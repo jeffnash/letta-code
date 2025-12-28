@@ -10,12 +10,19 @@
 > - Better error formatting for plain-object error payloads.
 >
 > ## What is CLIProxyAPI?
-> CLIProxyAPI is an OpenAI/Gemini/Claude/Codex-compatible proxy server that lets OpenAI-compatible clients (like Letta Code) talk to multiple provider backends through a single base URL.
+> [CLIProxyAPI](https://github.com/jeffnash/CLIProxyAPI) is an OpenAI/Gemini/Claude/Codex-compatible proxy server that lets OpenAI-compatible clients (like Letta Code) talk to multiple provider backends through a single base URL.
 >
-> This fork is intended to be used with the `jeffnash/CLIProxyAPI` fork (recommended). It adds additional provider adapters/auth flows and a hosted-friendly deployment path.
+> This fork is designed around the [`jeffnash/CLIProxyAPI`](https://github.com/jeffnash/CLIProxyAPI) fork specifically (recommended): it includes extra provider adapters/auth flows and an easy Railway-first deployment path.
 >
-> - CLIProxyAPI (recommended fork): https://github.com/jeffnash/CLIProxyAPI
-> - CLIProxyAPI (upstream): https://github.com/luispater/CLIProxyAPI
+> **Required:** use the [`jeffnash/letta`](https://github.com/jeffnash/letta) fork as your Letta server for this fork. It’s required for the CLIProxyAPI-related behavior in this repo and is easily configured to point to your hosted CLIProxyAPI instance.
+>
+> Optional but recommended: [Patch-22](https://github.com/jeffnash/patch-22) provides an `apply_patch` command as a safety net for tools/models that mistakenly try to run `apply_patch` as a shell command.
+>
+> Related links:
+> - Letta server (required): https://github.com/jeffnash/letta
+> - CLIProxyAPI (recommended): https://github.com/jeffnash/CLIProxyAPI
+> - Patch-22 (optional): https://github.com/jeffnash/patch-22
+> - CLIProxyAPI upstream: https://github.com/luispater/CLIProxyAPI
 
 [![npm](https://img.shields.io/npm/v/@letta-ai/letta-code.svg?style=flat-square)](https://www.npmjs.com/package/@letta-ai/letta-code) [![Discord](https://img.shields.io/badge/discord-join-blue?style=flat-square&logo=discord)](https://discord.gg/letta)
 
