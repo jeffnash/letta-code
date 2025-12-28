@@ -507,6 +507,41 @@
     "updateArgs": { "context_window": 272000, "max_output_tokens": 128000 }
   },
   {
+    "id": "cliproxy-gpt-5.2-codex-xhigh",
+    "handle": "cliproxy/gpt-5.2-codex-xhigh",
+    "label": "GPT-5.2 Codex XHigh (CLIProxy)",
+    "description": "GPT-5.2 Codex extra-high reasoning via CLIProxyAPI",
+    "updateArgs": { "context_window": 400000, "max_output_tokens": 128000 }
+  },
+  {
+    "id": "cliproxy-gpt-5.2-codex-high",
+    "handle": "cliproxy/gpt-5.2-codex-high",
+    "label": "GPT-5.2 Codex High (CLIProxy)",
+    "description": "GPT-5.2 Codex high reasoning via CLIProxyAPI",
+    "updateArgs": { "context_window": 400000, "max_output_tokens": 128000 }
+  },
+  {
+    "id": "cliproxy-gpt-5.2-codex-medium",
+    "handle": "cliproxy/gpt-5.2-codex-medium",
+    "label": "GPT-5.2 Codex Medium (CLIProxy)",
+    "description": "GPT-5.2 Codex medium reasoning via CLIProxyAPI",
+    "updateArgs": { "context_window": 400000, "max_output_tokens": 128000 }
+  },
+  {
+    "id": "cliproxy-gpt-5.2-codex-low",
+    "handle": "cliproxy/gpt-5.2-codex-low",
+    "label": "GPT-5.2 Codex Low (CLIProxy)",
+    "description": "GPT-5.2 Codex low reasoning via CLIProxyAPI",
+    "updateArgs": { "context_window": 400000, "max_output_tokens": 128000 }
+  },
+  {
+    "id": "cliproxy-gpt-5.2-codex",
+    "handle": "cliproxy/gpt-5.2-codex",
+    "label": "GPT-5.2 Codex (CLIProxy)",
+    "description": "GPT-5.2 Codex via CLIProxyAPI",
+    "updateArgs": { "context_window": 400000, "max_output_tokens": 128000 }
+  },
+  {
     "id": "cliproxy-gpt-5.1-codex-max-xhigh",
     "handle": "cliproxy/gpt-5.1-codex-max-xhigh",
     "label": "GPT-5.1 Codex Max XHigh (CLIProxy)",
@@ -714,14 +749,42 @@
     "handle": "cliproxy/copilot-gemini-3-pro-preview",
     "label": "Gemini 3 Pro (CLIProxy/Copilot)",
     "description": "Gemini 3 Pro via CLIProxyAPI Copilot",
-    "updateArgs": { "context_window": 180000, "max_output_tokens": 64000 }
+    "updateArgs": { "context_window": 128000, "max_output_tokens": 64000 }
+  },
+  {
+    "id": "cliproxy-copilot-gemini-3-flash",
+    "handle": "cliproxy/copilot-gemini-3-flash-preview",
+    "label": "Gemini 3 Flash (CLIProxy/Copilot)",
+    "description": "Gemini 3 Flash via CLIProxyAPI Copilot",
+    "updateArgs": { "context_window": 128000, "max_output_tokens": 64000 }
   },
   {
     "id": "cliproxy-copilot-gemini-2.5-pro",
     "handle": "cliproxy/copilot-gemini-2.5-pro",
     "label": "Gemini 2.5 Pro (CLIProxy/Copilot)",
     "description": "Gemini 2.5 Pro via CLIProxyAPI Copilot",
-    "updateArgs": { "context_window": 180000, "max_output_tokens": 64000 }
+    "updateArgs": { "context_window": 128000, "max_output_tokens": 64000 }
+  },
+  {
+    "id": "cliproxy-copilot-gemini-2.5-flash",
+    "handle": "cliproxy/copilot-gemini-2.5-flash",
+    "label": "Gemini 2.5 Flash (CLIProxy/Copilot)",
+    "description": "Gemini 2.5 Flash via CLIProxyAPI Copilot",
+    "updateArgs": { "context_window": 128000, "max_output_tokens": 64000 }
+  },
+  {
+    "id": "cliproxy-gemini-claude-sonnet-4.5-thinking",
+    "handle": "cliproxy/gemini-claude-sonnet-4-5-thinking",
+    "label": "Claude Sonnet 4.5 Thinking (CLIProxy/Gemini)",
+    "description": "Claude Sonnet 4.5 via Gemini provider through CLIProxyAPI",
+    "updateArgs": { "context_window": 200000, "max_output_tokens": 64000 }
+  },
+  {
+    "id": "cliproxy-gemini-claude-opus-4.5-thinking",
+    "handle": "cliproxy/gemini-claude-opus-4-5-thinking",
+    "label": "Claude Opus 4.5 Thinking (CLIProxy/Gemini)",
+    "description": "Claude Opus 4.5 via Gemini provider through CLIProxyAPI",
+    "updateArgs": { "context_window": 200000, "max_output_tokens": 64000 }
   },
   {
     "id": "cliproxy-copilot-grok-code-fast-1",
