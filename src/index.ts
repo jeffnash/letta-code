@@ -1,11 +1,13 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
 import type { AgentState } from "@letta-ai/letta-client/resources/agents/agents";
+import type { Message } from "@letta-ai/letta-client/resources/agents/messages";
 import { getResumeData, type ResumeData } from "./agent/check-approval";
 import { getClient } from "./agent/client";
 import { initializeLoadedSkillsFlag, setAgentContext } from "./agent/context";
 import type { AgentProvenance } from "./agent/create";
 import { LETTA_CLOUD_API_URL } from "./auth/oauth";
+import type { ApprovalRequest } from "./cli/helpers/stream";
 import { ProfileSelectionInline } from "./cli/profile-selection";
 import { permissionMode } from "./permissions/mode";
 import { settingsManager } from "./settings-manager";
@@ -591,6 +593,10 @@ async function main(): Promise<void> {
   const AppModule = await import("./cli/App");
   const App = AppModule.default;
 
+  // Stable empty arrays to avoid creating new references on each render
+  const EMPTY_APPROVALS: ApprovalRequest[] = [];
+  const EMPTY_HISTORY: Message[] = [];
+
   function LoadingApp({
     continueSession,
     forceNew,
@@ -1128,8 +1134,8 @@ async function main(): Promise<void> {
         loadingState,
         continueSession: isResumingSession,
         startupApproval: resumeData?.pendingApproval ?? null,
-        startupApprovals: resumeData?.pendingApprovals ?? [],
-        messageHistory: resumeData?.messageHistory ?? [],
+        startupApprovals: resumeData?.pendingApprovals ?? EMPTY_APPROVALS,
+        messageHistory: resumeData?.messageHistory ?? EMPTY_HISTORY,
         tokenStreaming: settings.tokenStreaming,
         agentProvenance,
       });
@@ -1141,8 +1147,8 @@ async function main(): Promise<void> {
       loadingState,
       continueSession: isResumingSession,
       startupApproval: resumeData?.pendingApproval ?? null,
-      startupApprovals: resumeData?.pendingApprovals ?? [],
-      messageHistory: resumeData?.messageHistory ?? [],
+      startupApprovals: resumeData?.pendingApprovals ?? EMPTY_APPROVALS,
+      messageHistory: resumeData?.messageHistory ?? EMPTY_HISTORY,
       tokenStreaming: settings.tokenStreaming,
       agentProvenance,
     });

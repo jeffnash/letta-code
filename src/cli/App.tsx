@@ -327,14 +327,18 @@ type StaticItem =
     }
   | Line;
 
+// Stable empty arrays to avoid prop reference changes when defaults are used
+const EMPTY_APPROVALS: ApprovalRequest[] = [];
+const EMPTY_HISTORY: Message[] = [];
+
 export default function App({
   agentId: initialAgentId,
   agentState: initialAgentState,
   loadingState = "ready",
   continueSession = false,
   startupApproval = null,
-  startupApprovals = [],
-  messageHistory = [],
+  startupApprovals = EMPTY_APPROVALS,
+  messageHistory = EMPTY_HISTORY,
   tokenStreaming = false,
   agentProvenance = null,
 }: {

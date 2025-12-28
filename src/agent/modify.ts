@@ -34,10 +34,11 @@ function buildModelSettings(
   const isGoogleAI = modelHandle.startsWith("google_ai/");
   const isGoogleVertex = modelHandle.startsWith("google_vertex/");
   const isOpenRouter = modelHandle.startsWith("openrouter/");
+  const isCLIProxy = modelHandle.startsWith("cliproxy/");
 
   let settings: ModelSettings;
 
-  if (isOpenAI || isOpenRouter) {
+  if (isOpenAI || isOpenRouter || isCLIProxy) {
     const openaiSettings: OpenAIModelSettings = {
       provider_type: "openai",
       parallel_tool_calls: true,

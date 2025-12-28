@@ -1,5 +1,22 @@
 # Letta Code
 
+> [!IMPORTANT]
+> This repository is a fork of `letta-ai/letta-code`.
+>
+> ## Fork changes (summary)
+> - Default model switched to `cliproxy/gpt-5.2-medium`.
+> - Added `cliproxy/*` model handles and treats them as OpenAI-provider settings.
+> - Improved CLI rendering stability by using stable empty-array defaults.
+> - Better error formatting for plain-object error payloads.
+>
+> ## What is CLIProxyAPI?
+> CLIProxyAPI is an OpenAI/Gemini/Claude/Codex-compatible proxy server that lets OpenAI-compatible clients (like Letta Code) talk to multiple provider backends through a single base URL.
+>
+> This fork is intended to be used with the `jeffnash/CLIProxyAPI` fork (recommended). It adds additional provider adapters/auth flows and a hosted-friendly deployment path.
+>
+> - CLIProxyAPI (recommended fork): https://github.com/jeffnash/CLIProxyAPI
+> - CLIProxyAPI (upstream): https://github.com/luispater/CLIProxyAPI
+
 [![npm](https://img.shields.io/npm/v/@letta-ai/letta-code.svg?style=flat-square)](https://www.npmjs.com/package/@letta-ai/letta-code) [![Discord](https://img.shields.io/badge/discord-join-blue?style=flat-square&logo=discord)](https://discord.gg/letta)
 
 Letta Code is a memory-first coding harness, built on top of the Letta API. Instead of working in independent sessions, you work with a persisted agent that learns over time and is portable across models (Claude Sonnet/Opus, GPT-5, Gemini 3 Pro, GLM-4.6, and more).

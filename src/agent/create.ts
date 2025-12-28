@@ -70,7 +70,7 @@ export async function createAgent(
     modelHandle = resolved;
   } else {
     // Use default model
-    modelHandle = "anthropic/claude-sonnet-4-5-20250929";
+    modelHandle = "cliproxy/gpt-5.2-medium";
   }
 
   const client = await getClient();
