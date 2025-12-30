@@ -313,8 +313,8 @@ export async function handleHeadlessCommand(
   // If resuming and a model or system prompt was specified, apply those changes
   if (isResumingAgent && (model || systemPromptId)) {
     if (model) {
-      const { resolveModel } = await import("./agent/model");
-      const modelHandle = resolveModel(model);
+      const { resolveModelAsync } = await import("./agent/model");
+      const modelHandle = await resolveModelAsync(model);
       if (!modelHandle) {
         console.error(`Error: Invalid model "${model}"`);
         process.exit(1);

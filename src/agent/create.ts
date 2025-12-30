@@ -13,8 +13,9 @@ import { getClient } from "./client";
 import { getDefaultMemoryBlocks } from "./memory";
 import {
   formatAvailableModels,
+  formatAvailableModelsAsync,
   getModelUpdateArgs,
-  resolveModel,
+  resolveModelAsync,
 } from "./model";
 import { updateAgentLLMConfig } from "./modify";
 import { resolveSystemPrompt } from "./promptAssets";
@@ -60,11 +61,11 @@ export async function createAgent(
   // Resolve model identifier to handle
   let modelHandle: string;
   if (model) {
-    const resolved = resolveModel(model);
+    const resolved = await resolveModelAsync(model);
     if (!resolved) {
       console.error(`Error: Unknown model "${model}"`);
       console.error("Available models:");
-      console.error(formatAvailableModels());
+      console.error(await formatAvailableModelsAsync());
       process.exit(1);
     }
     modelHandle = resolved;

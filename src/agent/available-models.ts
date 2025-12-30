@@ -17,6 +17,7 @@ function isFresh(now = Date.now()) {
 
 export type AvailableModelHandlesResult = {
   handles: Set<string>;
+  contextWindows?: Map<string, number>; // handle -> max_context_window
   source: "cache" | "network";
   fetchedAt: number;
 };
@@ -67,6 +68,7 @@ export async function getAvailableModelHandles(options?: {
   if (!forceRefresh && isFresh(now) && cache) {
     return {
       handles: cache.handles,
+      contextWindows: cache.contextWindows,
       source: "cache",
       fetchedAt: cache.fetchedAt,
     };
@@ -76,6 +78,7 @@ export async function getAvailableModelHandles(options?: {
     const entry = await inflight;
     return {
       handles: entry.handles,
+      contextWindows: entry.contextWindows,
       source: "network",
       fetchedAt: entry.fetchedAt,
     };
@@ -93,6 +96,7 @@ export async function getAvailableModelHandles(options?: {
   const entry = await inflight;
   return {
     handles: entry.handles,
+    contextWindows: entry.contextWindows,
     source: "network",
     fetchedAt: entry.fetchedAt,
   };
