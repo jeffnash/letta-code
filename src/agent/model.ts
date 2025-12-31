@@ -12,6 +12,41 @@ const DEFAULT_DYNAMIC_MODEL_CONFIG = {
   max_output_tokens: 32000,
 };
 
+// Apply a safety buffer to avoid hitting provider hard limits exactly.
+// This is especially important because we may add system prompt/tool schema overhead.
+const CONTEXT_WINDOW_SAFETY_FACTOR = Number.parseFloat(
+  process.env.LETTA_CONTEXT_WINDOW_SAFETY_FACTOR ?? "0.95",
+);
+const MAX_OUTPUT_TOKENS_SAFETY_FACTOR = Number.parseFloat(
+  process.env.LETTA_MAX_OUTPUT_TOKENS_SAFETY_FACTOR ?? "0.95",
+);
+
+function applySafetyLimit(value: unknown, safetyFactor: number): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  if (!Number.isFinite(safetyFactor) || safetyFactor <= 0 || safetyFactor > 1) return Math.max(1, Math.floor(value));
+  return Math.max(1, Math.floor(value * safetyFactor));
+}
+
+function applySafetyToUpdateArgs(
+  updateArgs: Record<string, unknown>,
+): Record<string, unknown> {
+  const safe = { ...updateArgs };
+
+  const safeContextWindow = applySafetyLimit(
+    updateArgs.context_window,
+    CONTEXT_WINDOW_SAFETY_FACTOR,
+  );
+  if (safeContextWindow) safe.context_window = safeContextWindow;
+
+  const safeMaxOutputTokens = applySafetyLimit(
+    updateArgs.max_output_tokens,
+    MAX_OUTPUT_TOKENS_SAFETY_FACTOR,
+  );
+  if (safeMaxOutputTokens) safe.max_output_tokens = safeMaxOutputTokens;
+
+  return safe;
+}
+
 /**
  * Resolve a model by ID or handle (synchronous - static list only)
  * @param modelIdentifier - Can be either a model ID (e.g., "opus-4.5") or a full handle (e.g., "anthropic/claude-opus-4-5")
@@ -150,17 +185,17 @@ export function getModelUpdateArgs(
   // Try static model first
   const modelInfo = getModelInfo(modelIdentifier);
   if (modelInfo?.updateArgs) {
-    return modelInfo.updateArgs;
+    return applySafetyToUpdateArgs(modelInfo.updateArgs);
   }
   
   // For dynamic models (not in static list), return sensible defaults
   // Try to get context window from cached server response
   const contextWindow = getModelContextWindow(modelIdentifier);
   
-  return {
+  return applySafetyToUpdateArgs({
     context_window: contextWindow || DEFAULT_DYNAMIC_MODEL_CONFIG.context_window,
     max_output_tokens: DEFAULT_DYNAMIC_MODEL_CONFIG.max_output_tokens,
-  };
+  });
 }
 
 /**
@@ -176,7 +211,7 @@ export async function getModelUpdateArgsAsync(
   // Try static model first
   const modelInfo = getModelInfo(modelIdentifier);
   if (modelInfo?.updateArgs) {
-    return modelInfo.updateArgs;
+    return applySafetyToUpdateArgs(modelInfo.updateArgs);
   }
   
   // For dynamic models, try to get context window from server
@@ -185,19 +220,19 @@ export async function getModelUpdateArgsAsync(
     const contextWindow = available.contextWindows?.get(modelIdentifier);
     
     if (contextWindow) {
-      return {
+      return applySafetyToUpdateArgs({
         context_window: contextWindow,
         max_output_tokens: DEFAULT_DYNAMIC_MODEL_CONFIG.max_output_tokens,
-      };
+      });
     }
   } catch {
     // Fall through to defaults
   }
   
-  return {
+  return applySafetyToUpdateArgs({
     context_window: DEFAULT_DYNAMIC_MODEL_CONFIG.context_window,
     max_output_tokens: DEFAULT_DYNAMIC_MODEL_CONFIG.max_output_tokens,
-  };
+  });
 }
 
 /**
