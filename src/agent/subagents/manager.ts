@@ -21,12 +21,24 @@ import { settingsManager } from "../../settings-manager";
 import { getErrorMessage } from "../../utils/error";
 import { getClient } from "../client";
 import { getCurrentAgentId } from "../context";
-import { resolveModelByLlmConfig } from "../model";
+import {
+  getDefaultModel,
+  resolveModel,
+  resolveModelAsync,
+} from "../model";
 import { getAllSubagentConfigs, type SubagentConfig } from ".";
 
 // ============================================================================
 // Types
 // ============================================================================
+
+/**
+ * Response from the server's model selector resolver
+ */
+interface ModelSelectorResponse {
+  resolved_handle: string;
+  expansion_chain: string[];
+}
 
 /**
  * Subagent execution result
@@ -56,21 +68,28 @@ interface ExecutionState {
 // ============================================================================
 
 /**
- * Get the primary agent's model ID
- * Fetches from API and resolves to a known model ID
+ * Get the primary agent's model handle.
+ * Fetches from API and resolves to a concrete handle when possible.
  */
-async function getPrimaryAgentModel(): Promise<string | null> {
+export async function getPrimaryAgentModelHandle(): Promise<string | undefined> {
   try {
     const agentId = getCurrentAgentId();
     const client = await getClient();
     const agent = await client.agents.retrieve(agentId);
-    const model = agent.llm_config?.model;
-    if (model) {
-      return resolveModelByLlmConfig(model);
+    const llmConfig = agent.llm_config as { model?: string; handle?: string } | undefined;
+    if (llmConfig?.handle) {
+      return llmConfig.handle;
     }
-    return null;
+
+    const model = llmConfig?.model;
+    if (!model) {
+      return undefined;
+    }
+
+    const resolved = await resolveModelAsync(model);
+    return resolved ?? undefined;
   } catch {
-    return null;
+    return undefined;
   }
 }
 
@@ -455,13 +474,13 @@ async function executeSubagent(
     if (exitCode !== 0) {
       // Check if this is a provider-not-supported error and we haven't retried yet
       if (!isRetry && isProviderNotSupportedError(stderr)) {
-        const primaryModel = await getPrimaryAgentModel();
-        if (primaryModel) {
+        const primaryModelHandle = await getPrimaryAgentModelHandle();
+        if (primaryModelHandle) {
           // Retry with the primary agent's model
           return executeSubagent(
             type,
             config,
-            primaryModel,
+            primaryModelHandle,
             userPrompt,
             baseURL,
             subagentId,
@@ -534,6 +553,88 @@ function getBaseURL(): string {
 }
 
 /**
+ * Check if a selector entry is a concrete model identifier.
+ */
+function isConcreteModelSelector(entry: string): boolean {
+  return !entry.startsWith("group:") && entry !== "inherit" && entry !== "any";
+}
+
+/**
+ * Pick a fallback model when server resolution fails.
+ */
+export async function getFallbackModelFromSelector(
+  selector: string[],
+  parentModelHandle: string | undefined,
+): Promise<string> {
+  if (parentModelHandle) {
+    return parentModelHandle;
+  }
+
+  for (const entry of selector) {
+    if (!isConcreteModelSelector(entry)) {
+      continue;
+    }
+
+    // If it already looks like a handle, use it directly.
+    if (entry.includes("/")) {
+      return entry;
+    }
+
+    // Try resolving a static model ID first.
+    const resolvedStatic = resolveModel(entry);
+    if (resolvedStatic) {
+      return resolvedStatic;
+    }
+
+    // Try resolving dynamically (best-effort; may fail offline).
+    try {
+      const resolvedDynamic = await resolveModelAsync(entry);
+      if (resolvedDynamic) {
+        return resolvedDynamic;
+      }
+    } catch {
+      // Ignore and fall through to default.
+    }
+  }
+
+  return getDefaultModel();
+}
+
+/**
+ * Resolve a model selector using the server's resolver endpoint.
+ * 
+ * @param selector - Ordered list of selector entries (group:X, inherit, any, or handles)
+ * @param parentModelHandle - Parent agent's model handle for 'inherit' resolution
+ * @returns Resolved model handle
+ */
+async function resolveModelSelector(
+  selector: string[],
+  parentModelHandle: string | undefined,
+): Promise<string> {
+  try {
+    const client = await getClient();
+    
+    // Call the server's resolve endpoint
+    const response = await client.request<ModelSelectorResponse>({
+      method: "POST",
+      path: "/v1/models/resolve",
+      body: {
+        selector,
+        parent_model_handle: parentModelHandle,
+      },
+    });
+    
+    return response.resolved_handle;
+  } catch (error) {
+    console.warn(
+      `[subagent] Server model resolution failed: ${getErrorMessage(error)}. Using fallback.`,
+    );
+
+    return await getFallbackModelFromSelector(selector, parentModelHandle);
+  }
+}
+
+/**
  * Spawn a subagent and execute it autonomously
  *
  * @param type - Subagent type (e.g., "code-reviewer", "explore")
@@ -561,7 +662,22 @@ export async function spawnSubagent(
     };
   }
 
-  const model = userModel || config.recommendedModel;
+  // Resolve model using the server's selector resolver
+  let model: string;
+  if (userModel) {
+    // User explicitly specified a model - use it directly
+    model = userModel;
+  } else {
+    // Use the model selector chain from config
+    const selector = config.modelSelector || [config.recommendedModel];
+    
+    // Get parent agent's model for 'inherit' resolution
+    const parentModelHandle = await getPrimaryAgentModelHandle();
+    
+    // Resolve via server (with fallback)
+    model = await resolveModelSelector(selector, parentModelHandle || undefined);
+  }
+
   const baseURL = getBaseURL();
 
   // Execute subagent - state updates are handled via the state store
