@@ -4,7 +4,7 @@ const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 type CacheEntry = {
   handles: Set<string>;
-  contextWindows: Map<string, number>; // handle -> max_context_window
+  contextWindows: Map<string, number>; // handle -> context_window
   fetchedAt: number;
 };
 
@@ -17,7 +17,7 @@ function isFresh(now = Date.now()) {
 
 export type AvailableModelHandlesResult = {
   handles: Set<string>;
-  contextWindows?: Map<string, number>; // handle -> max_context_window
+  contextWindows?: Map<string, number>; // handle -> context_window
   source: "cache" | "network";
   fetchedAt: number;
 };
@@ -52,8 +52,20 @@ async function fetchFromNetwork(): Promise<CacheEntry> {
   // Build context window map from API response
   const contextWindows = new Map<string, number>();
   for (const model of modelsList) {
-    if (model.handle && model.max_context_window) {
-      contextWindows.set(model.handle, model.max_context_window);
+    const modelWithAliases = model as {
+      context_window?: number;
+      max_context_window?: number;
+      context_window_limit?: number;
+      max_context_window_limit?: number;
+    };
+    const contextWindow =
+      modelWithAliases.context_window ??
+      modelWithAliases.max_context_window ??
+      modelWithAliases.context_window_limit ??
+      modelWithAliases.max_context_window_limit;
+
+    if (model.handle && contextWindow) {
+      contextWindows.set(model.handle, contextWindow);
     }
   }
   return { handles, contextWindows, fetchedAt: Date.now() };
@@ -113,7 +125,7 @@ export function prefetchAvailableModelHandles(): void {
 }
 
 /**
- * Get the max_context_window for a model handle from the cached API response.
+ * Get the context_window for a model handle from the cached API response.
  * Returns undefined if not cached or handle not found.
  */
 export function getModelContextWindow(handle: string): number | undefined {
