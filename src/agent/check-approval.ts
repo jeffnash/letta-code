@@ -129,10 +129,16 @@ export async function getResumeData(
 
     // Only check for pending approvals if we found the in-context message
     if (messageToCheck) {
-      // Log the agent's last_stop_reason for debugging
+      // Gate approval detection on the agent's last_stop_reason
       const lastStopReason = (agent as { last_stop_reason?: string })
         .last_stop_reason;
-      if (lastStopReason === "requires_approval") {
+      const shouldCheckApprovals = lastStopReason === "requires_approval";
+      if (!shouldCheckApprovals) {
+        debugWarn(
+          "check-approval",
+          `Agent last_stop_reason is ${lastStopReason ?? "unknown"}, not requires_approval - skipping pending approvals`,
+        );
+      } else {
         debugWarn(
           "check-approval",
           `Agent last_stop_reason: ${lastStopReason}`,
@@ -143,7 +149,10 @@ export async function getResumeData(
         );
       }
 
-      if (messageToCheck.message_type === "approval_request_message") {
+      if (
+        shouldCheckApprovals &&
+        messageToCheck.message_type === "approval_request_message"
+      ) {
         // Cast to access tool_calls with proper typing
         const approvalMsg = messageToCheck as Message & {
           tool_calls?: Array<{

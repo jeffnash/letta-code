@@ -177,6 +177,9 @@ async function isRetriableError(
   stopReason: StopReasonType,
   lastRunId: string | null | undefined,
 ): Promise<boolean> {
+  // Context overflow is not retriable without compaction
+  if (String(stopReason) === "context_window_exceeded") return false;
+
   // Primary check: backend sets stop_reason=llm_api_error for LLMError exceptions
   if (stopReason === "llm_api_error") return true;
 
