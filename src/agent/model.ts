@@ -14,11 +14,13 @@ const DEFAULT_DYNAMIC_MODEL_CONFIG = {
 
 // Apply a safety buffer to avoid hitting provider hard limits exactly.
 // This is especially important because we may add system prompt/tool schema overhead.
+// NOTE: Default is 1.0 (no buffer) because the server already applies a safety factor.
+// Set LETTA_CONTEXT_WINDOW_SAFETY_FACTOR=0.95 to apply additional client-side buffering.
 const CONTEXT_WINDOW_SAFETY_FACTOR = Number.parseFloat(
-  process.env.LETTA_CONTEXT_WINDOW_SAFETY_FACTOR ?? "0.95",
+  process.env.LETTA_CONTEXT_WINDOW_SAFETY_FACTOR ?? "1.0",
 );
 const MAX_OUTPUT_TOKENS_SAFETY_FACTOR = Number.parseFloat(
-  process.env.LETTA_MAX_OUTPUT_TOKENS_SAFETY_FACTOR ?? "0.95",
+  process.env.LETTA_MAX_OUTPUT_TOKENS_SAFETY_FACTOR ?? "1.0",
 );
 
 function applySafetyLimit(value: unknown, safetyFactor: number): number | undefined {
