@@ -4,6 +4,7 @@ description: Fast agent for codebase exploration - finding files, searching code
 tools: Glob, Grep, Read, LS, BashOutput
 model:
   - group:fast
+  - group:strong
   - inherit
   - any
 memoryBlocks: human, persona
