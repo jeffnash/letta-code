@@ -19,6 +19,12 @@ import {
   upsertToolsIfNeeded,
 } from "./tools/manager";
 
+// Stable empty array constants to prevent new references on every render
+// These are used as fallbacks when resumeData is null, avoiding the React
+// anti-pattern of creating new [] on every render which triggers useEffect re-runs
+const EMPTY_APPROVAL_ARRAY: ApprovalRequest[] = [];
+const EMPTY_MESSAGE_ARRAY: Message[] = [];
+
 function printHelp() {
   // Keep this plaintext (no colors) so output pipes cleanly
   const usage = `
@@ -44,12 +50,15 @@ OPTIONS
   --init-blocks <list>  Comma-separated memory blocks to initialize when using --new (e.g., "persona,skills")
   --base-tools <list>   Comma-separated base tools to attach when using --new (e.g., "memory,web_search,conversation_search")
   -a, --agent <id>      Use a specific agent ID
+  -n, --name <name>     Resume agent by name (from pinned agents, case-insensitive)
   -m, --model <id>      Model ID or handle (e.g., "opus-4.5" or "anthropic/claude-opus-4-5")
   -s, --system <id>     System prompt ID or subagent name (applies to new or existing agent)
   --toolset <name>      Force toolset: "codex", "default", or "gemini" (overrides model-based auto-selection)
   -p, --prompt          Headless prompt mode
   --output-format <fmt> Output format for headless mode (text, json, stream-json)
                         Default: text
+  --include-partial-messages
+                        Emit stream_event wrappers for each chunk (stream-json only)
   --skills <path>       Custom path to skills directory (default: .skills in current directory)
   --sleeptime           Enable sleeptime memory management (only for new agents)
   --from-af <path>      Create agent from an AgentFile (.af) template
@@ -61,7 +70,7 @@ BEHAVIOR
   - Use /profile save <name> to bookmark your current agent
 
   Profiles are stored in:
-  - Global: ~/.letta/settings.json (available everywhere)
+  - Global: ~/.config/letta/settings.json (available everywhere)
   - Local: .letta/settings.local.json (pinned to project)
 
   If no credentials are configured, you'll be prompted to authenticate via
@@ -213,10 +222,86 @@ function getModelForToolLoading(
   return specifiedModel;
 }
 
+/**
+ * Resolve an agent ID by name from pinned agents.
+ * Case-insensitive exact match. If multiple matches, picks the most recently used.
+ */
+async function resolveAgentByName(
+  name: string,
+): Promise<{ id: string; name: string } | null> {
+  const client = await getClient();
+
+  // Get all pinned agents (local first, then global, deduplicated)
+  const localPinned = settingsManager.getLocalPinnedAgents();
+  const globalPinned = settingsManager.getGlobalPinnedAgents();
+  const allPinned = [...new Set([...localPinned, ...globalPinned])];
+
+  if (allPinned.length === 0) {
+    return null;
+  }
+
+  // Fetch names for all pinned agents and find matches
+  const matches: { id: string; name: string }[] = [];
+  const normalizedSearchName = name.toLowerCase();
+
+  await Promise.all(
+    allPinned.map(async (id) => {
+      try {
+        const agent = await client.agents.retrieve(id);
+        if (agent.name?.toLowerCase() === normalizedSearchName) {
+          matches.push({ id, name: agent.name });
+        }
+      } catch {
+        // Agent not found or error, skip
+      }
+    }),
+  );
+
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0] ?? null;
+
+  // Multiple matches - pick most recently used
+  // Check local LRU first
+  const localSettings = settingsManager.getLocalProjectSettings();
+  const localMatch = matches.find((m) => m.id === localSettings.lastAgent);
+  if (localMatch) return localMatch;
+
+  // Then global LRU
+  const settings = settingsManager.getSettings();
+  const globalMatch = matches.find((m) => m.id === settings.lastAgent);
+  if (globalMatch) return globalMatch;
+
+  // Fallback to first match (preserves local pinned order)
+  return matches[0] ?? null;
+}
+
+/**
+ * Get all pinned agent names for error messages
+ */
+async function getPinnedAgentNames(): Promise<{ id: string; name: string }[]> {
+  const client = await getClient();
+  const localPinned = settingsManager.getLocalPinnedAgents();
+  const globalPinned = settingsManager.getGlobalPinnedAgents();
+  const allPinned = [...new Set([...localPinned, ...globalPinned])];
+
+  const agents: { id: string; name: string }[] = [];
+  await Promise.all(
+    allPinned.map(async (id) => {
+      try {
+        const agent = await client.agents.retrieve(id);
+        agents.push({ id, name: agent.name || "(unnamed)" });
+      } catch {
+        // Agent not found, skip
+      }
+    }),
+  );
+  return agents;
+}
+
 async function main(): Promise<void> {
   // Initialize settings manager (loads settings once into memory)
   await settingsManager.initialize();
-  const settings = settingsManager.getSettings();
+  const settings = await settingsManager.getSettingsWithSecureTokens();
 
   // Initialize telemetry (enabled by default, opt-out via LETTA_CODE_TELEM=0)
   telemetry.init();
@@ -242,6 +327,7 @@ async function main(): Promise<void> {
         "init-blocks": { type: "string" },
         "base-tools": { type: "string" },
         agent: { type: "string", short: "a" },
+        name: { type: "string", short: "n" },
         model: { type: "string", short: "m" },
         system: { type: "string", short: "s" },
         toolset: { type: "string" },
@@ -253,6 +339,7 @@ async function main(): Promise<void> {
         "permission-mode": { type: "string" },
         yolo: { type: "boolean" },
         "output-format": { type: "string" },
+        "include-partial-messages": { type: "boolean" },
         skills: { type: "string" },
         link: { type: "boolean" },
         unlink: { type: "boolean" },
@@ -313,7 +400,8 @@ async function main(): Promise<void> {
   const forceNew = (values.new as boolean | undefined) ?? false;
   const initBlocksRaw = values["init-blocks"] as string | undefined;
   const baseToolsRaw = values["base-tools"] as string | undefined;
-  const specifiedAgentId = (values.agent as string | undefined) ?? null;
+  let specifiedAgentId = (values.agent as string | undefined) ?? null;
+  const specifiedAgentName = (values.name as string | undefined) ?? null;
   const specifiedModel = (values.model as string | undefined) ?? undefined;
   const systemPromptId = (values.system as string | undefined) ?? undefined;
   const specifiedToolset = (values.toolset as string | undefined) ?? undefined;
@@ -412,6 +500,10 @@ async function main(): Promise<void> {
       console.error("Error: --from-af cannot be used with --agent");
       process.exit(1);
     }
+    if (specifiedAgentName) {
+      console.error("Error: --from-af cannot be used with --name");
+      process.exit(1);
+    }
     if (shouldContinue) {
       console.error("Error: --from-af cannot be used with --continue");
       process.exit(1);
@@ -426,6 +518,18 @@ async function main(): Promise<void> {
     const resolvedPath = resolve(fromAfFile);
     if (!existsSync(resolvedPath)) {
       console.error(`Error: AgentFile not found: ${resolvedPath}`);
+      process.exit(1);
+    }
+  }
+
+  // Validate --name flag
+  if (specifiedAgentName) {
+    if (specifiedAgentId) {
+      console.error("Error: --name cannot be used with --agent");
+      process.exit(1);
+    }
+    if (forceNew) {
+      console.error("Error: --name cannot be used with --new");
       process.exit(1);
     }
   }
@@ -492,7 +596,7 @@ async function main(): Promise<void> {
         "Your credentials may be invalid or the server may be unreachable.",
       );
       console.error(
-        "Delete ~/.letta/settings.json then run 'letta' to re-authenticate",
+        "Delete ~/.config/letta/settings.json then run 'letta' to re-authenticate",
       );
       process.exit(1);
     }
@@ -508,6 +612,33 @@ async function main(): Promise<void> {
     await runSetup();
     // After setup, restart main flow
     return main();
+  }
+
+  // Resolve --name to agent ID if provided
+  if (specifiedAgentName) {
+    // Load local settings for LRU priority
+    await settingsManager.loadLocalProjectSettings();
+
+    const resolved = await resolveAgentByName(specifiedAgentName);
+    if (!resolved) {
+      console.error(
+        `Error: No pinned agent found with name "${specifiedAgentName}"`,
+      );
+      console.error("");
+      const pinnedAgents = await getPinnedAgentNames();
+      if (pinnedAgents.length > 0) {
+        console.error("Available pinned agents:");
+        for (const agent of pinnedAgents) {
+          console.error(`  - "${agent.name}" (${agent.id})`);
+        }
+      } else {
+        console.error(
+          "No pinned agents available. Use /pin to pin an agent first.",
+        );
+      }
+      process.exit(1);
+    }
+    specifiedAgentId = resolved.id;
   }
 
   // Set tool filter if provided (controls which tools are loaded)
@@ -586,6 +717,17 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Enable enhanced key reporting (Shift+Enter, etc.) BEFORE Ink initializes.
+  // In VS Code/xterm.js this typically requires a short handshake (query + enable).
+  try {
+    const { detectAndEnableKittyProtocol } = await import(
+      "./cli/utils/kittyProtocolDetector"
+    );
+    await detectAndEnableKittyProtocol();
+  } catch {
+    // Best-effort: if this fails, the app still runs (Option+Enter remains supported).
+  }
+
   // Interactive: lazy-load React/Ink + App
   const React = await import("react");
   const { render } = await import("ink");
@@ -620,6 +762,9 @@ async function main(): Promise<void> {
     skillsDirectory?: string;
     fromAfFile?: string;
   }) {
+    const [showKeybindingSetup, setShowKeybindingSetup] = useState<
+      boolean | null
+    >(null);
     const [loadingState, setLoadingState] = useState<
       | "selecting"
       | "selecting_global"
@@ -640,6 +785,79 @@ async function main(): Promise<void> {
     const [selectedGlobalAgentId, setSelectedGlobalAgentId] = useState<
       string | null
     >(null);
+
+    // Auto-install Shift+Enter keybinding for VS Code/Cursor/Windsurf (silent, no prompt)
+    useEffect(() => {
+      async function autoInstallKeybinding() {
+        const {
+          detectTerminalType,
+          getKeybindingsPath,
+          keybindingExists,
+          installKeybinding,
+        } = await import("./cli/utils/terminalKeybindingInstaller");
+        const { loadSettings, updateSettings } = await import("./settings");
+
+        const terminal = detectTerminalType();
+        if (!terminal) {
+          setShowKeybindingSetup(false);
+          return;
+        }
+
+        const settings = await loadSettings();
+        const keybindingsPath = getKeybindingsPath(terminal);
+
+        // Skip if already installed or no valid path
+        if (!keybindingsPath || settings.shiftEnterKeybindingInstalled) {
+          setShowKeybindingSetup(false);
+          return;
+        }
+
+        // Check if keybinding already exists (user might have added it manually)
+        if (keybindingExists(keybindingsPath)) {
+          await updateSettings({ shiftEnterKeybindingInstalled: true });
+          setShowKeybindingSetup(false);
+          return;
+        }
+
+        // Silently install keybinding (no prompt, just like Claude Code)
+        const result = installKeybinding(keybindingsPath);
+        if (result.success) {
+          await updateSettings({ shiftEnterKeybindingInstalled: true });
+        }
+
+        setShowKeybindingSetup(false);
+      }
+
+      async function autoInstallWezTermFix() {
+        const {
+          isWezTerm,
+          wezTermDeleteFixExists,
+          getWezTermConfigPath,
+          installWezTermDeleteFix,
+        } = await import("./cli/utils/terminalKeybindingInstaller");
+        const { loadSettings, updateSettings } = await import("./settings");
+
+        if (!isWezTerm()) return;
+
+        const settings = await loadSettings();
+        if (settings.wezTermDeleteFixInstalled) return;
+
+        const configPath = getWezTermConfigPath();
+        if (wezTermDeleteFixExists(configPath)) {
+          await updateSettings({ wezTermDeleteFixInstalled: true });
+          return;
+        }
+
+        // Silently install the fix
+        const result = installWezTermDeleteFix();
+        if (result.success) {
+          await updateSettings({ wezTermDeleteFixInstalled: true });
+        }
+      }
+
+      autoInstallKeybinding();
+      autoInstallWezTermFix();
+    }, []);
 
     // Initialize on mount - check if we should show global agent selector
     useEffect(() => {
@@ -1100,6 +1318,11 @@ async function main(): Promise<void> {
       loadingState,
       selectedGlobalAgentId,
     ]);
+
+    // Wait for keybinding auto-install to complete before showing UI
+    if (showKeybindingSetup === null) {
+      return null;
+    }
 
     // Don't render anything during initial "selecting" phase - wait for checkAndStart
     if (loadingState === "selecting") {

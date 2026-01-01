@@ -98,61 +98,63 @@ export function formatErrorDetails(e: unknown, agentId?: string): string {
     return e.message;
   }
 
-  // Handle plain objects with error structure (e.g., from run.metadata.error)
-  if (e && typeof e === "object") {
-    // Try to extract error details from plain object structures
+  // Fallback for any other type (e.g., plain objects thrown by SDK or other code)
+  if (typeof e === "object" && e !== null) {
     const obj = e as Record<string, unknown>;
-    
-    // Check for {error: {error: {...}, run_id}} structure
+
+    // Handle plain objects with error structure (e.g., from run.metadata.error)
+    // Check for {error: {error: {...}, run_id}} or {error: {detail: "..."}} structures.
     if (obj.error && typeof obj.error === "object") {
       const errorWrapper = obj.error as Record<string, unknown>;
-      const runId = typeof errorWrapper.run_id === "string" ? errorWrapper.run_id : undefined;
-      
+      const nestedRunId =
+        typeof errorWrapper.run_id === "string" ? errorWrapper.run_id : undefined;
+
       if (errorWrapper.error && typeof errorWrapper.error === "object") {
         const errorData = errorWrapper.error as Record<string, unknown>;
         const type = typeof errorData.type === "string" ? errorData.type : undefined;
-        const message = typeof errorData.message === "string" ? errorData.message : undefined;
-        const detail = typeof errorData.detail === "string" ? errorData.detail : undefined;
-        
+        const message =
+          typeof errorData.message === "string" ? errorData.message : undefined;
+        const detail =
+          typeof errorData.detail === "string" ? errorData.detail : undefined;
+
         if (message || detail) {
           const errorType = type ? `[${type}] ` : "";
           const errorMsg = message || "An error occurred";
           const errorDetail = detail ? `\nDetail: ${detail}` : "";
           const baseError = `${errorType}${errorMsg}${errorDetail}`;
-          return runId && agentId
-            ? `${baseError}\n${createAgentLink(runId, agentId)}`
+          return nestedRunId && agentId
+            ? `${baseError}\n${createAgentLink(nestedRunId, agentId)}`
             : baseError;
         }
       }
-      
-      // Check for {error: {detail: "..."}} structure
+
       if (typeof errorWrapper.detail === "string") {
         const baseError = errorWrapper.detail;
-        return runId && agentId
-          ? `${baseError}\n${createAgentLink(runId, agentId)}`
+        return nestedRunId && agentId
+          ? `${baseError}\n${createAgentLink(nestedRunId, agentId)}`
           : baseError;
       }
     }
-    
-    // Check for {detail: "..."} structure
-    if (typeof obj.detail === "string") {
-      return obj.detail;
-    }
-    
-    // Check for {message: "..."} structure
+
+    // Check common error-like properties
     if (typeof obj.message === "string") {
       return obj.message;
     }
-    
-    // Last resort: JSON stringify the object
+    if (typeof obj.error === "string") {
+      return obj.error;
+    }
+    if (typeof obj.detail === "string") {
+      return obj.detail;
+    }
+
+    // Last resort: JSON stringify
     try {
-      return JSON.stringify(e);
+      return JSON.stringify(e, null, 2);
     } catch {
-      return String(e);
+      return "[Error: Unable to serialize error object]";
     }
   }
 
-  // Fallback for any other type
   return String(e);
 }
 

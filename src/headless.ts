@@ -55,6 +55,7 @@ export async function handleHeadlessCommand(
       toolset: { type: "string" },
       prompt: { type: "boolean", short: "p" },
       "output-format": { type: "string" },
+      "include-partial-messages": { type: "boolean" },
       // Additional flags from index.ts that need to be filtered out
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
@@ -391,6 +392,7 @@ export async function handleHeadlessCommand(
   // Validate output format
   const outputFormat =
     (values["output-format"] as string | undefined) || "text";
+  const includePartialMessages = Boolean(values["include-partial-messages"]);
   if (!["text", "json", "stream-json"].includes(outputFormat)) {
     console.error(
       `Error: Invalid output format "${outputFormat}". Valid formats: text, json, stream-json`,
@@ -404,13 +406,20 @@ export async function handleHeadlessCommand(
   // Initialize session stats
   const sessionStats = new SessionStats();
 
+  // Use agent.id as session_id for all stream-json messages
+  const sessionId = agent.id;
+
   // Output init event for stream-json format
   if (outputFormat === "stream-json") {
     const initEvent = {
-      type: "init",
+      type: "system",
+      subtype: "init",
+      session_id: sessionId,
       agent_id: agent.id,
       model: agent.llm_config?.model,
       tools: agent.tools?.map((t) => t.name) || [],
+      cwd: process.cwd(),
+      uuid: `init-${agent.id}`,
     };
     console.log(JSON.stringify(initEvent));
   }
@@ -509,6 +518,8 @@ export async function handleHeadlessCommand(
                 tool_name: decision.approval.toolName,
                 tool_call_id: decision.approval.toolCallId,
                 tool_args: decision.approval.toolArgs,
+                session_id: sessionId,
+                uuid: `auto-approval-${decision.approval.toolCallId}`,
               }),
             );
           }
@@ -624,6 +635,8 @@ export async function handleHeadlessCommand(
                 type: "error",
                 message: fullErrorText,
                 detail: errorDetail,
+                session_id: sessionId,
+                uuid: crypto.randomUUID(),
               }),
             );
 
@@ -758,6 +771,8 @@ export async function handleHeadlessCommand(
                         tool_args: incomingArgs,
                         reason: permission.reason,
                         matched_rule: permission.matchedRule,
+                        session_id: sessionId,
+                        uuid: `auto-approval-${id}`,
                       }),
                     );
                     autoApprovalEmitted.add(id);
@@ -769,12 +784,34 @@ export async function handleHeadlessCommand(
 
           // Output chunk as message event (unless filtered)
           if (shouldOutputChunk) {
-            console.log(
-              JSON.stringify({
-                type: "message",
-                ...chunk,
-              }),
-            );
+            // Use existing otid or id from the Letta SDK chunk
+            const chunkWithIds = chunk as typeof chunk & {
+              otid?: string;
+              id?: string;
+            };
+            const uuid = chunkWithIds.otid || chunkWithIds.id;
+
+            if (includePartialMessages) {
+              // Emit as stream_event wrapper (like Claude Code with --include-partial-messages)
+              console.log(
+                JSON.stringify({
+                  type: "stream_event",
+                  event: chunk,
+                  session_id: sessionId,
+                  uuid,
+                }),
+              );
+            } else {
+              // Emit as regular message (default)
+              console.log(
+                JSON.stringify({
+                  type: "message",
+                  ...chunk,
+                  session_id: sessionId,
+                  uuid,
+                }),
+              );
+            }
           }
 
           // Still accumulate for approval tracking
@@ -939,6 +976,8 @@ export async function handleHeadlessCommand(
                 max_attempts: LLM_API_ERROR_MAX_RETRIES,
                 delay_ms: delayMs,
                 run_id: lastRunId,
+                session_id: sessionId,
+                uuid: `retry-${lastRunId || crypto.randomUUID()}`,
               }),
             );
           } else {
@@ -972,10 +1011,30 @@ export async function handleHeadlessCommand(
                 error_type?: string;
                 message?: string;
                 detail?: string;
+                // Handle nested error structure (error.error) that can occur in some edge cases
+                error?: { error_type?: string; detail?: string };
               }
             | undefined;
 
-          if (metaError?.error_type === "llm_error") {
+          // Check for llm_error at top level or nested (handles error.error nesting)
+          const errorType =
+            metaError?.error_type ?? metaError?.error?.error_type;
+
+          // Fallback: detect LLM provider errors from detail even if misclassified as internal_error
+          // Patterns are derived from handle_llm_error() message formats in the backend
+          const detail = metaError?.detail ?? metaError?.error?.detail ?? "";
+          const llmProviderPatterns = [
+            "Anthropic API error", // anthropic_client.py:759
+            "OpenAI API error", // openai_client.py:1034
+            "Google Vertex API error", // google_vertex_client.py:848
+            "overloaded", // anthropic_client.py:753 - used for LLMProviderOverloaded
+            "api_error", // Anthropic SDK error type field
+          ];
+          const isLlmErrorFromDetail =
+            errorType === "internal_error" &&
+            llmProviderPatterns.some((pattern) => detail.includes(pattern));
+
+          if (errorType === "llm_error" || isLlmErrorFromDetail) {
             const attempt = llmApiErrorRetries + 1;
             const baseDelayMs = 1000;
             const delayMs = baseDelayMs * 2 ** (attempt - 1);
@@ -991,6 +1050,8 @@ export async function handleHeadlessCommand(
                   max_attempts: LLM_API_ERROR_MAX_RETRIES,
                   delay_ms: delayMs,
                   run_id: lastRunId,
+                  session_id: sessionId,
+                  uuid: `retry-${lastRunId || crypto.randomUUID()}`,
                 }),
               );
             } else {
@@ -1057,6 +1118,8 @@ export async function handleHeadlessCommand(
             message: errorMessage,
             stop_reason: stopReason,
             run_id: lastRunId,
+            session_id: sessionId,
+            uuid: `error-${lastRunId || crypto.randomUUID()}`,
           }),
         );
       } else {
@@ -1077,6 +1140,8 @@ export async function handleHeadlessCommand(
           type: "error",
           message: errorDetails,
           run_id: lastKnownRunId,
+          session_id: sessionId,
+          uuid: `error-${lastKnownRunId || crypto.randomUUID()}`,
         }),
       );
     } else {
@@ -1157,10 +1222,16 @@ export async function handleHeadlessCommand(
       }
     }
 
+    // Use the last run_id as the result uuid if available, otherwise derive from agent_id
+    const resultUuid =
+      allRunIds.size > 0
+        ? `result-${Array.from(allRunIds).pop()}`
+        : `result-${agent.id}`;
     const resultEvent = {
       type: "result",
       subtype: "success",
       is_error: false,
+      session_id: sessionId,
       duration_ms: Math.round(stats.totalWallMs),
       duration_api_ms: Math.round(stats.totalApiMs),
       num_turns: stats.usage.stepCount,
@@ -1172,6 +1243,7 @@ export async function handleHeadlessCommand(
         completion_tokens: stats.usage.completionTokens,
         total_tokens: stats.usage.totalTokens,
       },
+      uuid: resultUuid,
     };
     console.log(JSON.stringify(resultEvent));
   } else {

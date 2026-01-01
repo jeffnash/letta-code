@@ -104,10 +104,16 @@ export function ModelSelector({
   );
 
   // Supported models: models.json entries that are available
+  // Featured models first, then non-featured, preserving JSON order within each group
   const supportedModels = useMemo(() => {
     if (availableHandles === undefined) return [];
-    if (availableHandles === null) return typedModels; // fallback
-    return typedModels.filter((m) => availableHandles.has(m.handle));
+    const available =
+      availableHandles === null
+        ? typedModels // fallback
+        : typedModels.filter((m) => availableHandles.has(m.handle));
+    const featured = available.filter((m) => m.isFeatured);
+    const nonFeatured = available.filter((m) => !m.isFeatured);
+    return [...featured, ...nonFeatured];
   }, [typedModels, availableHandles]);
 
   // All other models: API handles not in models.json
@@ -179,6 +185,12 @@ export function ModelSelector({
 
   useInput(
     (input, key) => {
+      // CTRL-C: immediately cancel (bypasses search clearing)
+      if (key.ctrl && input === "c") {
+        onCancel();
+        return;
+      }
+
       // Handle ESC: clear search first if active, otherwise cancel
       if (key.escape) {
         if (searchQuery) {
@@ -258,7 +270,7 @@ export function ModelSelector({
   );
 
   const getCategoryLabel = (cat: ModelCategory) => {
-    if (cat === "supported") return `Supported (${supportedModels.length})`;
+    if (cat === "supported") return `Recommended (${supportedModels.length})`;
     return `All Available Models (${otherModelHandles.length})`;
   };
 
@@ -277,6 +289,7 @@ export function ModelSelector({
                 {i > 0 && <Text dimColor> · </Text>}
                 <Text
                   bold={cat === category}
+                  dimColor={cat !== category}
                   color={
                     cat === category
                       ? colors.selector.itemHighlighted
@@ -349,13 +362,15 @@ export function ModelSelector({
                 <Text
                   bold={isSelected}
                   color={
-                    isSelected ? colors.selector.itemHighlighted : undefined
+                    isSelected
+                      ? colors.selector.itemHighlighted
+                      : isCurrent
+                        ? colors.selector.itemCurrent
+                        : undefined
                   }
                 >
                   {model.label}
-                  {isCurrent && (
-                    <Text color={colors.selector.itemCurrent}> (current)</Text>
-                  )}
+                  {isCurrent && <Text> (current)</Text>}
                 </Text>
                 {model.description && (
                   <Text dimColor> {model.description}</Text>

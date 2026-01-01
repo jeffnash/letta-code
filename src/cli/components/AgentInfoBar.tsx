@@ -1,6 +1,7 @@
 import { Box, Text } from "ink";
 import Link from "ink-link";
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
+import { DEFAULT_AGENT_NAME } from "../../constants";
 import { settingsManager } from "../../settings-manager";
 import { colors } from "./colors";
 
@@ -11,9 +12,9 @@ interface AgentInfoBarProps {
 }
 
 /**
- * Shows agent info bar with current agent details and useful links
+ * Shows agent info bar with current agent details and useful links.
  */
-export function AgentInfoBar({
+export const AgentInfoBar = memo(function AgentInfoBar({
   agentId,
   agentName,
   serverUrl,
@@ -39,28 +40,32 @@ export function AgentInfoBar({
       borderStyle="round"
       borderColor={colors.command.border}
       paddingX={1}
-      marginBottom={1}
     >
       <Box>
-        <Text color="gray">Current agent: </Text>
         <Text bold>{agentName || "Unnamed"}</Text>
         {isPinned ? (
           <Text color="green"> (pinned ✓)</Text>
+        ) : agentName === DEFAULT_AGENT_NAME || !agentName ? (
+          <Text color="gray"> (type /pin to give your agent a real name!)</Text>
         ) : (
           <Text color="gray"> (type /pin to pin agent)</Text>
         )}
+        <Text dimColor> · {agentId}</Text>
       </Box>
       <Box>
-        <Text dimColor>{agentId}</Text>
         {isCloudUser && (
           <>
-            <Text dimColor> · </Text>
             <Link url={`https://app.letta.com/agents/${agentId}`}>
-              <Text color={colors.link.text}>Open in ADE ↗</Text>
+              <Text>Open in ADE ↗ </Text>
             </Link>
-            <Text dimColor> · </Text>
+          </>
+        )}
+      </Box>
+      <Box>
+        {isCloudUser && (
+          <>
             <Link url="https://app.letta.com/settings/organization/usage">
-              <Text color={colors.link.text}>View usage ↗</Text>
+              <Text>View usage ↗ </Text>
             </Link>
           </>
         )}
@@ -68,4 +73,4 @@ export function AgentInfoBar({
       </Box>
     </Box>
   );
-}
+});

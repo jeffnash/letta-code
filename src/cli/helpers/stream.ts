@@ -71,6 +71,9 @@ export async function drainStream(
   } else if (abortSignal?.aborted) {
     // Already aborted before we started
     abortedViaListener = true;
+    if (stream.controller && !stream.controller.signal.aborted) {
+      stream.controller.abort();
+    }
   }
 
   try {
@@ -329,6 +332,15 @@ export async function drainStreamWithResume(
 
     try {
       const client = await getClient();
+
+      // Reset interrupted flag so resumed chunks can be processed by onChunk.
+      // Without this, tool_return_message for server-side tools (web_search, fetch_webpage)
+      // would be silently ignored, showing "Interrupted by user" even on successful resume.
+      // Increment commitGeneration to invalidate any pending setTimeout refreshes that would
+      // commit the stale "Interrupted by user" state before the resume stream completes.
+      buffers.commitGeneration = (buffers.commitGeneration || 0) + 1;
+      buffers.interrupted = false;
+
       // Resume from Redis where we left off
       const resumeStream = await client.runs.messages.stream(result.lastRunId, {
         starting_after: result.lastSeqId,

@@ -145,7 +145,7 @@ export const colors = {
     removedWordBg: "#7a2d2d",
     contextLineBg: undefined,
     textOnDark: "white",
-    textOnHighlight: "black",
+    textOnHighlight: "white",
     symbolAdd: "green",
     symbolRemove: "red",
     symbolContext: undefined,
@@ -162,5 +162,10 @@ export const colors = {
     normal: "white",
     dim: "gray",
     bold: "white",
+  },
+
+  // Footer bar
+  footer: {
+    agentName: brandColors.primaryAccent,
   },
 } as const;

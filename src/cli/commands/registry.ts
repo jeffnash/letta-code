@@ -12,12 +12,12 @@ interface Command {
 
 export const commands: Record<string, Command> = {
   // === Page 1: Most commonly used (order 10-19) ===
-  "/pinned": {
-    desc: "Browse pinned agents",
+  "/agents": {
+    desc: "Browse agents (pinned, Letta Code, all)",
     order: 10,
     handler: () => {
-      // Handled specially in App.tsx to open pinned agents selector
-      return "Opening pinned agents...";
+      // Handled specially in App.tsx to open agent browser
+      return "Opening agent browser...";
     },
   },
   "/model": {
@@ -68,7 +68,7 @@ export const commands: Record<string, Command> = {
     },
   },
   "/clear": {
-    desc: "Clear conversation history",
+    desc: "Clear conversation history (keep memory)",
     order: 17,
     handler: () => {
       // Handled specially in App.tsx to access client and agent ID
@@ -83,14 +83,6 @@ export const commands: Record<string, Command> = {
     handler: () => {
       // Handled specially in App.tsx
       return "Creating new agent...";
-    },
-  },
-  "/agents": {
-    desc: "Browse all agents",
-    order: 21,
-    handler: () => {
-      // Handled specially in App.tsx to show agent selector
-      return "Opening agent selector...";
     },
   },
   "/pin": {
@@ -139,6 +131,14 @@ export const commands: Record<string, Command> = {
     handler: () => {
       // Handled specially in App.tsx to access agent ID and client
       return "Opening toolset selector...";
+    },
+  },
+  "/ade": {
+    desc: "Open agent in ADE (browser)",
+    order: 28,
+    handler: () => {
+      // Handled specially in App.tsx to access agent ID and open browser
+      return "Opening ADE...";
     },
   },
 
@@ -190,6 +190,58 @@ export const commands: Record<string, Command> = {
     handler: () => {
       // Handled specially in App.tsx to open help dialog
       return "Opening help...";
+    },
+  },
+  "/terminal": {
+    desc: "Setup terminal shortcuts [--revert]",
+    order: 36,
+    handler: async (args: string[]) => {
+      const {
+        detectTerminalType,
+        getKeybindingsPath,
+        installKeybinding,
+        removeKeybinding,
+      } = await import("../utils/terminalKeybindingInstaller");
+      const { updateSettings } = await import("../../settings");
+
+      const isRevert = args.includes("--revert") || args.includes("--remove");
+      const terminal = detectTerminalType();
+
+      if (!terminal) {
+        return "Not running in a VS Code-like terminal. Shift+Enter keybinding is not needed.";
+      }
+
+      const terminalName = {
+        vscode: "VS Code",
+        cursor: "Cursor",
+        windsurf: "Windsurf",
+      }[terminal];
+
+      const keybindingsPath = getKeybindingsPath(terminal);
+      if (!keybindingsPath) {
+        return `Could not determine keybindings.json path for ${terminalName}`;
+      }
+
+      if (isRevert) {
+        const result = removeKeybinding(keybindingsPath);
+        if (!result.success) {
+          return `Failed to remove keybinding: ${result.error}`;
+        }
+        await updateSettings({ shiftEnterKeybindingInstalled: false });
+        return `Removed Shift+Enter keybinding from ${terminalName}`;
+      }
+
+      const result = installKeybinding(keybindingsPath);
+      if (!result.success) {
+        return `Failed to install keybinding: ${result.error}`;
+      }
+
+      if (result.alreadyExists) {
+        return `Shift+Enter keybinding already exists in ${terminalName}`;
+      }
+
+      await updateSettings({ shiftEnterKeybindingInstalled: true });
+      return `Installed Shift+Enter keybinding for ${terminalName}\nLocation: ${keybindingsPath}`;
     },
   },
 
@@ -274,6 +326,20 @@ export const commands: Record<string, Command> = {
     handler: () => {
       // Handled specially in App.tsx to show agent selector
       return "Opening agent selector...";
+    },
+  },
+  "/pinned": {
+    desc: "Browse pinned agents",
+    hidden: true, // Alias for /agents (opens to Pinned tab)
+    handler: () => {
+      return "Opening agent browser...";
+    },
+  },
+  "/profiles": {
+    desc: "Browse pinned agents",
+    hidden: true, // Alias for /agents (opens to Pinned tab)
+    handler: () => {
+      return "Opening agent browser...";
     },
   },
 };

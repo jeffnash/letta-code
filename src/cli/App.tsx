@@ -24,6 +24,7 @@ import { getClient } from "../agent/client";
 import { getCurrentAgentId, setCurrentAgentId } from "../agent/context";
 import { type AgentProvenance, createAgent } from "../agent/create";
 import { sendMessageStream } from "../agent/message";
+import { getModelDisplayName, getModelInfo } from "../agent/model";
 import { SessionStats } from "../agent/stats";
 import type { ApprovalContext } from "../permissions/analyzer";
 import { type PermissionMode, permissionMode } from "../permissions/mode";
@@ -53,15 +54,21 @@ import {
   validateProfileLoad,
 } from "./commands/profile";
 import { AgentSelector } from "./components/AgentSelector";
-import { ApprovalDialog } from "./components/ApprovalDialogRich";
+// ApprovalDialog removed - all approvals now render inline
 import { AssistantMessage } from "./components/AssistantMessageRich";
 import { BashCommandMessage } from "./components/BashCommandMessage";
 import { CommandMessage } from "./components/CommandMessage";
 import { colors } from "./components/colors";
-import { EnterPlanModeDialog } from "./components/EnterPlanModeDialog";
+// EnterPlanModeDialog removed - now using InlineEnterPlanModeApproval
 import { ErrorMessage } from "./components/ErrorMessageRich";
 import { FeedbackDialog } from "./components/FeedbackDialog";
 import { HelpDialog } from "./components/HelpDialog";
+import { InlineBashApproval } from "./components/InlineBashApproval";
+import { InlineEnterPlanModeApproval } from "./components/InlineEnterPlanModeApproval";
+import { InlineFileEditApproval } from "./components/InlineFileEditApproval";
+import { InlineGenericApproval } from "./components/InlineGenericApproval";
+import { InlinePlanApproval } from "./components/InlinePlanApproval";
+import { InlineQuestionApproval } from "./components/InlineQuestionApproval";
 import { Input } from "./components/InputRich";
 import { McpSelector } from "./components/McpSelector";
 import { MemoryViewer } from "./components/MemoryViewer";
@@ -70,9 +77,7 @@ import { ModelSelector } from "./components/ModelSelector";
 import { NewAgentDialog } from "./components/NewAgentDialog";
 import { OAuthCodeDialog } from "./components/OAuthCodeDialog";
 import { PinDialog, validateAgentName } from "./components/PinDialog";
-import { PlanModeDialog } from "./components/PlanModeDialog";
-import { ProfileSelector } from "./components/ProfileSelector";
-import { QuestionDialog } from "./components/QuestionDialog";
+// QuestionDialog removed - now using InlineQuestionApproval
 import { ReasoningMessage } from "./components/ReasoningMessageRich";
 import { ResumeSelector } from "./components/ResumeSelector";
 import { formatUsageStats } from "./components/SessionStats";
@@ -84,7 +89,7 @@ import { SystemPromptSelector } from "./components/SystemPromptSelector";
 import { ToolCallMessage } from "./components/ToolCallMessageRich";
 import { ToolsetSelector } from "./components/ToolsetSelector";
 import { UserMessage } from "./components/UserMessageRich";
-import { getAgentStatusHints, WelcomeScreen } from "./components/WelcomeScreen";
+import { WelcomeScreen } from "./components/WelcomeScreen";
 import {
   type Buffers,
   createBuffers,
@@ -127,12 +132,18 @@ import {
   isFileEditTool,
   isFileWriteTool,
   isPatchTool,
+  isShellTool,
 } from "./helpers/toolNameMapping";
-import { isFancyUITool, isTaskTool } from "./helpers/toolNameMapping.js";
+import {
+  alwaysRequiresUserInput,
+  isFancyUITool,
+  isTaskTool,
+} from "./helpers/toolNameMapping.js";
 import { useSuspend } from "./hooks/useSuspend/useSuspend.ts";
 import { useSyncedState } from "./hooks/useSyncedState";
 import { useTerminalWidth } from "./hooks/useTerminalWidth";
 
+// Used only for terminal resize, not for dialog dismissal (see PR for details)
 const CLEAR_SCREEN_AND_HOME = "\u001B[2J\u001B[H";
 
 // Feature flag: Check for pending approvals before sending messages
@@ -154,6 +165,13 @@ function uid(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// Send desktop notification via terminal bell
+// Modern terminals (iTerm2, Ghostty, WezTerm, Kitty) convert this to a desktop
+// notification when the terminal is not focused
+function sendDesktopNotification() {
+  process.stdout.write("\x07");
+}
+
 // Check if error is retriable based on stop reason and run metadata
 async function isRetriableError(
   stopReason: StopReasonType,
@@ -171,9 +189,37 @@ async function isRetriableError(
       const client = await getClient();
       const run = await client.runs.retrieve(lastRunId);
       const metaError = run.metadata?.error as
-        | { error_type?: string }
+        | {
+            error_type?: string;
+            detail?: string;
+            // Handle nested error structure (error.error) that can occur in some edge cases
+            error?: { error_type?: string; detail?: string };
+          }
         | undefined;
-      return metaError?.error_type === "llm_error";
+
+      // Check for llm_error at top level or nested (handles error.error nesting)
+      const errorType = metaError?.error_type ?? metaError?.error?.error_type;
+      if (errorType === "llm_error") return true;
+
+      // Fallback: detect LLM provider errors from detail even if misclassified as internal_error
+      // This handles edge cases where streaming errors weren't properly converted to LLMError
+      // Patterns are derived from handle_llm_error() message formats in the backend
+      const detail = metaError?.detail ?? metaError?.error?.detail ?? "";
+      const llmProviderPatterns = [
+        "Anthropic API error", // anthropic_client.py:759
+        "OpenAI API error", // openai_client.py:1034
+        "Google Vertex API error", // google_vertex_client.py:848
+        "overloaded", // anthropic_client.py:753 - used for LLMProviderOverloaded
+        "api_error", // Anthropic SDK error type field
+      ];
+      if (
+        errorType === "internal_error" &&
+        llmProviderPatterns.some((pattern) => detail.includes(pattern))
+      ) {
+        return true;
+      }
+
+      return false;
     } catch {
       return false;
     }
@@ -203,7 +249,7 @@ function getPlanModeReminder(): string {
 
   // Generate dynamic reminder with plan file path
   return `<system-reminder>
-Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits (with the exception of the plan file mentioned below), run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supercedes any other instructions you have received.
+      Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits (with the exception of the plan file mentioned below), run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supersedes any other instructions you have received.
 
 ## Plan File Info:
 ${planFilePath ? `No plan file exists yet. You should create your plan at ${planFilePath} using a write tool (e.g. Write, ApplyPatch, etc. depending on your toolset).` : "No plan file path assigned."}
@@ -473,6 +519,7 @@ export default function App({
   // Derive current approval from pending approvals and results
   // This is the approval currently being shown to the user
   const currentApproval = pendingApprovals[approvalResults.length];
+  const currentApprovalContext = approvalContexts[approvalResults.length];
 
   // Overlay/selector state - only one can be open at a time
   type ActiveOverlay =
@@ -481,7 +528,6 @@ export default function App({
     | "system"
     | "agent"
     | "resume"
-    | "profile"
     | "search"
     | "subagent"
     | "feedback"
@@ -531,7 +577,10 @@ export default function App({
     llmConfig?.model_endpoint_type && llmConfig?.model
       ? `${llmConfig.model_endpoint_type}/${llmConfig.model}`
       : (llmConfig?.model ?? null);
-  const currentModelDisplay = currentModelLabel?.split("/").pop() ?? null;
+  const currentModelDisplay = currentModelLabel
+    ? (getModelDisplayName(currentModelLabel) ??
+      currentModelLabel.split("/").pop())
+    : null;
   const currentModelProvider = llmConfig?.provider_name ?? null;
 
   // Token streaming preference (can be toggled at runtime)
@@ -744,7 +793,11 @@ export default function App({
     new Map(),
   );
 
-  // Recompute UI state from buffers after chunks (micro-batched)
+  // Store the last plan file path for post-approval rendering
+  // (needed because plan mode is exited before rendering the result)
+  const lastPlanFilePathRef = useRef<string | null>(null);
+
+  // Recompute UI state from buffers after each streaming chunk
   const refreshDerived = useCallback(() => {
     const b = buffersRef.current;
     setTokenCount(b.tokenCount);
@@ -758,11 +811,18 @@ export default function App({
     // Use a ref to track pending refresh
     if (!buffersRef.current.pendingRefresh) {
       buffersRef.current.pendingRefresh = true;
+      // Capture the current generation to detect if resume invalidates this refresh
+      const capturedGeneration = buffersRef.current.commitGeneration || 0;
       setTimeout(() => {
         buffersRef.current.pendingRefresh = false;
         // Skip refresh if stream was interrupted - prevents stale updates appearing
         // after user cancels. Normal stream completion still renders (interrupted=false).
-        if (!buffersRef.current.interrupted) {
+        // Also skip if commitGeneration changed - this means a resume is in progress and
+        // committing now would lock in the stale "Interrupted by user" state.
+        if (
+          !buffersRef.current.interrupted &&
+          (buffersRef.current.commitGeneration || 0) === capturedGeneration
+        ) {
           refreshDerived();
         }
       }, 16); // ~60fps
@@ -843,15 +903,35 @@ export default function App({
       const shortCwd = cwd.startsWith(process.env.HOME || "")
         ? `~${cwd.slice((process.env.HOME || "").length)}`
         : cwd;
-      const agentUrl = agentState?.id
-        ? `https://app.letta.com/agents/${agentState.id}`
-        : null;
-      const statusLines = [
-        `Connecting to last used agent in ${shortCwd}`,
-        agentState?.name ? `→ Agent: ${agentState.name}` : "",
-        agentUrl ? `→ ${agentUrl}` : "",
-        "→ Use /pinned or /agents to switch agents",
-      ].filter(Boolean);
+
+      // Check if agent is pinned (locally or globally)
+      const isPinned = agentState?.id
+        ? settingsManager.getLocalPinnedAgents().includes(agentState.id) ||
+          settingsManager.getGlobalPinnedAgents().includes(agentState.id)
+        : false;
+
+      // Build status message
+      const agentName = agentState?.name || "Unnamed Agent";
+      const headerMessage = `Connecting to **${agentName}** (last used in ${shortCwd})`;
+
+      // Command hints - for pinned agents show /memory, for unpinned show /pin
+      const commandHints = isPinned
+        ? [
+            "→ **/memory**    view your agent's memory blocks",
+            "→ **/init**      initialize your agent's memory",
+            "→ **/remember**  teach your agent",
+            "→ **/agents**    list agents",
+            "→ **/ade**       open in the browser (web UI)",
+          ]
+        : [
+            "→ **/pin**       save + name your agent",
+            "→ **/init**      initialize your agent's memory",
+            "→ **/remember**  teach your agent",
+            "→ **/agents**    list agents",
+            "→ **/ade**       open in the browser (web UI)",
+          ];
+
+      const statusLines = [headerMessage, ...commandHints];
       buffersRef.current.byId.set(statusId, {
         kind: "status",
         id: statusId,
@@ -889,6 +969,18 @@ export default function App({
             .last_run_completion;
           setAgentLastRunAt(lastRunCompletion ?? null);
 
+          // Derive model ID from llm_config for ModelSelector
+          const agentModelHandle =
+            agent.llm_config.model_endpoint_type && agent.llm_config.model
+              ? `${agent.llm_config.model_endpoint_type}/${agent.llm_config.model}`
+              : agent.llm_config.model;
+          const modelInfo = getModelInfo(agentModelHandle || "");
+          if (modelInfo) {
+            setCurrentModelId(modelInfo.id);
+          } else {
+            setCurrentModelId(agentModelHandle || null);
+          }
+
           // Detect current toolset from attached tools
           const { detectToolsetFromAgent } = await import("../tools/toolset");
           const detected = await detectToolsetFromAgent(client, agentId);
@@ -907,18 +999,26 @@ export default function App({
   // Also tracks the error in telemetry so we know an error was shown
   const appendError = useCallback(
     (message: string, skipTelemetry = false) => {
+      // Defensive: ensure message is always a string (guards against [object Object])
+      const text =
+        typeof message === "string"
+          ? message
+          : message != null
+            ? JSON.stringify(message)
+            : "[Unknown error]";
+
       const id = uid("err");
       buffersRef.current.byId.set(id, {
         kind: "error",
         id,
-        text: message,
+        text,
       });
       buffersRef.current.order.push(id);
       refreshDerived();
 
       // Track error in telemetry (unless explicitly skipped for user-initiated actions)
       if (!skipTelemetry) {
-        telemetry.trackError("ui_error", message, "error_display", {
+        telemetry.trackError("ui_error", text, "error_display", {
           modelId: currentModelId || undefined,
         });
       }
@@ -927,7 +1027,6 @@ export default function App({
   );
 
   // Core streaming function - iterative loop that processes conversation turns
-  // biome-ignore lint/correctness/useExhaustiveDependencies: refs read .current dynamically
   const processConversation = useCallback(
     async (
       initialInput: Array<MessageCreate | ApprovalCreate>,
@@ -1066,13 +1165,24 @@ export default function App({
           sessionStatsRef.current.endTurn(apiDurationMs);
           sessionStatsRef.current.updateUsageFromBuffers(buffersRef.current);
 
-          // Immediate refresh after stream completes to show final state
-          refreshDerived();
+          const wasInterrupted = !!buffersRef.current.interrupted;
+
+          // Immediate refresh after stream completes to show final state unless
+          // the user already cancelled (handleInterrupt rendered the UI).
+          if (!wasInterrupted) {
+            refreshDerived();
+          }
 
           // Case 1: Turn ended normally
           if (stopReason === "end_turn") {
             setStreaming(false);
             llmApiErrorRetriesRef.current = 0; // Reset retry counter on success
+
+            // Send desktop notification when turn completes
+            // and we're not about to auto-send another queued message
+            if (!waitingForQueueCancelRef.current) {
+              sendDesktopNotification();
+            }
 
             // Check if we were waiting for cancel but stream finished naturally
             if (waitingForQueueCancelRef.current) {
@@ -1264,9 +1374,11 @@ export default function App({
               const { approval, permission } = ac;
               let decision = permission.decision;
 
-              // Fancy tools should always go through a UI dialog in interactive mode,
-              // even if a rule says "allow". Deny rules are still respected.
-              if (isFancyUITool(approval.toolName) && decision === "allow") {
+              // Some tools always need user input regardless of yolo mode
+              if (
+                alwaysRequiresUserInput(approval.toolName) &&
+                decision === "allow"
+              ) {
                 decision = "ask";
               }
 
@@ -1280,8 +1392,9 @@ export default function App({
               }
             }
 
-            // Precompute diffs for auto-allowed file edit tools before execution
-            for (const ac of autoAllowed) {
+            // Precompute diffs for file edit tools before execution (both auto-allowed and needs-user-input)
+            // This is needed for inline approval UI to show diffs, and for post-approval rendering
+            for (const ac of [...autoAllowed, ...needsUserInput]) {
               const toolName = ac.approval.toolName;
               const toolCallId = ac.approval.toolCallId;
               try {
@@ -1542,6 +1655,8 @@ export default function App({
             setAutoHandledResults(autoAllowedResults);
             setAutoDeniedApprovals(autoDeniedResults);
             setStreaming(false);
+            // Notify user that approval is needed
+            sendDesktopNotification();
             return;
           }
 
@@ -1622,6 +1737,7 @@ export default function App({
               : `Stream error: ${fallbackError}`;
             appendError(errorMsg, true); // Skip telemetry - already tracked above
             setStreaming(false);
+            sendDesktopNotification(); // Notify user of error
             refreshDerived();
             return;
           }
@@ -1676,6 +1792,7 @@ export default function App({
           }
 
           setStreaming(false);
+          sendDesktopNotification(); // Notify user of error
           refreshDerived();
           return;
         }
@@ -1715,6 +1832,7 @@ export default function App({
         const errorDetails = formatErrorDetails(e, agentIdRef.current);
         appendError(errorDetails, true); // Skip telemetry - already tracked above with more context
         setStreaming(false);
+        sendDesktopNotification(); // Notify user of error
         refreshDerived();
       } finally {
         abortControllerRef.current = null;
@@ -1852,13 +1970,6 @@ export default function App({
   useEffect(() => {
     processConversationRef.current = processConversation;
   }, [processConversation]);
-
-  // Reset interrupt flag when streaming ends
-  useEffect(() => {
-    if (!streaming) {
-      setInterruptRequested(false);
-    }
-  }, [streaming]);
 
   const handleAgentSelect = useCallback(
     async (targetAgentId: string, _opts?: { profileName?: string }) => {
@@ -2257,6 +2368,32 @@ export default function App({
           return { submitted: true };
         }
 
+        // Special handling for /ade command - open agent in browser
+        if (trimmed === "/ade") {
+          const adeUrl = `https://app.letta.com/agents/${agentId}`;
+          const cmdId = uid("cmd");
+
+          // Fire-and-forget browser open
+          import("open")
+            .then(({ default: open }) => open(adeUrl, { wait: false }))
+            .catch(() => {
+              // Silently ignore - user can use the URL from the output
+            });
+
+          // Always show the URL in case browser doesn't open
+          buffersRef.current.byId.set(cmdId, {
+            kind: "command",
+            id: cmdId,
+            input: "/ade",
+            output: `Opening ADE...\n→ ${adeUrl}`,
+            phase: "finished",
+            success: true,
+          });
+          buffersRef.current.order.push(cmdId);
+          refreshDerived();
+          return { submitted: true };
+        }
+
         // Special handling for /system command - opens system prompt selector
         if (trimmed === "/system") {
           setActiveOverlay("system");
@@ -2477,7 +2614,8 @@ export default function App({
 
           try {
             const { settingsManager } = await import("../settings-manager");
-            const currentSettings = settingsManager.getSettings();
+            const currentSettings =
+              await settingsManager.getSettingsWithSecureTokens();
 
             // Revoke refresh token on server if we have one
             if (currentSettings.refreshToken) {
@@ -2485,17 +2623,8 @@ export default function App({
               await revokeToken(currentSettings.refreshToken);
             }
 
-            // Clear local credentials
-            const newEnv = { ...currentSettings.env };
-            delete newEnv.LETTA_API_KEY;
-            // Note: LETTA_BASE_URL is intentionally NOT deleted from settings
-            // because it should not be stored there in the first place
-
-            settingsManager.updateSettings({
-              env: newEnv,
-              refreshToken: undefined,
-              tokenExpiresAt: undefined,
-            });
+            // Clear all credentials including secrets
+            await settingsManager.logout();
 
             buffersRef.current.byId.set(cmdId, {
               kind: "command",
@@ -2888,8 +3017,14 @@ export default function App({
           return { submitted: true };
         }
 
-        // Special handling for /agents command - show agent selector (/resume is hidden alias)
-        if (msg.trim() === "/agents" || msg.trim() === "/resume") {
+        // Special handling for /agents command - show agent browser
+        // /resume, /pinned, /profiles are hidden aliases
+        if (
+          msg.trim() === "/agents" ||
+          msg.trim() === "/resume" ||
+          msg.trim() === "/pinned" ||
+          msg.trim() === "/profiles"
+        ) {
           setActiveOverlay("resume");
           return { submitted: true };
         }
@@ -2915,9 +3050,9 @@ export default function App({
             setAgentName,
           };
 
-          // /profile - open profile selector
+          // /profile - open agent browser (now points to /agents)
           if (!subcommand) {
-            setActiveOverlay("profile");
+            setActiveOverlay("resume");
             return { submitted: true };
           }
 
@@ -2973,12 +3108,6 @@ export default function App({
 
           // Unknown subcommand
           handleProfileUsage(profileCtx, msg);
-          return { submitted: true };
-        }
-
-        // Special handling for /profiles and /pinned commands - open pinned agents selector
-        if (msg.trim() === "/profiles" || msg.trim() === "/pinned") {
-          setActiveOverlay("profile");
           return { submitted: true };
         }
 
@@ -3791,8 +3920,11 @@ DO NOT respond to these messages or otherwise consider them in your response unl
               const { approval, permission } = ac;
               let decision = permission.decision;
 
-              // Fancy tools always need user input (except if denied)
-              if (isFancyUITool(approval.toolName) && decision === "allow") {
+              // Some tools always need user input regardless of yolo mode
+              if (
+                alwaysRequiresUserInput(approval.toolName) &&
+                decision === "allow"
+              ) {
                 decision = "ask";
               }
 
@@ -3807,8 +3939,8 @@ DO NOT respond to these messages or otherwise consider them in your response unl
 
             // If all approvals can be auto-handled (yolo mode), process them immediately
             if (needsUserInput.length === 0) {
-              // Precompute diffs for auto-allowed file edit tools before execution
-              for (const ac of autoAllowed) {
+              // Precompute diffs for file edit tools before execution (both auto-allowed and needs-user-input)
+              for (const ac of [...autoAllowed, ...needsUserInput]) {
                 const toolName = ac.approval.toolName;
                 const toolCallId = ac.approval.toolCallId;
                 try {
@@ -3963,8 +4095,8 @@ DO NOT respond to these messages or otherwise consider them in your response unl
                   .filter(Boolean) as ApprovalContext[],
               );
 
-              // Precompute diffs for auto-allowed file edit tools before execution
-              for (const ac of autoAllowed) {
+              // Precompute diffs for file edit tools before execution (both auto-allowed and needs-user-input)
+              for (const ac of [...autoAllowed, ...needsUserInput]) {
                 const toolName = ac.approval.toolName;
                 const toolCallId = ac.approval.toolCallId;
                 try {
@@ -4385,8 +4517,6 @@ DO NOT respond to these messages or otherwise consider them in your response unl
     ) => {
       if (isExecutingTool) return;
 
-      // For now, just handle the first approval with approve-always
-      // TODO: Support approve-always for multiple approvals
       if (pendingApprovals.length === 0 || approvalContexts.length === 0)
         return;
 
@@ -4413,8 +4543,99 @@ DO NOT respond to these messages or otherwise consider them in your response unl
       buffersRef.current.order.push(cmdId);
       refreshDerived();
 
-      // Approve current tool (handleApproveCurrent manages the execution guard)
-      // Pass diffs through to store them before execution
+      // Re-check remaining approvals against the newly saved permission
+      // This allows subsequent approvals that match the new rule to be auto-allowed
+      const remainingApprovals = pendingApprovals.slice(currentIndex + 1);
+      if (remainingApprovals.length > 0) {
+        const recheckResults = await Promise.all(
+          remainingApprovals.map(async (approval) => {
+            const parsedArgs = safeJsonParseOr<Record<string, unknown>>(
+              approval.toolArgs,
+              {},
+            );
+            const permission = await checkToolPermission(
+              approval.toolName,
+              parsedArgs,
+            );
+            return { approval, permission };
+          }),
+        );
+
+        const nowAutoAllowed = recheckResults.filter(
+          (r) => r.permission.decision === "allow",
+        );
+        const stillNeedAsking = recheckResults.filter(
+          (r) => r.permission.decision === "ask",
+        );
+
+        // Only auto-handle if ALL remaining are now allowed
+        // (avoids complex state synchronization issues with partial batches)
+        if (stillNeedAsking.length === 0 && nowAutoAllowed.length > 0) {
+          const currentApproval = pendingApprovals[currentIndex];
+          if (!currentApproval) return;
+
+          // Store diffs before execution
+          if (diffs) {
+            for (const [key, diff] of diffs) {
+              precomputedDiffsRef.current.set(key, diff);
+            }
+          }
+
+          setIsExecutingTool(true);
+
+          // Build ALL decisions: current + auto-allowed remaining
+          const allDecisions: Array<{
+            type: "approve";
+            approval: ApprovalRequest;
+          }> = [
+            { type: "approve", approval: currentApproval },
+            ...nowAutoAllowed.map((r) => ({
+              type: "approve" as const,
+              approval: r.approval,
+            })),
+          ];
+
+          // Clear dialog state immediately
+          setPendingApprovals([]);
+          setApprovalContexts([]);
+          setApprovalResults([]);
+          setAutoHandledResults([]);
+          setAutoDeniedApprovals([]);
+
+          setStreaming(true);
+          buffersRef.current.interrupted = false;
+
+          try {
+            // Execute ALL decisions together
+            const { executeApprovalBatch } = await import(
+              "../agent/approval-execution"
+            );
+            const executedResults = await executeApprovalBatch(
+              allDecisions,
+              (chunk) => {
+                onChunk(buffersRef.current, chunk);
+                refreshDerived();
+              },
+            );
+
+            setThinkingMessage(getRandomThinkingVerb());
+            refreshDerived();
+
+            // Continue conversation with all results
+            await processConversation([
+              {
+                type: "approval",
+                approvals: executedResults as ApprovalResult[],
+              },
+            ]);
+          } finally {
+            setIsExecutingTool(false);
+          }
+          return; // Don't call handleApproveCurrent - we handled everything
+        }
+      }
+
+      // Fallback: proceed with normal flow (will prompt for remaining approvals)
       await handleApproveCurrent(diffs);
     },
     [
@@ -4422,8 +4643,10 @@ DO NOT respond to these messages or otherwise consider them in your response unl
       approvalContexts,
       pendingApprovals,
       handleApproveCurrent,
+      processConversation,
       refreshDerived,
       isExecutingTool,
+      setStreaming,
     ],
   );
 
@@ -4911,6 +5134,10 @@ DO NOT respond to these messages or otherwise consider them in your response unl
 
       const isLast = currentIndex + 1 >= pendingApprovals.length;
 
+      // Capture plan file path BEFORE exiting plan mode (for post-approval rendering)
+      const planFilePath = permissionMode.getPlanFilePath();
+      lastPlanFilePathRef.current = planFilePath;
+
       // Exit plan mode
       const newMode = acceptEdits ? "acceptEdits" : "default";
       permissionMode.setMode(newMode);
@@ -5205,31 +5432,44 @@ Plan file path: ${planFilePath}`;
       ]);
 
       // Add status line showing agent info
-      const agentUrl = agentState?.id
-        ? `https://app.letta.com/agents/${agentState.id}`
-        : null;
       const statusId = `status-agent-${Date.now().toString(36)}`;
-      const hints = getAgentStatusHints(
-        !!continueSession,
-        agentState,
-        agentProvenance,
-      );
-      // For resumed agents, show the agent name if it has one (profile name)
-      const resumedMessage = continueSession
-        ? agentState?.name
-          ? `Resumed **${agentState.name}**`
-          : "Resumed agent"
-        : "Creating a new agent (use /pin to save)";
 
-      const statusLines = continueSession
-        ? [resumedMessage, ...hints, agentUrl ? `→ ${agentUrl}` : ""].filter(
-            Boolean,
-          )
+      // Get short path for display
+      const cwd = process.cwd();
+      const shortCwd = cwd.startsWith(process.env.HOME || "")
+        ? `~${cwd.slice((process.env.HOME || "").length)}`
+        : cwd;
+
+      // Check if agent is pinned (locally or globally)
+      const isPinned = agentState?.id
+        ? settingsManager.getLocalPinnedAgents().includes(agentState.id) ||
+          settingsManager.getGlobalPinnedAgents().includes(agentState.id)
+        : false;
+
+      // Build status message based on session type
+      const agentName = agentState?.name || "Unnamed Agent";
+      const headerMessage = continueSession
+        ? `Connecting to **${agentName}** (last used in ${shortCwd})`
+        : "Creating a new agent";
+
+      // Command hints - for pinned agents show /memory, for unpinned show /pin
+      const commandHints = isPinned
+        ? [
+            "→ **/memory**    view your agent's memory blocks",
+            "→ **/init**      initialize your agent's memory",
+            "→ **/remember**  teach your agent",
+            "→ **/agents**    list agents",
+            "→ **/ade**       open in the browser (web UI)",
+          ]
         : [
-            resumedMessage,
-            agentUrl ? `→ ${agentUrl}` : "",
-            "→ Tip: use /init to initialize your agent's memory system!",
-          ].filter(Boolean);
+            "→ **/pin**       save + name your agent",
+            "→ **/init**      initialize your agent's memory",
+            "→ **/remember**  teach your agent",
+            "→ **/agents**    list agents",
+            "→ **/ade**       open in the browser (web UI)",
+          ];
+
+      const statusLines = [headerMessage, ...commandHints];
 
       buffersRef.current.byId.set(statusId, {
         kind: "status",
@@ -5270,6 +5510,7 @@ Plan file path: ${planFilePath}`;
               <ToolCallMessage
                 line={item}
                 precomputedDiffs={precomputedDiffsRef.current}
+                lastPlanFilePath={lastPlanFilePathRef.current}
               />
             ) : item.kind === "subagent_group" ? (
               <SubagentGroupStatic agents={item.agents} />
@@ -5301,32 +5542,242 @@ Plan file path: ${planFilePath}`;
         {loadingState === "ready" && (
           <>
             {/* Transcript */}
-            {liveItems.length > 0 && pendingApprovals.length === 0 && (
+            {/* Show liveItems always - all approvals now render inline */}
+            {liveItems.length > 0 && (
               <Box flexDirection="column">
-                {liveItems.map((ln) => (
-                  <Box key={ln.id} marginTop={1}>
-                    {ln.kind === "user" ? (
-                      <UserMessage line={ln} />
-                    ) : ln.kind === "reasoning" ? (
-                      <ReasoningMessage line={ln} />
-                    ) : ln.kind === "assistant" ? (
-                      <AssistantMessage line={ln} />
-                    ) : ln.kind === "tool_call" ? (
-                      <ToolCallMessage
-                        line={ln}
-                        precomputedDiffs={precomputedDiffsRef.current}
-                      />
-                    ) : ln.kind === "error" ? (
-                      <ErrorMessage line={ln} />
-                    ) : ln.kind === "status" ? (
-                      <StatusMessage line={ln} />
-                    ) : ln.kind === "command" ? (
-                      <CommandMessage line={ln} />
-                    ) : ln.kind === "bash_command" ? (
-                      <BashCommandMessage line={ln} />
-                    ) : null}
-                  </Box>
-                ))}
+                {liveItems.map((ln) => {
+                  // Check if this tool call matches the current ExitPlanMode approval
+                  const isExitPlanModeApproval =
+                    ln.kind === "tool_call" &&
+                    currentApproval?.toolName === "ExitPlanMode" &&
+                    ln.toolCallId === currentApproval?.toolCallId;
+
+                  // Check if this tool call matches a file edit/write/patch approval
+                  const isFileEditApproval =
+                    ln.kind === "tool_call" &&
+                    currentApproval &&
+                    (isFileEditTool(currentApproval.toolName) ||
+                      isFileWriteTool(currentApproval.toolName) ||
+                      isPatchTool(currentApproval.toolName)) &&
+                    ln.toolCallId === currentApproval.toolCallId;
+
+                  // Check if this tool call matches a bash/shell approval
+                  const isBashApproval =
+                    ln.kind === "tool_call" &&
+                    currentApproval &&
+                    isShellTool(currentApproval.toolName) &&
+                    ln.toolCallId === currentApproval.toolCallId;
+
+                  // Check if this tool call matches an EnterPlanMode approval
+                  const isEnterPlanModeApproval =
+                    ln.kind === "tool_call" &&
+                    currentApproval?.toolName === "EnterPlanMode" &&
+                    ln.toolCallId === currentApproval?.toolCallId;
+
+                  // Check if this tool call matches an AskUserQuestion approval
+                  const isAskUserQuestionApproval =
+                    ln.kind === "tool_call" &&
+                    currentApproval?.toolName === "AskUserQuestion" &&
+                    ln.toolCallId === currentApproval?.toolCallId;
+
+                  // Parse file edit info from approval args
+                  const getFileEditInfo = () => {
+                    if (!isFileEditApproval || !currentApproval) return null;
+                    try {
+                      const args = JSON.parse(currentApproval.toolArgs || "{}");
+
+                      // For patch tools, use the input field
+                      if (isPatchTool(currentApproval.toolName)) {
+                        return {
+                          toolName: currentApproval.toolName,
+                          filePath: "", // Patch can have multiple files
+                          patchInput: args.input as string | undefined,
+                          toolCallId: ln.toolCallId,
+                        };
+                      }
+
+                      // For regular file edit/write tools
+                      return {
+                        toolName: currentApproval.toolName,
+                        filePath: String(args.file_path || ""),
+                        content: args.content as string | undefined,
+                        oldString: args.old_string as string | undefined,
+                        newString: args.new_string as string | undefined,
+                        replaceAll: args.replace_all as boolean | undefined,
+                        edits: args.edits as
+                          | Array<{
+                              old_string: string;
+                              new_string: string;
+                              replace_all?: boolean;
+                            }>
+                          | undefined,
+                        toolCallId: ln.toolCallId,
+                      };
+                    } catch {
+                      return null;
+                    }
+                  };
+
+                  const fileEditInfo = getFileEditInfo();
+
+                  // Parse bash info from approval args
+                  const getBashInfo = () => {
+                    if (!isBashApproval || !currentApproval) return null;
+                    try {
+                      const args = JSON.parse(currentApproval.toolArgs || "{}");
+                      const t = currentApproval.toolName.toLowerCase();
+
+                      // Handle different bash tool arg formats
+                      let command = "";
+                      let description = "";
+
+                      if (t === "shell") {
+                        // Shell tool uses command array and justification
+                        const cmdVal = args.command;
+                        command = Array.isArray(cmdVal)
+                          ? cmdVal.join(" ")
+                          : typeof cmdVal === "string"
+                            ? cmdVal
+                            : "(no command)";
+                        description =
+                          typeof args.justification === "string"
+                            ? args.justification
+                            : "";
+                      } else {
+                        // Bash/shell_command uses command string and description
+                        command =
+                          typeof args.command === "string"
+                            ? args.command
+                            : "(no command)";
+                        description =
+                          typeof args.description === "string"
+                            ? args.description
+                            : "";
+                      }
+
+                      return {
+                        toolName: currentApproval.toolName,
+                        command,
+                        description,
+                      };
+                    } catch {
+                      return null;
+                    }
+                  };
+
+                  const bashInfo = getBashInfo();
+
+                  return (
+                    <Box key={ln.id} flexDirection="column" marginTop={1}>
+                      {/* For ExitPlanMode awaiting approval: render InlinePlanApproval */}
+                      {isExitPlanModeApproval ? (
+                        <InlinePlanApproval
+                          plan={readPlanFile()}
+                          onApprove={() => handlePlanApprove(false)}
+                          onApproveAndAcceptEdits={() =>
+                            handlePlanApprove(true)
+                          }
+                          onKeepPlanning={handlePlanKeepPlanning}
+                          isFocused={true}
+                        />
+                      ) : isFileEditApproval && fileEditInfo ? (
+                        <InlineFileEditApproval
+                          fileEdit={fileEditInfo}
+                          precomputedDiff={
+                            ln.toolCallId
+                              ? precomputedDiffsRef.current.get(ln.toolCallId)
+                              : undefined
+                          }
+                          allDiffs={precomputedDiffsRef.current}
+                          onApprove={(diffs) => handleApproveCurrent(diffs)}
+                          onApproveAlways={(scope, diffs) =>
+                            handleApproveAlways(scope, diffs)
+                          }
+                          onDeny={(reason) => handleDenyCurrent(reason)}
+                          onCancel={handleCancelApprovals}
+                          isFocused={true}
+                          approveAlwaysText={
+                            currentApprovalContext?.approveAlwaysText
+                          }
+                          allowPersistence={
+                            currentApprovalContext?.allowPersistence ?? true
+                          }
+                        />
+                      ) : isBashApproval && bashInfo ? (
+                        <InlineBashApproval
+                          bashInfo={bashInfo}
+                          onApprove={() => handleApproveCurrent()}
+                          onApproveAlways={(scope) =>
+                            handleApproveAlways(scope)
+                          }
+                          onDeny={(reason) => handleDenyCurrent(reason)}
+                          onCancel={handleCancelApprovals}
+                          isFocused={true}
+                          approveAlwaysText={
+                            currentApprovalContext?.approveAlwaysText
+                          }
+                          allowPersistence={
+                            currentApprovalContext?.allowPersistence ?? true
+                          }
+                        />
+                      ) : isEnterPlanModeApproval ? (
+                        <InlineEnterPlanModeApproval
+                          onApprove={handleEnterPlanModeApprove}
+                          onReject={handleEnterPlanModeReject}
+                          isFocused={true}
+                        />
+                      ) : isAskUserQuestionApproval ? (
+                        <InlineQuestionApproval
+                          questions={getQuestionsFromApproval(currentApproval)}
+                          onSubmit={handleQuestionSubmit}
+                          onCancel={handleCancelApprovals}
+                          isFocused={true}
+                        />
+                      ) : ln.kind === "tool_call" &&
+                        currentApproval &&
+                        ln.toolCallId === currentApproval.toolCallId ? (
+                        // Generic fallback for any other tool needing approval
+                        <InlineGenericApproval
+                          toolName={currentApproval.toolName}
+                          toolArgs={currentApproval.toolArgs}
+                          onApprove={() => handleApproveCurrent()}
+                          onApproveAlways={(scope) =>
+                            handleApproveAlways(scope)
+                          }
+                          onDeny={(reason) => handleDenyCurrent(reason)}
+                          onCancel={handleCancelApprovals}
+                          isFocused={true}
+                          approveAlwaysText={
+                            currentApprovalContext?.approveAlwaysText
+                          }
+                          allowPersistence={
+                            currentApprovalContext?.allowPersistence ?? true
+                          }
+                        />
+                      ) : ln.kind === "user" ? (
+                        <UserMessage line={ln} />
+                      ) : ln.kind === "reasoning" ? (
+                        <ReasoningMessage line={ln} />
+                      ) : ln.kind === "assistant" ? (
+                        <AssistantMessage line={ln} />
+                      ) : ln.kind === "tool_call" ? (
+                        <ToolCallMessage
+                          line={ln}
+                          precomputedDiffs={precomputedDiffsRef.current}
+                          lastPlanFilePath={lastPlanFilePathRef.current}
+                        />
+                      ) : ln.kind === "error" ? (
+                        <ErrorMessage line={ln} />
+                      ) : ln.kind === "status" ? (
+                        <StatusMessage line={ln} />
+                      ) : ln.kind === "command" ? (
+                        <CommandMessage line={ln} />
+                      ) : ln.kind === "bash_command" ? (
+                        <BashCommandMessage line={ln} />
+                      ) : null}
+                    </Box>
+                  );
+                })}
               </Box>
             )}
 
@@ -5342,7 +5793,14 @@ Plan file path: ${planFilePath}`;
                   })}
                 </Text>
                 <Text dimColor>Resume this agent with:</Text>
-                <Text color={colors.link.url}>letta --agent {agentId}</Text>
+                <Text color={colors.link.url}>
+                  {/* Show -n "name" if agent has name and is pinned, otherwise --agent */}
+                  {agentName &&
+                  (settingsManager.getLocalPinnedAgents().includes(agentId) ||
+                    settingsManager.getGlobalPinnedAgents().includes(agentId))
+                    ? `letta -n "${agentName}"`
+                    : `letta --agent ${agentId}`}
+                </Text>
               </Box>
             )}
 
@@ -5426,33 +5884,6 @@ Plan file path: ${planFilePath}`;
                 onSelect={async (id) => {
                   closeOverlay();
                   await handleAgentSelect(id);
-                }}
-                onCancel={closeOverlay}
-              />
-            )}
-
-            {/* Profile Selector - conditionally mounted as overlay */}
-            {activeOverlay === "profile" && (
-              <ProfileSelector
-                currentAgentId={agentId}
-                onSelect={async (id) => {
-                  closeOverlay();
-                  await handleAgentSelect(id);
-                }}
-                onUnpin={(unpinAgentId) => {
-                  closeOverlay();
-                  settingsManager.unpinBoth(unpinAgentId);
-                  const cmdId = uid("cmd");
-                  buffersRef.current.byId.set(cmdId, {
-                    kind: "command",
-                    id: cmdId,
-                    input: "/pinned",
-                    output: `Unpinned agent ${unpinAgentId.slice(0, 12)}`,
-                    phase: "finished",
-                    success: true,
-                  });
-                  buffersRef.current.order.push(cmdId);
-                  refreshDerived();
                 }}
                 onCancel={closeOverlay}
               />
@@ -5619,57 +6050,12 @@ Plan file path: ${planFilePath}`;
               />
             )}
 
-            {/* Plan Mode Dialog - for ExitPlanMode tool */}
-            {currentApproval?.toolName === "ExitPlanMode" && (
-              <PlanModeDialog
-                plan={readPlanFile()}
-                onApprove={() => handlePlanApprove(false)}
-                onApproveAndAcceptEdits={() => handlePlanApprove(true)}
-                onKeepPlanning={handlePlanKeepPlanning}
-              />
-            )}
+            {/* Plan Mode Dialog - NOW RENDERED INLINE with tool call (see liveItems above) */}
+            {/* ExitPlanMode approval is handled by InlinePlanApproval component */}
 
-            {/* Question Dialog - for AskUserQuestion tool */}
-            {currentApproval?.toolName === "AskUserQuestion" && (
-              <QuestionDialog
-                questions={getQuestionsFromApproval(currentApproval)}
-                onSubmit={handleQuestionSubmit}
-              />
-            )}
-
-            {/* Enter Plan Mode Dialog - for EnterPlanMode tool */}
-            {currentApproval?.toolName === "EnterPlanMode" && (
-              <EnterPlanModeDialog
-                onApprove={handleEnterPlanModeApprove}
-                onReject={handleEnterPlanModeReject}
-              />
-            )}
-
-            {/* Approval Dialog - for standard tools (not fancy UI tools) */}
-            {currentApproval && !isFancyUITool(currentApproval.toolName) && (
-              <ApprovalDialog
-                approvals={[currentApproval]}
-                approvalContexts={
-                  approvalContexts[approvalResults.length]
-                    ? [
-                        approvalContexts[
-                          approvalResults.length
-                        ] as ApprovalContext,
-                      ]
-                    : []
-                }
-                progress={{
-                  current: approvalResults.length + 1,
-                  total: pendingApprovals.length,
-                }}
-                totalTools={autoHandledResults.length + pendingApprovals.length}
-                isExecuting={isExecutingTool}
-                onApproveAll={handleApproveCurrent}
-                onApproveAlways={handleApproveAlways}
-                onDenyAll={handleDenyCurrent}
-                onCancel={handleCancelApprovals}
-              />
-            )}
+            {/* AskUserQuestion now rendered inline via InlineQuestionApproval */}
+            {/* EnterPlanMode now rendered inline in liveItems above */}
+            {/* ApprovalDialog removed - all approvals now render inline via InlineGenericApproval fallback */}
           </>
         )}
       </Box>
