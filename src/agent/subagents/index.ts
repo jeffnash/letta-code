@@ -43,8 +43,25 @@ export interface SubagentConfig {
   systemPrompt: string;
   /** Allowed tools - specific list or "all" (invalid names are ignored at runtime) */
   allowedTools: string[] | "all";
-  /** Recommended model - any model ID from models.json or full handle */
+  /** 
+   * Model selector - can be a single string or an ordered fallback chain.
+   * Each entry can be:
+   * - group:X - Server-defined group (e.g., "group:fast", "group:strong")
+   * - inherit - Use parent agent's model
+   * - any - Use server default model
+   * - <handle> - Concrete model handle (e.g., "openai/gpt-5.2")
+   * @deprecated Use modelSelector instead for new subagents
+   */
   recommendedModel: string;
+  /**
+   * Model selector - ordered fallback chain for model selection.
+   * Each entry can be:
+   * - group:X - Server-defined group (e.g., "group:fast", "group:strong")
+   * - inherit - Use parent agent's model
+   * - any - Use server default model
+   * - <handle> - Concrete model handle (e.g., "openai/gpt-5.2")
+   */
+  modelSelector: string[];
   /** Skills to auto-load */
   skills: string[];
   /** Memory blocks the subagent has access to - list of labels or "all" or "none" */
@@ -189,9 +206,38 @@ function validateFrontmatter(frontmatter: Record<string, string | string[]>): {
 }
 
 /**
+ * Parse model selector from frontmatter.
+ * Supports both string (single model) and array (fallback chain) formats.
+ * 
+ * @param modelField - The model field from frontmatter (string or string[])
+ * @returns Array of selector entries
+ */
+export function parseModelSelector(
+  modelField: string | string[] | undefined,
+): string[] {
+  // Default fallback chain if not specified
+  if (!modelField) {
+    return ["inherit", "any"];
+  }
+
+  // Already an array - use as-is
+  if (Array.isArray(modelField)) {
+    return modelField.map((m) => (typeof m === "string" ? m.trim() : String(m)));
+  }
+
+  // Single string - wrap in array
+  if (typeof modelField === "string") {
+    return [modelField.trim()];
+  }
+
+  // Fallback
+  return ["inherit", "any"];
+}
+
+/**
  * Parse a subagent from markdown content
  */
-function parseSubagentContent(content: string): SubagentConfig {
+export function parseSubagentContent(content: string): SubagentConfig {
   const { frontmatter, body } = parseFrontmatter(content);
 
   // Validate frontmatter
@@ -203,12 +249,18 @@ function parseSubagentContent(content: string): SubagentConfig {
   const name = frontmatter.name as string;
   const description = frontmatter.description as string;
 
+  // Parse model selector - supports both string and array formats
+  const modelField = frontmatter.model;
+  const modelSelector = parseModelSelector(modelField);
+
   return {
     name,
     description,
     systemPrompt: body,
     allowedTools: parseTools(getStringField(frontmatter, "tools")),
-    recommendedModel: getStringField(frontmatter, "model") || "inherit",
+    // Keep recommendedModel for backwards compatibility (first entry or "inherit")
+    recommendedModel: modelSelector[0] || "inherit",
+    modelSelector,
     skills: parseSkills(getStringField(frontmatter, "skills")),
     memoryBlocks: parseMemoryBlocks(
       getStringField(frontmatter, "memoryBlocks"),

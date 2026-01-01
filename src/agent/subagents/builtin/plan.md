@@ -2,7 +2,11 @@
 name: plan
 description: Planning agent that breaks down complex tasks into actionable steps
 tools: Glob, Grep, Read, LS, BashOutput
-model: opus
+model:
+  - group:planning
+  - group:strong
+  - inherit
+  - any
 memoryBlocks: all
 mode: stateless
 ---

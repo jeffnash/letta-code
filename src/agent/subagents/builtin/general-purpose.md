@@ -2,7 +2,10 @@
 name: general-purpose
 description: Full-capability agent for research, planning, and implementation
 tools: Bash, BashOutput, Edit, Glob, Grep, KillBash, LS, MultiEdit, Read, TodoWrite, Write
-model: sonnet-4.5
+model:
+  - group:strong
+  - inherit
+  - any
 memoryBlocks: all
 mode: stateful
 ---
