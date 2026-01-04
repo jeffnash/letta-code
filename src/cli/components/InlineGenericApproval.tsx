@@ -129,7 +129,7 @@ export const InlineGenericApproval = memo(
 
     // Generate horizontal line
     const solidLine = SOLID_LINE.repeat(Math.max(columns - 2, 10));
-    const formattedArgs = formatArgs(toolArgs);
+    const formattedArgs = toolArgs ? formatArgs(toolArgs) : "(no arguments)";
 
     // Hint text based on state
     const hintText = isOnCustomOption

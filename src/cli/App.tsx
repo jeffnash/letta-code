@@ -1,7 +1,7 @@
 // src/cli/App.tsx
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { APIUserAbortError } from "@letta-ai/letta-client/core/error";
+import { APIUserAbortError, ConflictError } from "@letta-ai/letta-client/core/error";
 import type {
   AgentState,
   MessageCreate,
@@ -1811,6 +1811,54 @@ export default function App({
           return;
         }
 
+        // If the backend says we're blocked on a pending approval, recover by
+        // fetching pending approvals and surfacing the inline approval UI.
+        if (
+          e instanceof ConflictError &&
+          typeof e.error === "object" &&
+          e.error !== null &&
+          "detail" in e.error &&
+          typeof (e.error as { detail?: unknown }).detail === "string" &&
+          (e.error as { detail: string }).detail.includes(
+            "waiting for approval on a tool call",
+          )
+        ) {
+          try {
+            const client = await getClient();
+            const agent = await client.agents.retrieve(agentIdRef.current);
+            const { pendingApprovals: existingApprovals } = await getResumeData(
+              client,
+              agent,
+            );
+
+            if (existingApprovals.length > 0) {
+              setPendingApprovals(existingApprovals);
+              setApprovalContexts([]);
+              setApprovalResults([]);
+              setAutoHandledResults([]);
+              setAutoDeniedApprovals([]);
+
+              // Also precompute contexts so we can offer approve-always options.
+              const contexts = await Promise.all(
+                existingApprovals.map(async (approval) => {
+                  const parsedArgs = safeJsonParseOr<Record<string, unknown>>(
+                    approval.toolArgs,
+                    {},
+                  );
+                  return await analyzeToolApproval(approval.toolName, parsedArgs);
+                }),
+              );
+              setApprovalContexts(contexts);
+
+              setStreaming(false);
+              refreshDerived();
+              return;
+            }
+          } catch {
+            // fall through to normal error handling
+          }
+        }
+
         // Track error with enhanced context
         const errorType =
           e instanceof Error ? e.constructor.name : "UnknownError";
@@ -1925,10 +1973,38 @@ export default function App({
       setAutoHandledResults([]);
       setAutoDeniedApprovals([]);
 
-      // Send cancel request to backend asynchronously (fire-and-forget)
-      // Don't wait for it or show errors since user already got feedback
+      // If the backend has already created an approval_request_message, it will refuse
+      // new user messages until it receives an approval/denial. Best-effort: detect
+      // any server-side pending approvals and queue denials to be sent with the next
+      // user message (see queuedApprovalResults flow below).
       getClient()
-        .then((client) => client.agents.messages.cancel(agentId))
+        .then(async (client) => {
+          // Fire-and-forget cancel request to backend (do not await)
+          client.agents.messages.cancel(agentId).catch(() => {
+            // Silently ignore - cancellation already happened client-side
+          });
+
+          try {
+            const agent = await client.agents.retrieve(agentId);
+            const { pendingApprovals: existingApprovals } = await getResumeData(
+              client,
+              agent,
+            );
+
+            if (existingApprovals.length > 0) {
+              setQueuedApprovalResults(
+                existingApprovals.map((a) => ({
+                  type: "approval" as const,
+                  tool_call_id: a.toolCallId,
+                  approve: false,
+                  reason: "User cancelled",
+                })),
+              );
+            }
+          } catch {
+            // Best-effort only; failing to fetch approvals should not block interrupt UX.
+          }
+        })
         .catch(() => {
           // Silently ignore - cancellation already happened client-side
         });
@@ -5394,9 +5470,16 @@ Plan file path: ${planFilePath}`;
         return ln.phase === "running";
       }
       if (ln.kind === "tool_call") {
-        // Skip Task tool_calls - SubagentGroupDisplay handles them
+        // Skip Task tool_calls UNLESS they have a pending approval
+        // SubagentGroupDisplay handles running/completed Task tools,
+        // but we need to show them here when approval is required
         if (ln.name && isTaskTool(ln.name)) {
-          return false;
+          // Check if this Task tool has a pending approval
+          const hasPendingApproval = pendingApprovals.some(
+            (a) => a.toolCallId === ln.toolCallId,
+          );
+          // Only include in liveItems if it needs approval UI
+          return hasPendingApproval;
         }
         // Always show other tool calls in progress
         return ln.phase !== "finished";
@@ -5404,7 +5487,7 @@ Plan file path: ${planFilePath}`;
       if (!tokenStreamingEnabled && ln.phase === "streaming") return false;
       return ln.phase === "streaming";
     });
-  }, [lines, tokenStreamingEnabled]);
+  }, [lines, tokenStreamingEnabled, pendingApprovals]);
 
   // Commit welcome snapshot once when ready for fresh sessions (no history)
   // Wait for agentProvenance to be available for new agents (continueSession=false)

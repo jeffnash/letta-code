@@ -369,6 +369,17 @@
     }
   },
   {
+    "id": "zai-glm-4.7",
+    "handle": "cliproxy/zai-glm-4.7",
+    "label": "GLM-4.7 (CLIProxy)",
+    "description": "Zai GLM-4.7 via CLIProxyAPI passthru",
+    "isFeatured": true,
+    "updateArgs": {
+      "context_window": 204800,
+      "max_output_tokens": 131072
+    }
+  },
+  {
     "id": "minimax-m2",
     "handle": "openrouter/minimax/minimax-m2",
     "label": "Minimax M2",
