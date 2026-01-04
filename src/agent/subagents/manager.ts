@@ -665,8 +665,15 @@ export async function spawnSubagent(
   // Resolve model using the server's selector resolver
   let model: string;
   if (userModel) {
-    // User explicitly specified a model - use it directly
-    model = userModel;
+    // User explicitly specified a model - resolve it to a valid handle
+    // If it already looks like a handle (contains /), use directly
+    // Otherwise, try to resolve it via static models or server
+    if (userModel.includes("/")) {
+      model = userModel;
+    } else {
+      const resolved = await resolveModelAsync(userModel);
+      model = resolved || userModel; // Fall back to original if resolution fails
+    }
   } else {
     // Use the model selector chain from config
     const selector = config.modelSelector || [config.recommendedModel];
