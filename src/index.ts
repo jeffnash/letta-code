@@ -18,12 +18,10 @@ import {
   loadTools,
   upsertToolsIfNeeded,
 } from "./tools/manager";
+import { validatePromptAssets } from "./agent/promptAssets";
 
-// Stable empty array constants to prevent new references on every render
-// These are used as fallbacks when resumeData is null, avoiding the React
-// anti-pattern of creating new [] on every render which triggers useEffect re-runs
-const EMPTY_APPROVAL_ARRAY: ApprovalRequest[] = [];
-const EMPTY_MESSAGE_ARRAY: Message[] = [];
+// Validate bundled prompt assets early - throws if build is corrupted
+validatePromptAssets();
 
 function printHelp() {
   // Keep this plaintext (no colors) so output pipes cleanly

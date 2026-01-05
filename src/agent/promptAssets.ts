@@ -29,6 +29,114 @@ export const SKILL_CREATOR_PROMPT = skillCreatorModePrompt;
 export const REMEMBER_PROMPT = rememberPrompt;
 export const MEMORY_CHECK_REMINDER = memoryCheckReminder;
 
+/**
+ * Error thrown when a bundled prompt asset is missing or invalid.
+ * This indicates a build/packaging issue that requires reinstallation.
+ */
+export class MissingPromptAssetError extends Error {
+  constructor(assetName: string, details?: string) {
+    const message =
+      `Missing bundled prompt asset: ${assetName}. ` +
+      `This usually means the CLI was not built correctly. ` +
+      `Try reinstalling with: npm install -g letta-code` +
+      (details ? ` (${details})` : "");
+    super(message);
+    this.name = "MissingPromptAssetError";
+  }
+}
+
+/**
+ * Validate that all critical prompt assets are present and non-empty.
+ * Call this early in the CLI startup to catch packaging issues.
+ *
+ * @throws {MissingPromptAssetError} if any critical asset is missing
+ */
+export function validatePromptAssets(): void {
+  const criticalAssets: Array<[string, unknown]> = [
+    ["systemPrompt", systemPrompt],
+    ["lettaAnthropicPrompt", lettaAnthropicPrompt],
+    ["lettaCodexPrompt", lettaCodexPrompt],
+    ["lettaGeminiPrompt", lettaGeminiPrompt],
+    ["personaPrompt", personaPrompt],
+    ["humanPrompt", humanPrompt],
+    ["projectPrompt", projectPrompt],
+    ["skillsPrompt", skillsPrompt],
+    ["loadedSkillsPrompt", loadedSkillsPrompt],
+  ];
+
+  for (const [name, asset] of criticalAssets) {
+    if (asset === undefined || asset === null) {
+      throw new MissingPromptAssetError(name, "asset is undefined/null");
+    }
+    if (typeof asset !== "string") {
+      throw new MissingPromptAssetError(
+        name,
+        `expected string, got ${typeof asset}`,
+      );
+    }
+    if (asset.trim().length === 0) {
+      throw new MissingPromptAssetError(name, "asset is empty");
+    }
+  }
+}
+
+/**
+ * Get a diagnostic report of all prompt assets for debugging.
+ * Useful for troubleshooting build/packaging issues.
+ */
+export function getPromptAssetsDiagnostics(): Record<
+  string,
+  { loaded: boolean; length: number; preview: string }
+> {
+  const assets: Array<[string, unknown]> = [
+    ["systemPrompt", systemPrompt],
+    ["lettaAnthropicPrompt", lettaAnthropicPrompt],
+    ["lettaCodexPrompt", lettaCodexPrompt],
+    ["lettaGeminiPrompt", lettaGeminiPrompt],
+    ["anthropicPrompt", anthropicPrompt],
+    ["codexPrompt", codexPrompt],
+    ["geminiPrompt", geminiPrompt],
+    ["personaPrompt", personaPrompt],
+    ["personaClaudePrompt", personaClaudePrompt],
+    ["personaKawaiiPrompt", personaKawaiiPrompt],
+    ["humanPrompt", humanPrompt],
+    ["projectPrompt", projectPrompt],
+    ["skillsPrompt", skillsPrompt],
+    ["loadedSkillsPrompt", loadedSkillsPrompt],
+    ["stylePrompt", stylePrompt],
+    ["planModeReminder", planModeReminder],
+    ["skillUnloadReminder", skillUnloadReminder],
+    ["skillCreatorModePrompt", skillCreatorModePrompt],
+    ["rememberPrompt", rememberPrompt],
+    ["memoryCheckReminder", memoryCheckReminder],
+  ];
+
+  const result: Record<
+    string,
+    { loaded: boolean; length: number; preview: string }
+  > = {};
+
+  for (const [name, asset] of assets) {
+    if (typeof asset === "string") {
+      result[name] = {
+        loaded: true,
+        length: asset.length,
+        preview:
+          asset.substring(0, 50).replace(/\n/g, "\\n") +
+          (asset.length > 50 ? "..." : ""),
+      };
+    } else {
+      result[name] = {
+        loaded: false,
+        length: 0,
+        preview: `[${typeof asset}]`,
+      };
+    }
+  }
+
+  return result;
+}
+
 export const MEMORY_PROMPTS: Record<string, string> = {
   "persona.mdx": personaPrompt,
   "persona_claude.mdx": personaClaudePrompt,
