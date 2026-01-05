@@ -115,6 +115,25 @@ function isUnknownModelError(errorOutput: string): boolean {
 }
 
 /**
+ * Check if an error message indicates a rate limit or temporary unavailability
+ */
+function isRateLimitError(errorOutput: string): boolean {
+  const lowerError = errorOutput.toLowerCase();
+  return (
+    lowerError.includes("rate limit") ||
+    lowerError.includes("rate_limit") ||
+    lowerError.includes("ratelimit") ||
+    lowerError.includes("too many requests") ||
+    lowerError.includes("429") ||
+    lowerError.includes("temporarily unavailable") ||
+    lowerError.includes("temporarily disabled") ||
+    lowerError.includes("model is currently unavailable") ||
+    lowerError.includes("capacity") ||
+    lowerError.includes("overloaded")
+  );
+}
+
+/**
  * Record a tool call to the state store
  */
 function recordToolCall(
@@ -384,6 +403,16 @@ function buildSubagentArgs(
 
 /**
  * Execute a subagent and collect its final report by spawning letta in headless mode
+ *
+ * @param type - Subagent type
+ * @param config - Subagent configuration
+ * @param model - Model handle to use
+ * @param userPrompt - The task prompt
+ * @param baseURL - Base URL for agent links
+ * @param subagentId - ID for tracking
+ * @param expansionChain - Full list of fallback models for rate limit retry
+ * @param chainIndex - Current position in the expansion chain (for retry tracking)
+ * @param signal - Optional abort signal
  */
 async function executeSubagent(
   type: string,
@@ -392,7 +421,8 @@ async function executeSubagent(
   userPrompt: string,
   baseURL: string,
   subagentId: string,
-  isRetry = false,
+  expansionChain: string[] = [],
+  chainIndex = 0,
   signal?: AbortSignal,
 ): Promise<SubagentResult> {
   // Check if already aborted before starting
@@ -482,16 +512,58 @@ async function executeSubagent(
 
     // Handle non-zero exit code
     if (exitCode !== 0) {
-      // Check if this is a recoverable error and we haven't retried yet
+      // Check for rate limit errors - try next model in expansion chain
+      if (isRateLimitError(stderr) && expansionChain.length > 0) {
+        // Find next available model in the chain after current one
+        const nextIndex = chainIndex + 1;
+        if (nextIndex < expansionChain.length) {
+          const nextModel = expansionChain[nextIndex];
+          console.warn(
+            `[subagent] Rate limit error on ${model}, trying next model in chain: ${nextModel}`,
+          );
+          return executeSubagent(
+            type,
+            config,
+            nextModel,
+            userPrompt,
+            baseURL,
+            subagentId,
+            expansionChain,
+            nextIndex,
+            signal,
+          );
+        }
+      }
+
+      // Check if this is a recoverable model error
       const isRecoverableError =
         isProviderNotSupportedError(stderr) || isUnknownModelError(stderr);
-      if (!isRetry && isRecoverableError) {
+      if (chainIndex === 0 && isRecoverableError) {
+        // Try next model in chain first
+        if (expansionChain.length > 1) {
+          const nextModel = expansionChain[1];
+          console.warn(
+            `[subagent] Model error on ${model}, trying next model in chain: ${nextModel}`,
+          );
+          return executeSubagent(
+            type,
+            config,
+            nextModel,
+            userPrompt,
+            baseURL,
+            subagentId,
+            expansionChain,
+            1,
+            signal,
+          );
+        }
+
+        // Fall back to primary agent's model as last resort
         const primaryModelHandle = await getPrimaryAgentModelHandle();
-        if (primaryModelHandle) {
+        if (primaryModelHandle && primaryModelHandle !== model) {
           console.warn(
             `[subagent] Model error detected, retrying with primary agent's model: ${primaryModelHandle}`,
           );
-          // Retry with the primary agent's model
           return executeSubagent(
             type,
             config,
@@ -499,7 +571,8 @@ async function executeSubagent(
             userPrompt,
             baseURL,
             subagentId,
-            true, // Mark as retry to prevent infinite loops
+            [], // No chain for fallback
+            0,
             signal,
           );
         }
@@ -617,15 +690,16 @@ export async function getFallbackModelFromSelector(
 
 /**
  * Resolve a model selector using the server's resolver endpoint.
+ * Returns both the resolved handle and the full expansion chain for fallback.
  *
  * @param selector - Ordered list of selector entries (group:X, inherit, any, or handles)
  * @param parentModelHandle - Parent agent's model handle for 'inherit' resolution
- * @returns Resolved model handle
+ * @returns Full ModelSelectorResponse with resolved_handle and expansion_chain
  */
-async function resolveModelSelector(
+async function resolveModelSelectorWithChain(
   selector: string[],
   parentModelHandle: string | undefined,
-): Promise<string> {
+): Promise<ModelSelectorResponse> {
   try {
     const client = await getClient();
 
@@ -639,14 +713,39 @@ async function resolveModelSelector(
       },
     });
 
-    return response.resolved_handle;
+    return response;
   } catch (error) {
     console.warn(
       `[subagent] Server model resolution failed: ${getErrorMessage(error)}. Using fallback.`,
     );
 
-    return await getFallbackModelFromSelector(selector, parentModelHandle);
+    const fallbackModel = await getFallbackModelFromSelector(
+      selector,
+      parentModelHandle,
+    );
+    return {
+      resolved_handle: fallbackModel,
+      expansion_chain: [fallbackModel],
+    };
   }
+}
+
+/**
+ * Resolve a model selector using the server's resolver endpoint.
+ *
+ * @param selector - Ordered list of selector entries (group:X, inherit, any, or handles)
+ * @param parentModelHandle - Parent agent's model handle for 'inherit' resolution
+ * @returns Resolved model handle
+ */
+async function resolveModelSelector(
+  selector: string[],
+  parentModelHandle: string | undefined,
+): Promise<string> {
+  const response = await resolveModelSelectorWithChain(
+    selector,
+    parentModelHandle,
+  );
+  return response.resolved_handle;
 }
 
 /**
@@ -677,51 +776,75 @@ export async function spawnSubagent(
     };
   }
 
+  // Get parent agent's model for 'inherit' resolution
+  const parentModelHandle = await getPrimaryAgentModelHandle();
+
   // Resolve model using the server's selector resolver
+  // We get both the resolved model AND the expansion chain for rate limit fallback
   let model: string;
+  let expansionChain: string[] = [];
+
   if (userModel) {
-    // User explicitly specified a model - resolve it to a valid handle
-    // Always try to resolve via static models or server first
-    const resolved = await resolveModelAsync(userModel);
-    if (resolved) {
-      model = resolved;
-    } else if (userModel.includes("/")) {
-      // If it looks like a full handle but couldn't be resolved,
-      // use it anyway (user might know something we don't)
-      // but log a warning
-      console.warn(
-        `[subagent] Model "${userModel}" not found in available models, using as-is`,
+    // Check if userModel is a selector (group:*, inherit, any) vs a concrete model
+    const isSelector =
+      userModel.startsWith("group:") ||
+      userModel === "inherit" ||
+      userModel === "any";
+
+    if (isSelector) {
+      // User specified a selector - resolve it through the selector resolver
+      const resolution = await resolveModelSelectorWithChain(
+        [userModel, "any"], // Add "any" as fallback
+        parentModelHandle,
       );
-      model = userModel;
+      model = resolution.resolved_handle;
+      expansionChain = resolution.expansion_chain;
     } else {
-      // Not a full handle and couldn't be resolved - fall back to config's selector
-      console.warn(
-        `[subagent] Unknown model "${userModel}", falling back to config selector`,
-      );
-      const selector = config.modelSelector || [config.recommendedModel];
-      const parentModelHandle = await getPrimaryAgentModelHandle();
-      model = await resolveModelSelector(
-        selector,
-        parentModelHandle || undefined,
-      );
+      // User specified a concrete model - try to resolve it
+      const resolved = await resolveModelAsync(userModel);
+      if (resolved) {
+        model = resolved;
+        expansionChain = [resolved];
+      } else if (userModel.includes("/")) {
+        // If it looks like a full handle but couldn't be resolved,
+        // use it anyway (user might know something we don't)
+        // but log a warning
+        console.warn(
+          `[subagent] Model "${userModel}" not found in available models, using as-is`,
+        );
+        model = userModel;
+        expansionChain = [userModel];
+      } else {
+        // Not a full handle and couldn't be resolved - fall back to config's selector
+        console.warn(
+          `[subagent] Unknown model "${userModel}", falling back to config selector`,
+        );
+        const selector = config.modelSelector || [config.recommendedModel];
+        const resolution = await resolveModelSelectorWithChain(
+          selector,
+          parentModelHandle || undefined,
+        );
+        model = resolution.resolved_handle;
+        expansionChain = resolution.expansion_chain;
+      }
     }
   } else {
     // Use the model selector chain from config
     const selector = config.modelSelector || [config.recommendedModel];
 
-    // Get parent agent's model for 'inherit' resolution
-    const parentModelHandle = await getPrimaryAgentModelHandle();
-
-    // Resolve via server (with fallback)
-    model = await resolveModelSelector(
+    // Resolve via server (with fallback) - get full chain for rate limit retry
+    const resolution = await resolveModelSelectorWithChain(
       selector,
       parentModelHandle || undefined,
     );
+    model = resolution.resolved_handle;
+    expansionChain = resolution.expansion_chain;
   }
 
   const baseURL = getBaseURL();
 
   // Execute subagent - state updates are handled via the state store
+  // Pass expansion chain for rate limit fallback
   const result = await executeSubagent(
     type,
     config,
@@ -729,7 +852,8 @@ export async function spawnSubagent(
     prompt,
     baseURL,
     subagentId,
-    false,
+    expansionChain,
+    0, // Start at beginning of chain
     signal,
   );
 
