@@ -43,7 +43,7 @@ export interface SubagentConfig {
   systemPrompt: string;
   /** Allowed tools - specific list or "all" (invalid names are ignored at runtime) */
   allowedTools: string[] | "all";
-  /** 
+  /**
    * Model selector - can be a single string or an ordered fallback chain.
    * Each entry can be:
    * - group:X - Server-defined group (e.g., "group:fast", "group:strong")
@@ -208,7 +208,7 @@ function validateFrontmatter(frontmatter: Record<string, string | string[]>): {
 /**
  * Parse model selector from frontmatter.
  * Supports both string (single model) and array (fallback chain) formats.
- * 
+ *
  * @param modelField - The model field from frontmatter (string or string[])
  * @returns Array of selector entries
  */
@@ -222,7 +222,9 @@ export function parseModelSelector(
 
   // Already an array - use as-is
   if (Array.isArray(modelField)) {
-    return modelField.map((m) => (typeof m === "string" ? m.trim() : String(m)));
+    return modelField.map((m) =>
+      typeof m === "string" ? m.trim() : String(m),
+    );
   }
 
   // Single string - wrap in array

@@ -1,11 +1,11 @@
 /**
  * Tests for subagent model selector parsing and resolution.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { getFallbackModelFromSelector } from "../../agent/subagents/manager";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as modelModule from "../../agent/model";
 import { getDefaultModel } from "../../agent/model";
 import { parseModelSelector } from "../../agent/subagents";
+import { getFallbackModelFromSelector } from "../../agent/subagents/manager";
 
 describe("parseModelSelector", () => {
   describe("undefined/null input", () => {
@@ -77,7 +77,10 @@ describe("parseModelSelector", () => {
 
     it("should convert non-string array elements to strings", () => {
       // Edge case: YAML might parse numbers
-      const result = parseModelSelector([123 as unknown as string, "group:fast"]);
+      const result = parseModelSelector([
+        123 as unknown as string,
+        "group:fast",
+      ]);
       expect(result).toEqual(["123", "group:fast"]);
     });
   });
@@ -125,22 +128,24 @@ describe("model selector patterns", () => {
   describe("concrete handles", () => {
     it("should identify concrete handle with provider prefix", () => {
       const selector = "openai/gpt-5.2";
+      // Concrete handles have a "/" and are not special keywords
       expect(selector.includes("/")).toBe(true);
-      expect(!selector.startsWith("group:")).toBe(true);
-      expect(selector !== "inherit" && selector !== "any").toBe(true);
+      expect(selector.startsWith("group:")).toBe(false);
+      // Verify it's not a special keyword by checking it contains a provider prefix
+      expect(selector.split("/").length).toBeGreaterThan(1);
     });
 
     it("should identify cliproxy handle", () => {
       const selector = "cliproxy/gpt-5-mini";
       expect(selector.includes("/")).toBe(true);
-      expect(!selector.startsWith("group:")).toBe(true);
+      expect(selector.startsWith("group:")).toBe(false);
     });
   });
 });
 
 describe("built-in subagent model selectors", () => {
   // These tests verify the expected model selectors for built-in subagents
-  
+
   it("explore subagent should use fast group with fallbacks", () => {
     const expectedSelector = ["group:fast", "inherit", "any"];
     expect(expectedSelector[0]).toBe("group:fast");
@@ -149,7 +154,12 @@ describe("built-in subagent model selectors", () => {
   });
 
   it("plan subagent should use planning/strong groups with fallbacks", () => {
-    const expectedSelector = ["group:planning", "group:strong", "inherit", "any"];
+    const expectedSelector = [
+      "group:planning",
+      "group:strong",
+      "inherit",
+      "any",
+    ];
     expect(expectedSelector[0]).toBe("group:planning");
     expect(expectedSelector[1]).toBe("group:strong");
     expect(expectedSelector).toContain("inherit");
@@ -253,36 +263,56 @@ describe("fallback chain behavior", () => {
   it("should fall back to inherit when group unavailable", () => {
     const selector = ["group:fast", "inherit", "any"];
     const available = new Set(["parent/model"]);
-    
-    const result = simulateResolution(selector, available, "parent/model", "default/model");
-    
+
+    const result = simulateResolution(
+      selector,
+      available,
+      "parent/model",
+      "default/model",
+    );
+
     expect(result).toBe("parent/model");
   });
 
   it("should fall back to any when inherit unavailable", () => {
     const selector = ["group:fast", "inherit", "any"];
     const available = new Set(["default/model"]);
-    
-    const result = simulateResolution(selector, available, undefined, "default/model");
-    
+
+    const result = simulateResolution(
+      selector,
+      available,
+      undefined,
+      "default/model",
+    );
+
     expect(result).toBe("default/model");
   });
 
   it("should use concrete handle when available", () => {
     const selector = ["openai/gpt-5.2", "inherit", "any"];
     const available = new Set(["openai/gpt-5.2", "parent/model"]);
-    
-    const result = simulateResolution(selector, available, "parent/model", "default/model");
-    
+
+    const result = simulateResolution(
+      selector,
+      available,
+      "parent/model",
+      "default/model",
+    );
+
     expect(result).toBe("openai/gpt-5.2");
   });
 
   it("should return null when nothing available", () => {
     const selector = ["openai/gpt-5.2", "inherit"];
     const available = new Set(["completely/different"]);
-    
-    const result = simulateResolution(selector, available, undefined, "also/unavailable");
-    
+
+    const result = simulateResolution(
+      selector,
+      available,
+      undefined,
+      "also/unavailable",
+    );
+
     expect(result).toBeNull();
   });
 });

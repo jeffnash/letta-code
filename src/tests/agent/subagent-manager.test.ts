@@ -22,7 +22,9 @@ import { resolveModelAsync } from "../../agent/model";
 import { getPrimaryAgentModelHandle } from "../../agent/subagents/manager";
 
 const mockGetClient = getClient as unknown as ReturnType<typeof vi.fn>;
-const mockResolveModelAsync = resolveModelAsync as unknown as ReturnType<typeof vi.fn>;
+const mockResolveModelAsync = resolveModelAsync as unknown as ReturnType<
+  typeof vi.fn
+>;
 
 describe("getPrimaryAgentModelHandle", () => {
   beforeEach(() => {

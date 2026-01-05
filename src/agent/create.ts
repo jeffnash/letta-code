@@ -12,8 +12,8 @@ import { getToolNames } from "../tools/manager";
 import { getClient } from "./client";
 import { getDefaultMemoryBlocks } from "./memory";
 import {
-  formatAvailableModels,
   formatAvailableModelsAsync,
+  getDefaultModel,
   getModelUpdateArgs,
   resolveModelAsync,
 } from "./model";
@@ -58,6 +58,8 @@ export async function createAgent(
   initBlocks?: string[],
   baseTools?: string[],
 ) {
+  const client = await getClient();
+
   // Resolve model identifier to handle
   let modelHandle: string;
   if (model) {
@@ -70,11 +72,23 @@ export async function createAgent(
     }
     modelHandle = resolved;
   } else {
-    // Use default model
-    modelHandle = "cliproxy/gpt-5.2-medium";
+    // Use server-side groups when possible.
+    // Prefer planning-capable models, then fall back to the server default.
+    try {
+      const response = await client.request<{ resolved_handle: string }>({
+        method: "post",
+        path: "/v1/models/resolve",
+        body: {
+          selector: ["group:planning", "any"],
+          parent_model_handle: undefined,
+        },
+      });
+      modelHandle = response.resolved_handle;
+    } catch {
+      // Offline / older server: fall back to a static default.
+      modelHandle = getDefaultModel();
+    }
   }
-
-  const client = await getClient();
 
   // Get loaded tool names (tools are already registered with Letta)
   // Map internal names to server names so the agent sees the correct tool names
@@ -85,7 +99,8 @@ export async function createAgent(
   );
 
   const baseMemoryTool =
-    modelHandle.startsWith("openai/gpt-5") || modelHandle.startsWith("cliproxy/gpt-5")
+    modelHandle.startsWith("openai/gpt-5") ||
+    modelHandle.startsWith("cliproxy/gpt-5")
       ? "memory_apply_patch"
       : "memory";
   const defaultBaseTools = baseTools ?? [

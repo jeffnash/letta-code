@@ -21,11 +21,7 @@ import { settingsManager } from "../../settings-manager";
 import { getErrorMessage } from "../../utils/error";
 import { getClient } from "../client";
 import { getCurrentAgentId } from "../context";
-import {
-  getDefaultModel,
-  resolveModel,
-  resolveModelAsync,
-} from "../model";
+import { getDefaultModel, resolveModel, resolveModelAsync } from "../model";
 import { getAllSubagentConfigs, type SubagentConfig } from ".";
 
 // ============================================================================
@@ -71,12 +67,16 @@ interface ExecutionState {
  * Get the primary agent's model handle.
  * Fetches from API and resolves to a concrete handle when possible.
  */
-export async function getPrimaryAgentModelHandle(): Promise<string | undefined> {
+export async function getPrimaryAgentModelHandle(): Promise<
+  string | undefined
+> {
   try {
     const agentId = getCurrentAgentId();
     const client = await getClient();
     const agent = await client.agents.retrieve(agentId);
-    const llmConfig = agent.llm_config as { model?: string; handle?: string } | undefined;
+    const llmConfig = agent.llm_config as
+      | { model?: string; handle?: string }
+      | undefined;
     if (llmConfig?.handle) {
       return llmConfig.handle;
     }
@@ -101,6 +101,16 @@ function isProviderNotSupportedError(errorOutput: string): boolean {
     errorOutput.includes("Provider") &&
     errorOutput.includes("is not supported") &&
     errorOutput.includes("supported providers:")
+  );
+}
+
+/**
+ * Check if an error message indicates an unknown/unavailable model
+ */
+function isUnknownModelError(errorOutput: string): boolean {
+  return (
+    errorOutput.includes("Unknown model") ||
+    errorOutput.includes("Error: Unknown model")
   );
 }
 
@@ -472,10 +482,15 @@ async function executeSubagent(
 
     // Handle non-zero exit code
     if (exitCode !== 0) {
-      // Check if this is a provider-not-supported error and we haven't retried yet
-      if (!isRetry && isProviderNotSupportedError(stderr)) {
+      // Check if this is a recoverable error and we haven't retried yet
+      const isRecoverableError =
+        isProviderNotSupportedError(stderr) || isUnknownModelError(stderr);
+      if (!isRetry && isRecoverableError) {
         const primaryModelHandle = await getPrimaryAgentModelHandle();
         if (primaryModelHandle) {
+          console.warn(
+            `[subagent] Model error detected, retrying with primary agent's model: ${primaryModelHandle}`,
+          );
           // Retry with the primary agent's model
           return executeSubagent(
             type,
@@ -602,7 +617,7 @@ export async function getFallbackModelFromSelector(
 
 /**
  * Resolve a model selector using the server's resolver endpoint.
- * 
+ *
  * @param selector - Ordered list of selector entries (group:X, inherit, any, or handles)
  * @param parentModelHandle - Parent agent's model handle for 'inherit' resolution
  * @returns Resolved model handle
@@ -613,17 +628,17 @@ async function resolveModelSelector(
 ): Promise<string> {
   try {
     const client = await getClient();
-    
+
     // Call the server's resolve endpoint
     const response = await client.request<ModelSelectorResponse>({
-      method: "POST",
+      method: "post",
       path: "/v1/models/resolve",
       body: {
         selector,
         parent_model_handle: parentModelHandle,
       },
     });
-    
+
     return response.resolved_handle;
   } catch (error) {
     console.warn(
@@ -666,23 +681,42 @@ export async function spawnSubagent(
   let model: string;
   if (userModel) {
     // User explicitly specified a model - resolve it to a valid handle
-    // If it already looks like a handle (contains /), use directly
-    // Otherwise, try to resolve it via static models or server
-    if (userModel.includes("/")) {
+    // Always try to resolve via static models or server first
+    const resolved = await resolveModelAsync(userModel);
+    if (resolved) {
+      model = resolved;
+    } else if (userModel.includes("/")) {
+      // If it looks like a full handle but couldn't be resolved,
+      // use it anyway (user might know something we don't)
+      // but log a warning
+      console.warn(
+        `[subagent] Model "${userModel}" not found in available models, using as-is`,
+      );
       model = userModel;
     } else {
-      const resolved = await resolveModelAsync(userModel);
-      model = resolved || userModel; // Fall back to original if resolution fails
+      // Not a full handle and couldn't be resolved - fall back to config's selector
+      console.warn(
+        `[subagent] Unknown model "${userModel}", falling back to config selector`,
+      );
+      const selector = config.modelSelector || [config.recommendedModel];
+      const parentModelHandle = await getPrimaryAgentModelHandle();
+      model = await resolveModelSelector(
+        selector,
+        parentModelHandle || undefined,
+      );
     }
   } else {
     // Use the model selector chain from config
     const selector = config.modelSelector || [config.recommendedModel];
-    
+
     // Get parent agent's model for 'inherit' resolution
     const parentModelHandle = await getPrimaryAgentModelHandle();
-    
+
     // Resolve via server (with fallback)
-    model = await resolveModelSelector(selector, parentModelHandle || undefined);
+    model = await resolveModelSelector(
+      selector,
+      parentModelHandle || undefined,
+    );
   }
 
   const baseURL = getBaseURL();

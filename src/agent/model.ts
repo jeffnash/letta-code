@@ -2,7 +2,10 @@
  * Model resolution and handling utilities
  */
 import modelsData from "../models.json";
-import { getAvailableModelHandles, getModelContextWindow } from "./available-models";
+import {
+  getAvailableModelHandles,
+  getModelContextWindow,
+} from "./available-models";
 
 export const models = modelsData;
 
@@ -23,9 +26,14 @@ const MAX_OUTPUT_TOKENS_SAFETY_FACTOR = Number.parseFloat(
   process.env.LETTA_MAX_OUTPUT_TOKENS_SAFETY_FACTOR ?? "1.0",
 );
 
-function applySafetyLimit(value: unknown, safetyFactor: number): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
-  if (!Number.isFinite(safetyFactor) || safetyFactor <= 0 || safetyFactor > 1) return Math.max(1, Math.floor(value));
+function applySafetyLimit(
+  value: unknown,
+  safetyFactor: number,
+): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0)
+    return undefined;
+  if (!Number.isFinite(safetyFactor) || safetyFactor <= 0 || safetyFactor > 1)
+    return Math.max(1, Math.floor(value));
   return Math.max(1, Math.floor(value * safetyFactor));
 }
 
@@ -69,7 +77,9 @@ export function resolveModel(modelIdentifier: string): string | null {
  * @param modelIdentifier - Can be either a model ID (e.g., "opus-4.5") or a full handle (e.g., "cliproxy/zai-glm-4.7")
  * @returns The model handle if found, null otherwise
  */
-export async function resolveModelAsync(modelIdentifier: string): Promise<string | null> {
+export async function resolveModelAsync(
+  modelIdentifier: string,
+): Promise<string | null> {
   // First, try static models.json lookup (fast path)
   const byId = models.find((m) => m.id === modelIdentifier);
   if (byId) return byId.handle;
@@ -80,19 +90,19 @@ export async function resolveModelAsync(modelIdentifier: string): Promise<string
   // If not in static list, check if server knows this model
   try {
     const available = await getAvailableModelHandles();
-    
+
     // Check exact match on handle
     if (available.handles.has(modelIdentifier)) {
       return modelIdentifier;
     }
-    
+
     // Check if any handle ends with the identifier (e.g., "zai-glm-4.7" -> "cliproxy/zai-glm-4.7")
     for (const handle of available.handles) {
       if (handle.endsWith(`/${modelIdentifier}`)) {
         return handle;
       }
     }
-    
+
     // Check if identifier matches the model part of a handle
     for (const handle of available.handles) {
       const modelPart = handle.split("/").pop();
@@ -100,7 +110,7 @@ export async function resolveModelAsync(modelIdentifier: string): Promise<string
         return handle;
       }
     }
-  } catch (error) {
+  } catch (_error) {
     // If server check fails, return null (model not found)
     // This is expected if server is not available
   }
@@ -133,18 +143,20 @@ export function formatAvailableModels(): string {
  * Format available models for error messages including dynamic models from server
  */
 export async function formatAvailableModelsAsync(): Promise<string> {
-  const staticModels = models.map((m) => `  ${m.id.padEnd(24)} ${m.handle}`).join("\n");
-  
+  const staticModels = models
+    .map((m) => `  ${m.id.padEnd(24)} ${m.handle}`)
+    .join("\n");
+
   try {
     const available = await getAvailableModelHandles();
-    const staticHandles = new Set(models.map(m => m.handle));
+    const staticHandles = new Set(models.map((m) => m.handle));
     const dynamicHandles = [...available.handles]
-      .filter(h => !staticHandles.has(h))
+      .filter((h) => !staticHandles.has(h))
       .sort();
-    
+
     if (dynamicHandles.length > 0) {
       const dynamicSection = dynamicHandles
-        .map(h => {
+        .map((h) => {
           const shortName = h.split("/").pop() || h;
           return `  ${shortName.padEnd(24)} ${h} (dynamic)`;
         })
@@ -154,7 +166,7 @@ export async function formatAvailableModelsAsync(): Promise<string> {
   } catch {
     // Ignore errors, just show static models
   }
-  
+
   return staticModels;
 }
 
@@ -183,19 +195,20 @@ export function getModelUpdateArgs(
   modelIdentifier?: string,
 ): Record<string, unknown> | undefined {
   if (!modelIdentifier) return undefined;
-  
+
   // Try static model first
   const modelInfo = getModelInfo(modelIdentifier);
   if (modelInfo?.updateArgs) {
     return applySafetyToUpdateArgs(modelInfo.updateArgs);
   }
-  
+
   // For dynamic models (not in static list), return sensible defaults
   // Try to get context window from cached server response
   const contextWindow = getModelContextWindow(modelIdentifier);
-  
+
   return applySafetyToUpdateArgs({
-    context_window: contextWindow || DEFAULT_DYNAMIC_MODEL_CONFIG.context_window,
+    context_window:
+      contextWindow || DEFAULT_DYNAMIC_MODEL_CONFIG.context_window,
     max_output_tokens: DEFAULT_DYNAMIC_MODEL_CONFIG.max_output_tokens,
   });
 }
@@ -209,18 +222,18 @@ export async function getModelUpdateArgsAsync(
   modelIdentifier?: string,
 ): Promise<Record<string, unknown> | undefined> {
   if (!modelIdentifier) return undefined;
-  
+
   // Try static model first
   const modelInfo = getModelInfo(modelIdentifier);
   if (modelInfo?.updateArgs) {
     return applySafetyToUpdateArgs(modelInfo.updateArgs);
   }
-  
+
   // For dynamic models, try to get context window from server
   try {
     const available = await getAvailableModelHandles();
     const contextWindow = available.contextWindows?.get(modelIdentifier);
-    
+
     if (contextWindow) {
       return applySafetyToUpdateArgs({
         context_window: contextWindow,
@@ -230,7 +243,7 @@ export async function getModelUpdateArgsAsync(
   } catch {
     // Fall through to defaults
   }
-  
+
   return applySafetyToUpdateArgs({
     context_window: DEFAULT_DYNAMIC_MODEL_CONFIG.context_window,
     max_output_tokens: DEFAULT_DYNAMIC_MODEL_CONFIG.max_output_tokens,

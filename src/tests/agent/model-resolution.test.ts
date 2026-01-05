@@ -1,14 +1,14 @@
 /**
  * Tests for model resolution utilities including dynamic model support.
  */
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  resolveModel,
-  resolveModelAsync,
+  formatAvailableModels,
   getModelInfo,
   getModelUpdateArgs,
   isDynamicModel,
-  formatAvailableModels,
+  resolveModel,
+  resolveModelAsync,
 } from "../../agent/model";
 
 // Mock the available-models module
@@ -17,7 +17,10 @@ vi.mock("../../agent/available-models", () => ({
   getModelContextWindow: vi.fn(),
 }));
 
-import { getAvailableModelHandles, getModelContextWindow } from "../../agent/available-models";
+import {
+  getAvailableModelHandles,
+  getModelContextWindow,
+} from "../../agent/available-models";
 
 describe("resolveModel (synchronous)", () => {
   it("should resolve a static model by ID", () => {
@@ -36,7 +39,8 @@ describe("resolveModel (synchronous)", () => {
   });
 
   it("should return null for dynamic model (not in static list)", () => {
-    const result = resolveModel("zai-glm-4.7");
+    // Use a fictional model name that will never be in models.json
+    const result = resolveModel("fictional-dynamic-model-xyz");
     expect(result).toBeNull();
   });
 });
@@ -53,36 +57,44 @@ describe("resolveModelAsync", () => {
   });
 
   it("should resolve a static model by handle without server call", async () => {
-    const result = await resolveModelAsync("anthropic/claude-sonnet-4-5-20250929");
+    const result = await resolveModelAsync(
+      "anthropic/claude-sonnet-4-5-20250929",
+    );
     expect(result).toBe("anthropic/claude-sonnet-4-5-20250929");
     expect(getAvailableModelHandles).not.toHaveBeenCalled();
   });
 
   it("should resolve a dynamic model from server by exact handle", async () => {
-    (getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
-      handles: new Set(["cliproxy/zai-glm-4.7", "cliproxy/other-model"]),
+    (
+      getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({
+      handles: new Set(["cliproxy/fictional-dynamic-xyz", "cliproxy/other-model"]),
       source: "network",
       fetchedAt: Date.now(),
     });
 
-    const result = await resolveModelAsync("cliproxy/zai-glm-4.7");
-    expect(result).toBe("cliproxy/zai-glm-4.7");
+    const result = await resolveModelAsync("cliproxy/fictional-dynamic-xyz");
+    expect(result).toBe("cliproxy/fictional-dynamic-xyz");
     expect(getAvailableModelHandles).toHaveBeenCalled();
   });
 
   it("should resolve a dynamic model from server by short name", async () => {
-    (getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
-      handles: new Set(["cliproxy/zai-glm-4.7"]),
+    (
+      getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({
+      handles: new Set(["cliproxy/fictional-dynamic-xyz"]),
       source: "network",
       fetchedAt: Date.now(),
     });
 
-    const result = await resolveModelAsync("zai-glm-4.7");
-    expect(result).toBe("cliproxy/zai-glm-4.7");
+    const result = await resolveModelAsync("fictional-dynamic-xyz");
+    expect(result).toBe("cliproxy/fictional-dynamic-xyz");
   });
 
   it("should return null if dynamic model not found on server", async () => {
-    (getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+    (
+      getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({
       handles: new Set(["cliproxy/other-model"]),
       source: "network",
       fetchedAt: Date.now(),
@@ -93,9 +105,12 @@ describe("resolveModelAsync", () => {
   });
 
   it("should return null if server call fails", async () => {
-    (getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("Network error"));
+    (
+      getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>
+    ).mockRejectedValue(new Error("Network error"));
 
-    const result = await resolveModelAsync("zai-glm-4.7");
+    // Use a fictional model that's not in static list
+    const result = await resolveModelAsync("fictional-dynamic-xyz");
     expect(result).toBeNull();
   });
 });
@@ -132,18 +147,24 @@ describe("getModelUpdateArgs", () => {
   });
 
   it("should return defaults for dynamic model", () => {
-    (getModelContextWindow as unknown as ReturnType<typeof vi.fn>).mockReturnValue(undefined);
+    (
+      getModelContextWindow as unknown as ReturnType<typeof vi.fn>
+    ).mockReturnValue(undefined);
 
-    const args = getModelUpdateArgs("zai-glm-4.7");
+    // Use a fictional model that's not in static list
+    const args = getModelUpdateArgs("fictional-dynamic-xyz");
     expect(args).toBeDefined();
     expect(args?.context_window).toBe(128000); // Default
     expect(args?.max_output_tokens).toBe(32000); // Default
   });
 
   it("should use cached context window for dynamic model", () => {
-    (getModelContextWindow as unknown as ReturnType<typeof vi.fn>).mockReturnValue(256000);
+    (
+      getModelContextWindow as unknown as ReturnType<typeof vi.fn>
+    ).mockReturnValue(256000);
 
-    const args = getModelUpdateArgs("zai-glm-4.7");
+    // Use a fictional model that's not in static list
+    const args = getModelUpdateArgs("fictional-dynamic-xyz");
     expect(args).toBeDefined();
     expect(args?.context_window).toBe(256000);
   });
@@ -158,11 +179,15 @@ describe("isDynamicModel", () => {
   it("should return false for static model", () => {
     expect(isDynamicModel("sonnet-4.5")).toBe(false);
     expect(isDynamicModel("anthropic/claude-sonnet-4-5-20250929")).toBe(false);
+    // zai-glm-4.7 is now in models.json, so it's static
+    expect(isDynamicModel("zai-glm-4.7")).toBe(false);
+    expect(isDynamicModel("cliproxy/zai-glm-4.7")).toBe(false);
   });
 
   it("should return true for dynamic model", () => {
-    expect(isDynamicModel("zai-glm-4.7")).toBe(true);
-    expect(isDynamicModel("cliproxy/zai-glm-4.7")).toBe(true);
+    // Use fictional models that will never be in models.json
+    expect(isDynamicModel("fictional-dynamic-xyz")).toBe(true);
+    expect(isDynamicModel("cliproxy/fictional-dynamic-xyz")).toBe(true);
     expect(isDynamicModel("unknown-model")).toBe(true);
   });
 });
