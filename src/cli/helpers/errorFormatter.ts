@@ -107,11 +107,14 @@ export function formatErrorDetails(e: unknown, agentId?: string): string {
     if (obj.error && typeof obj.error === "object") {
       const errorWrapper = obj.error as Record<string, unknown>;
       const nestedRunId =
-        typeof errorWrapper.run_id === "string" ? errorWrapper.run_id : undefined;
+        typeof errorWrapper.run_id === "string"
+          ? errorWrapper.run_id
+          : undefined;
 
       if (errorWrapper.error && typeof errorWrapper.error === "object") {
         const errorData = errorWrapper.error as Record<string, unknown>;
-        const type = typeof errorData.type === "string" ? errorData.type : undefined;
+        const type =
+          typeof errorData.type === "string" ? errorData.type : undefined;
         const message =
           typeof errorData.message === "string" ? errorData.message : undefined;
         const detail =

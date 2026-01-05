@@ -1,7 +1,10 @@
 // src/cli/App.tsx
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { APIUserAbortError, ConflictError } from "@letta-ai/letta-client/core/error";
+import {
+  APIUserAbortError,
+  ConflictError,
+} from "@letta-ai/letta-client/core/error";
 import type {
   AgentState,
   MessageCreate,
@@ -136,7 +139,6 @@ import {
 } from "./helpers/toolNameMapping";
 import {
   alwaysRequiresUserInput,
-  isFancyUITool,
   isTaskTool,
 } from "./helpers/toolNameMapping.js";
 import { useSuspend } from "./hooks/useSuspend/useSuspend.ts";
@@ -1845,7 +1847,10 @@ export default function App({
                     approval.toolArgs,
                     {},
                   );
-                  return await analyzeToolApproval(approval.toolName, parsedArgs);
+                  return await analyzeToolApproval(
+                    approval.toolName,
+                    parsedArgs,
+                  );
                 }),
               );
               setApprovalContexts(contexts);

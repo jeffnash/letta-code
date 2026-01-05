@@ -25,7 +25,10 @@
     // Some stricter flags (disabled by default)
     "noUnusedLocals": false,
     "noUnusedParameters": false,
-    "noPropertyAccessFromIndexSignature": false
+    "noPropertyAccessFromIndexSignature": false,
+
+    // Interop: allows default imports for CJS-style text asset shims
+    "esModuleInterop": true
   },
   "include": ["src/**/*"],
   "exclude": ["src/skills/builtin/**/scripts/**"]
