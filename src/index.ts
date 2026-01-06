@@ -12,7 +12,7 @@ import { ProfileSelectionInline } from "./cli/profile-selection";
 import { permissionMode } from "./permissions/mode";
 import { settingsManager } from "./settings-manager";
 import { telemetry } from "./telemetry";
-import { loadTools } from "./tools/manager";
+import { loadTools, upsertToolsIfNeeded } from "./tools/manager";
 import { validatePromptAssets } from "./agent/promptAssets";
 
 // Validate bundled prompt assets early - throws if build is corrupted
@@ -733,6 +733,8 @@ async function main(): Promise<void> {
       specifiedToolset as "codex" | "default" | undefined,
     );
     await loadTools(modelForTools);
+    const client = await getClient();
+    await upsertToolsIfNeeded(client, baseURL);
 
     const { handleHeadlessCommand } = await import("./headless");
     await handleHeadlessCommand(process.argv, specifiedModel, skillsDirectory);
@@ -791,6 +793,7 @@ async function main(): Promise<void> {
       | "selecting"
       | "selecting_global"
       | "assembling"
+      | "upserting"
       | "importing"
       | "initializing"
       | "checking"
@@ -980,6 +983,9 @@ async function main(): Promise<void> {
         );
         await loadTools(modelForTools);
 
+        setLoadingState("upserting");
+        await upsertToolsIfNeeded(client, baseURL);
+
         setLoadingState("initializing");
         const { createAgent } = await import("./agent/create");
         const { getModelUpdateArgs } = await import("./agent/model");
@@ -1106,6 +1112,12 @@ async function main(): Promise<void> {
           setAgentProvenance(result.provenance);
         }
 
+        // Ensure Letta Code tools are attached to the agent
+        // For new agents, linkToolsToAgent is already called in createAgent
+        // For resumed agents, we need to ensure tools are attached in case they're missing
+        const { linkToolsToAgent } = await import("./agent/modify");
+        await linkToolsToAgent(agent.id);
+
         // Ensure local project settings are loaded before updating
         // (they may not have been loaded if we didn't try to resume from project settings)
         try {
@@ -1211,6 +1223,12 @@ async function main(): Promise<void> {
             }
             agent = result.agent;
           }
+        }
+
+        // Re-link tools after model/system prompt updates for resumed agents
+        if (resuming) {
+          const { linkToolsToAgent } = await import("./agent/modify");
+          await linkToolsToAgent(agent.id);
         }
 
         // Get resume data (pending approval + message history) if resuming

@@ -43,6 +43,8 @@ export interface Settings {
     provider: "anthropic";
     timestamp: number;
   };
+  // Tool upserting hash cache (maps server URL to hash of tool definitions)
+  toolUpsertHashes?: Record<string, string>;
 }
 
 export interface ProjectSettings {

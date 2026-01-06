@@ -236,3 +236,164 @@ export async function updateAgentSystemPrompt(
     };
   }
 }
+
+export interface LinkResult {
+  success: boolean;
+  message: string;
+  addedCount?: number;
+}
+
+/**
+ * Attach all Letta Code tools to an agent.
+ * This looks up tool IDs on the server and attaches them to the agent,
+ * also adding requires_approval rules for client-side execution.
+ */
+export async function linkToolsToAgent(agentId: string): Promise<LinkResult> {
+  try {
+    const client = await getClient();
+
+    const agent = await client.agents.retrieve(agentId, {
+      include: ["agent.tools"],
+    });
+    const currentTools = agent.tools || [];
+    const currentToolIds = currentTools
+      .map((t) => t.id)
+      .filter((id): id is string => typeof id === "string");
+    const currentToolNames = new Set(
+      currentTools
+        .map((t) => t.name)
+        .filter((name): name is string => typeof name === "string"),
+    );
+
+    const { getServerToolName, getToolNames } = await import("../tools/manager");
+    const lettaCodeToolNames = getToolNames();
+
+    const toolsToAdd = lettaCodeToolNames.filter((internalName) => {
+      const serverName = getServerToolName(internalName);
+      return !currentToolNames.has(serverName);
+    });
+
+    if (toolsToAdd.length === 0) {
+      return {
+        success: true,
+        message: "All Letta Code tools already attached",
+        addedCount: 0,
+      };
+    }
+
+    const toolsToAddIds = (
+      await Promise.all(
+        toolsToAdd.map(async (toolName) => {
+          const serverName = getServerToolName(toolName);
+          const toolsResponse = await client.tools.list({ name: serverName });
+          return toolsResponse.items[0]?.id;
+        }),
+      )
+    ).filter((id): id is string => !!id);
+
+    const newToolIds = [...currentToolIds, ...toolsToAddIds];
+
+    const currentToolRules = agent.tool_rules || [];
+    const newToolRules = [
+      ...currentToolRules,
+      ...toolsToAdd.map((toolName) => ({
+        tool_name: getServerToolName(toolName),
+        type: "requires_approval" as const,
+        prompt_template: null,
+      })),
+    ];
+
+    await client.agents.update(agentId, {
+      tool_ids: newToolIds,
+      tool_rules: newToolRules,
+    });
+
+    return {
+      success: true,
+      message: `Attached ${toolsToAddIds.length} Letta Code tool(s) to agent`,
+      addedCount: toolsToAddIds.length,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+export interface UnlinkResult {
+  success: boolean;
+  message: string;
+  removedCount?: number;
+}
+
+/**
+ * Remove all Letta Code tools from an agent.
+ * This detaches client-side tools from the agent, typically before switching toolsets.
+ */
+export async function unlinkToolsFromAgent(agentId: string): Promise<UnlinkResult> {
+  try {
+    const client = await getClient();
+
+    const agent = await client.agents.retrieve(agentId, {
+      include: ["agent.tools"],
+    });
+    const currentTools = agent.tools || [];
+    const currentToolIds = currentTools
+      .map((t) => t.id)
+      .filter((id): id is string => typeof id === "string");
+    const currentToolNames = new Map(
+      currentTools
+        .filter((t) => typeof t.name === "string" && typeof t.id === "string")
+        .map((t) => [t.name as string, t.id as string]),
+    );
+
+    const { getAllLettaToolNames, getServerToolName } = await import("../tools/manager");
+    const allLettaToolNames = getAllLettaToolNames();
+
+    // Find tools to remove (any Letta Code tool currently attached)
+    const toolIdsToRemove = new Set<string>();
+    for (const internalName of allLettaToolNames) {
+      const serverName = getServerToolName(internalName);
+      const toolId = currentToolNames.get(serverName);
+      if (toolId) {
+        toolIdsToRemove.add(toolId);
+      }
+    }
+
+    if (toolIdsToRemove.size === 0) {
+      return {
+        success: true,
+        message: "No Letta Code tools to remove",
+        removedCount: 0,
+      };
+    }
+
+    // Filter out the tools to remove
+    const newToolIds = currentToolIds.filter((id) => !toolIdsToRemove.has(id));
+
+    // Also remove tool rules for the removed tools
+    const removedServerNames = new Set(
+      allLettaToolNames.map((n) => getServerToolName(n)),
+    );
+    const newToolRules = (agent.tool_rules || []).filter(
+      (r) => !removedServerNames.has(r.tool_name),
+    );
+
+    await client.agents.update(agentId, {
+      tool_ids: newToolIds,
+      tool_rules: newToolRules,
+    });
+
+    return {
+      success: true,
+      message: `Removed ${toolIdsToRemove.size} Letta Code tool(s) from agent`,
+      removedCount: toolIdsToRemove.size,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}

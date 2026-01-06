@@ -353,6 +353,10 @@ export async function createAgent(
     enable_sleeptime: enableSleeptimeVal,
   });
 
+  // Attach Letta Code tools to the agent with requires_approval rules
+  const { linkToolsToAgent } = await import("./modify");
+  await linkToolsToAgent(agent.id);
+
   // Note: Preflight check above falls back to 'memory' when 'memory_apply_patch' is unavailable.
 
   // Apply updateArgs if provided (e.g., context_window, reasoning_effort, verbosity, etc.)

@@ -433,6 +433,12 @@ export async function handleHeadlessCommand(
     }
   }
 
+  // Re-link tools after model/system prompt updates for resumed agents
+  if (isResumingAgent) {
+    const { linkToolsToAgent } = await import("./agent/modify");
+    await linkToolsToAgent(agent.id);
+  }
+
   // Save agent ID to both project and global settings
   await settingsManager.loadLocalProjectSettings();
   settingsManager.updateLocalProjectSettings({ lastAgent: agent.id });

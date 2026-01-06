@@ -427,6 +427,7 @@ export default function App({
   agentState?: AgentState | null;
   loadingState?:
     | "assembling"
+    | "upserting"
     | "importing"
     | "initializing"
     | "checking"

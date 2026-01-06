@@ -1,4 +1,5 @@
 import { getClient } from "../agent/client";
+import { linkToolsToAgent, unlinkToolsFromAgent } from "../agent/modify";
 import { resolveModel } from "../agent/model";
 import { toolFilter } from "./filter";
 import {
@@ -113,6 +114,9 @@ export async function forceToolsetSwitch(
   toolsetName: ToolsetName,
   agentId: string,
 ): Promise<void> {
+  // Unlink old tools from agent before switching
+  await unlinkToolsFromAgent(agentId);
+
   // Clear currently loaded tools
   clearTools();
 
@@ -145,6 +149,9 @@ export async function forceToolsetSwitch(
     toolsetName === "codex" || toolsetName === "codex_snake";
   await ensureCorrectMemoryTool(agentId, modelForLoading, useMemoryPatch);
 
+  // Re-link the new toolset to the agent
+  await linkToolsToAgent(agentId);
+
   // NOTE: Toolset is not persisted. On resume, we derive from agent's model.
   // If we want to persist explicit toolset overrides in the future, add:
   //   agentToolsets: Record<string, ToolsetName> to Settings (global, since agent IDs are UUIDs)
@@ -165,6 +172,9 @@ export async function switchToolsetForModel(
 ): Promise<ToolsetName> {
   // Resolve model ID to handle when possible so provider checks stay consistent
   const resolvedModel = resolveModel(modelIdentifier) ?? modelIdentifier;
+
+  // Unlink old tools from agent before switching
+  await unlinkToolsFromAgent(agentId);
 
   // Clear currently loaded tools and load the appropriate set for the target model
   clearTools();
@@ -187,6 +197,9 @@ export async function switchToolsetForModel(
 
   // Ensure base memory tool is correct for the model
   await ensureCorrectMemoryTool(agentId, resolvedModel);
+
+  // Re-link the new toolset to the agent
+  await linkToolsToAgent(agentId);
 
   const { isGeminiModel } = await import("./manager");
   const toolsetName = isOpenAIModel(resolvedModel)

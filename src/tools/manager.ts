@@ -1,3 +1,6 @@
+import { createHash } from "crypto";
+import type Letta from "@letta-ai/letta-client";
+import { AuthenticationError, PermissionDeniedError } from "@letta-ai/letta-client";
 import { getModelInfo } from "../agent/model";
 import { getAllSubagentConfigs } from "../agent/subagents";
 import { INTERRUPTED_BY_USER } from "../constants";
@@ -847,4 +850,184 @@ export function getToolSchema(name: string): ToolSchema | undefined {
  */
 export function clearTools(): void {
   toolRegistry.clear();
+}
+
+/**
+ * Sanitize a parameter name to be a valid Python identifier.
+ * Handles parameters like -B, -A, -C in Grep schema.
+ */
+function sanitizePythonParamName(name: string): string {
+  let sanitized = name.replace(/^-+/, "_").replace(/[^a-zA-Z0-9_]/g, "_");
+  if (/^[0-9]/.test(sanitized)) {
+    sanitized = "_" + sanitized;
+  }
+  return sanitized || "_param";
+}
+
+/**
+ * Generate a Python stub for a tool that will be executed client-side.
+ */
+function generatePythonStub(
+  name: string,
+  _description: string,
+  schema: JsonSchema,
+): string {
+  const params = (schema.properties ?? {}) as Record<string, JsonSchema>;
+  const required = schema.required ?? [];
+
+  const allKeys = Object.keys(params);
+  const requiredParams = allKeys.filter((key) => required.includes(key));
+  const optionalParams = allKeys.filter((key) => !required.includes(key));
+
+  const paramList = [
+    ...requiredParams.map(sanitizePythonParamName),
+    ...optionalParams.map((key) => `${sanitizePythonParamName(key)}=None`),
+  ].join(", ");
+
+  return `def ${name}(${paramList}):
+    """Stub method. This tool is executed client-side via the approval flow.
+    """
+    raise Exception("This is a stub tool. Execution should happen on client.")  
+`;
+}
+
+/**
+ * Upsert all loaded tools to the Letta server.
+ */
+export async function upsertToolsToServer(client: Letta): Promise<void> {
+  const OPERATION_TIMEOUT = 20000;
+  const MAX_TOTAL_TIME = 30000;
+  const startTime = Date.now();
+
+  async function attemptUpsert(retryCount: number = 0): Promise<void> {
+    const attemptStartTime = Date.now();
+
+    if (Date.now() - startTime > MAX_TOTAL_TIME) {
+      throw new Error(
+        "Tool upserting exceeded maximum time limit (30s). Please check your network connection and try again.",
+      );
+    }
+
+    try {
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          reject(new Error(`Tool upsert operation timed out (${OPERATION_TIMEOUT / 1000}s)`));
+        }, OPERATION_TIMEOUT);
+      });
+
+      const upsertPromise = Promise.all(
+        Array.from(toolRegistry.entries()).map(async ([name, tool]) => {
+          const serverName = TOOL_NAME_MAPPINGS[name as ToolName] || name;
+
+          const pythonStub = generatePythonStub(
+            serverName,
+            tool.schema.description,
+            tool.schema.input_schema,
+          );
+
+          const fullJsonSchema = {
+            name: serverName,
+            description: tool.schema.description,
+            parameters: tool.schema.input_schema,
+          };
+
+          await client.tools.upsert({
+            default_requires_approval: true,
+            source_code: pythonStub,
+            json_schema: fullJsonSchema,
+          });
+        }),
+      );
+
+      await Promise.race([upsertPromise, timeoutPromise]);
+      return;
+    } catch (error) {
+      const elapsed = Date.now() - attemptStartTime;
+      const totalElapsed = Date.now() - startTime;
+
+      if (error instanceof AuthenticationError || error instanceof PermissionDeniedError) {
+        throw new Error(
+          `Authentication failed. Please check your LETTA_API_KEY.\n` +
+            `Run 'rm ~/.letta/settings.json' and restart to re-authenticate.\n` +
+            `Original error: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+
+      if (totalElapsed < MAX_TOTAL_TIME) {
+        const backoffDelay = Math.min(1000 * 2 ** retryCount, 5000);
+        const remainingTime = MAX_TOTAL_TIME - totalElapsed;
+
+        console.error(
+          `Tool upsert attempt ${retryCount + 1} failed after ${elapsed}ms. Retrying in ${backoffDelay}ms... (${Math.round(remainingTime / 1000)}s remaining)`,
+        );
+        console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+
+        await new Promise((resolve) => setTimeout(resolve, backoffDelay));
+        return attemptUpsert(retryCount + 1);
+      }
+
+      throw error;
+    }
+  }
+
+  await attemptUpsert();
+}
+
+/**
+ * Compute a hash of all currently loaded tools for cache invalidation.
+ */
+export function computeToolsHash(): string {
+  const toolData = Array.from(toolRegistry.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, tool]) => ({
+      name,
+      serverName: getServerToolName(name),
+      schema: tool.schema,
+    }));
+
+  return createHash("sha256")
+    .update(JSON.stringify(toolData))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+/**
+ * Upserts tools only if the tool definitions have changed since last upsert.
+ */
+export async function upsertToolsIfNeeded(
+  client: Letta,
+  serverUrl: string,
+): Promise<boolean> {
+  const currentHash = computeToolsHash();
+
+  const { settingsManager } = await import("../settings-manager");
+  const cachedHashes = settingsManager.getSetting("toolUpsertHashes") || {};
+
+  if (cachedHashes[serverUrl] === currentHash) {
+    return false;
+  }
+
+  await upsertToolsToServer(client);
+
+  settingsManager.updateSettings({
+    toolUpsertHashes: { ...cachedHashes, [serverUrl]: currentHash },
+  });
+
+  return true;
+}
+
+/**
+ * Force upsert tools by clearing the hash cache for the server.
+ */
+export async function forceUpsertTools(
+  client: Letta,
+  serverUrl: string,
+): Promise<void> {
+  const { settingsManager } = await import("../settings-manager");
+  const cachedHashes = settingsManager.getSetting("toolUpsertHashes") || {};
+
+  delete cachedHashes[serverUrl];
+  settingsManager.updateSettings({ toolUpsertHashes: cachedHashes });
+
+  await upsertToolsIfNeeded(client, serverUrl);
 }

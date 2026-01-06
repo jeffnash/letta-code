@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import type { AgentState } from "@letta-ai/letta-client/resources/agents/agents";
 import { getClient } from "./client";
 import { getModelUpdateArgs } from "./model";
-import { updateAgentLLMConfig } from "./modify";
+import { updateAgentLLMConfig, linkToolsToAgent } from "./modify";
 
 export interface ImportAgentOptions {
   filePath: string;
@@ -40,6 +40,9 @@ export async function importAgentFromFile(
 
   const agentId = importResponse.agent_ids[0] as string;
   let agent = await client.agents.retrieve(agentId);
+
+  // Attach Letta Code tools to the imported agent
+  await linkToolsToAgent(agentId);
 
   // Override model if specified
   if (options.modelOverride) {
