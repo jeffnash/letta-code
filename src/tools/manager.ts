@@ -480,27 +480,46 @@ export async function loadTools(modelIdentifier?: string): Promise<void> {
   }
 }
 
+/**
+ * Check if a model identifier is an OpenAI/GPT-5 model (uses memory_apply_patch, codex toolset)
+ */
+function isOpenAIModelHandle(handle: string): boolean {
+  return (
+    handle.startsWith("openai/") ||
+    handle.startsWith("cliproxy/gpt-5") ||
+    handle.startsWith("cliproxy/copilot-gpt-5") ||
+    handle.startsWith("cliproxy/copilot-gpt-4")
+  );
+}
+
 export function isOpenAIModel(modelIdentifier: string): boolean {
   const info = getModelInfo(modelIdentifier);
   if (info?.handle && typeof info.handle === "string") {
-    return info.handle.startsWith("openai/") || info.handle.startsWith("cliproxy/gpt-5");
+    return isOpenAIModelHandle(info.handle);
   }
-  // Fallback: treat raw handle-style identifiers as OpenAI if they start with openai/ or cliproxy/gpt-5
-  return modelIdentifier.startsWith("openai/") || modelIdentifier.startsWith("cliproxy/gpt-5");
+  // Fallback: treat raw handle-style identifiers
+  return isOpenAIModelHandle(modelIdentifier);
+}
+
+/**
+ * Check if a model identifier is a Gemini model (uses gemini toolset)
+ */
+function isGeminiModelHandle(handle: string): boolean {
+  return (
+    handle.startsWith("google/") ||
+    handle.startsWith("google_ai/") ||
+    handle.startsWith("cliproxy/gemini-") ||
+    handle.startsWith("cliproxy/copilot-gemini-")
+  );
 }
 
 export function isGeminiModel(modelIdentifier: string): boolean {
   const info = getModelInfo(modelIdentifier);
   if (info?.handle && typeof info.handle === "string") {
-    return (
-      info.handle.startsWith("google/") || info.handle.startsWith("google_ai/")
-    );
+    return isGeminiModelHandle(info.handle);
   }
-  // Fallback: treat raw handle-style identifiers as Gemini
-  return (
-    modelIdentifier.startsWith("google/") ||
-    modelIdentifier.startsWith("google_ai/")
-  );
+  // Fallback: treat raw handle-style identifiers
+  return isGeminiModelHandle(modelIdentifier);
 }
 
 /**
