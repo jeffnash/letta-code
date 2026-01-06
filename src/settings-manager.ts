@@ -191,9 +191,8 @@ class SettingsManager {
             console.warn("Tokens will remain in settings file for persistence");
           }
         } else {
-          console.warn(
-            "Secrets not available - tokens will remain in settings file for persistence",
-          );
+          // Silently continue - tokens in settings file is the expected fallback
+          // when keychain is unavailable. Don't warn as this pollutes subagent output.
         }
       }
     } catch (error) {
@@ -345,10 +344,7 @@ class SettingsManager {
     }
 
     if (Object.keys(secureTokens).length > 0) {
-      // Fallback: store tokens in settings file
-      console.warn(
-        "Secrets not available, storing tokens in settings file for persistence",
-      );
+      // Fallback: store tokens in settings file (silently - this is expected when keychain unavailable)
 
       // biome-ignore lint/style/noNonNullAssertion: at this point will always exist
       const fallbackSettings: Settings = { ...this.settings! };
@@ -982,9 +978,7 @@ class SettingsManager {
   async setSecureTokens(tokens: SecureTokens): Promise<void> {
     const available = await this.isKeychainAvailable();
     if (!available) {
-      console.warn(
-        "Secrets not available, tokens will use fallback storage (not persistent across restarts)",
-      );
+      // Silently return - caller will handle fallback storage
       return;
     }
 
