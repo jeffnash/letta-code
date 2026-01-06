@@ -21,6 +21,11 @@ import {
   type ApprovalResult,
   executeAutoAllowedTools,
 } from "../agent/approval-execution";
+import {
+  buildApprovalRecoveryMessage,
+  fetchRunErrorDetail,
+  isApprovalStateDesyncError,
+} from "../agent/approval-recovery";
 import { prefetchAvailableModelHandles } from "../agent/available-models";
 import { getResumeData } from "../agent/check-approval";
 import { getClient } from "../agent/client";
@@ -34,12 +39,14 @@ import { type PermissionMode, permissionMode } from "../permissions/mode";
 import { updateProjectSettings } from "../settings";
 import { settingsManager } from "../settings-manager";
 import { telemetry } from "../telemetry";
-import type { ToolExecutionResult } from "../tools/manager";
 import {
   analyzeToolApproval,
   checkToolPermission,
   executeTool,
+  isGeminiModel,
+  isOpenAIModel,
   savePermissionRule,
+  type ToolExecutionResult,
 } from "../tools/manager";
 import {
   handleMcpAdd,
@@ -58,6 +65,7 @@ import {
 } from "./commands/profile";
 import { AgentSelector } from "./components/AgentSelector";
 // ApprovalDialog removed - all approvals now render inline
+import { ApprovalPreview } from "./components/ApprovalPreview";
 import { AssistantMessage } from "./components/AssistantMessageRich";
 import { BashCommandMessage } from "./components/BashCommandMessage";
 import { CommandMessage } from "./components/CommandMessage";
@@ -70,8 +78,8 @@ import { InlineBashApproval } from "./components/InlineBashApproval";
 import { InlineEnterPlanModeApproval } from "./components/InlineEnterPlanModeApproval";
 import { InlineFileEditApproval } from "./components/InlineFileEditApproval";
 import { InlineGenericApproval } from "./components/InlineGenericApproval";
-import { InlinePlanApproval } from "./components/InlinePlanApproval";
 import { InlineQuestionApproval } from "./components/InlineQuestionApproval";
+import { InlineTaskApproval } from "./components/InlineTaskApproval";
 import { Input } from "./components/InputRich";
 import { McpSelector } from "./components/McpSelector";
 import { MemoryViewer } from "./components/MemoryViewer";
@@ -79,11 +87,15 @@ import { MessageSearch } from "./components/MessageSearch";
 import { ModelSelector } from "./components/ModelSelector";
 import { NewAgentDialog } from "./components/NewAgentDialog";
 import { OAuthCodeDialog } from "./components/OAuthCodeDialog";
+import { PendingApprovalStub } from "./components/PendingApprovalStub";
 import { PinDialog, validateAgentName } from "./components/PinDialog";
 // QuestionDialog removed - now using InlineQuestionApproval
 import { ReasoningMessage } from "./components/ReasoningMessageRich";
 import { ResumeSelector } from "./components/ResumeSelector";
 import { formatUsageStats } from "./components/SessionStats";
+// InlinePlanApproval kept for easy rollback if needed
+// import { InlinePlanApproval } from "./components/InlinePlanApproval";
+import { StaticPlanApproval } from "./components/StaticPlanApproval";
 import { StatusMessage } from "./components/StatusMessage";
 import { SubagentGroupDisplay } from "./components/SubagentGroupDisplay";
 import { SubagentGroupStatic } from "./components/SubagentGroupStatic";
@@ -161,6 +173,10 @@ const EAGER_CANCEL = true;
 
 // Maximum retries for transient LLM API errors (matches headless.ts)
 const LLM_API_ERROR_MAX_RETRIES = 3;
+
+// Message shown when user interrupts the stream
+const INTERRUPT_MESSAGE =
+  "Interrupted – tell the agent what to do differently. Something went wrong? Use /feedback to report the issue.";
 
 // tiny helper for unique ids (avoid overwriting prior user lines)
 function uid(prefix: string) {
@@ -309,7 +325,7 @@ function planFileExists(): boolean {
 }
 
 // Read plan content from the plan file
-function readPlanFile(): string {
+function _readPlanFile(): string {
   const planFilePath = permissionMode.getPlanFilePath();
   if (!planFilePath) {
     return "No plan file path set.";
@@ -376,6 +392,20 @@ type StaticItem =
         error?: string;
       }>;
     }
+  | {
+      // Preview content committed early during approval to enable flicker-free UI
+      // When an approval's content is tall enough to overflow the viewport,
+      // we commit the preview to static and only show small approval options in dynamic
+      kind: "approval_preview";
+      id: string;
+      toolCallId: string;
+      toolName: string;
+      toolArgs: string;
+      // Optional precomputed/cached data for rendering
+      precomputedDiff?: AdvancedDiffSuccess;
+      planContent?: string; // For ExitPlanMode
+      planFilePath?: string; // For ExitPlanMode
+    }
   | Line;
 
 // Stable empty arrays to avoid prop reference changes when defaults are used
@@ -397,8 +427,6 @@ export default function App({
   agentState?: AgentState | null;
   loadingState?:
     | "assembling"
-    | "upserting"
-    | "updating_tools"
     | "importing"
     | "initializing"
     | "checking"
@@ -525,6 +553,99 @@ export default function App({
   // This is the approval currently being shown to the user
   const currentApproval = pendingApprovals[approvalResults.length];
   const currentApprovalContext = approvalContexts[approvalResults.length];
+  const activeApprovalId = currentApproval?.toolCallId ?? null;
+
+  // Build Sets/Maps for three approval states (excluding the active one):
+  // - pendingIds: undecided approvals (index > approvalResults.length)
+  // - queuedIds: decided but not yet executed (index < approvalResults.length)
+  // Used to render appropriate stubs while one approval is active
+  const {
+    pendingIds,
+    queuedIds,
+    approvalMap,
+    stubDescriptions,
+    queuedDecisions,
+  } = useMemo(() => {
+    const pending = new Set<string>();
+    const queued = new Set<string>();
+    const map = new Map<string, ApprovalRequest>();
+    const descriptions = new Map<string, string>();
+    const decisions = new Map<
+      string,
+      { type: "approve" | "deny"; reason?: string }
+    >();
+
+    // Helper to compute stub description - called once per approval during memo
+    const computeStubDescription = (
+      approval: ApprovalRequest,
+    ): string | undefined => {
+      try {
+        const args = JSON.parse(approval.toolArgs || "{}");
+
+        if (
+          isFileEditTool(approval.toolName) ||
+          isFileWriteTool(approval.toolName)
+        ) {
+          return args.file_path || undefined;
+        }
+        if (isShellTool(approval.toolName)) {
+          const cmd =
+            typeof args.command === "string"
+              ? args.command
+              : Array.isArray(args.command)
+                ? args.command.join(" ")
+                : "";
+          return cmd.length > 50 ? `${cmd.slice(0, 50)}...` : cmd || undefined;
+        }
+        if (isPatchTool(approval.toolName)) {
+          return "patch operation";
+        }
+        return undefined;
+      } catch {
+        return undefined;
+      }
+    };
+
+    const activeIndex = approvalResults.length;
+
+    for (let i = 0; i < pendingApprovals.length; i++) {
+      const approval = pendingApprovals[i];
+      if (!approval?.toolCallId || approval.toolCallId === activeApprovalId) {
+        continue;
+      }
+
+      const id = approval.toolCallId;
+      map.set(id, approval);
+
+      const desc = computeStubDescription(approval);
+      if (desc) {
+        descriptions.set(id, desc);
+      }
+
+      if (i < activeIndex) {
+        // Decided but not yet executed
+        queued.add(id);
+        const result = approvalResults[i];
+        if (result) {
+          decisions.set(id, {
+            type: result.type,
+            reason: result.type === "deny" ? result.reason : undefined,
+          });
+        }
+      } else {
+        // Undecided (waiting in queue)
+        pending.add(id);
+      }
+    }
+
+    return {
+      pendingIds: pending,
+      queuedIds: queued,
+      approvalMap: map,
+      stubDescriptions: descriptions,
+      queuedDecisions: decisions,
+    };
+  }, [pendingApprovals, approvalResults, activeApprovalId]);
 
   // Overlay/selector state - only one can be open at a time
   type ActiveOverlay =
@@ -742,9 +863,23 @@ export default function App({
         continue;
       }
       // Handle Task tool_calls specially - track position but don't add individually
+      // (unless there's no subagent data, in which case commit as regular tool call)
       if (ln.kind === "tool_call" && ln.name && isTaskTool(ln.name)) {
-        if (firstTaskIndex === -1 && finishedTaskToolCalls.length > 0) {
-          firstTaskIndex = newlyCommitted.length;
+        // Check if this specific Task tool has subagent data (will be grouped)
+        const hasSubagentData = finishedTaskToolCalls.some(
+          (tc) => tc.lineId === id,
+        );
+        if (hasSubagentData) {
+          // Has subagent data - will be grouped later
+          if (firstTaskIndex === -1) {
+            firstTaskIndex = newlyCommitted.length;
+          }
+          continue;
+        }
+        // No subagent data (e.g., backfilled from history) - commit as regular tool call
+        if (ln.phase === "finished") {
+          emittedIdsRef.current.add(id);
+          newlyCommitted.push({ ...ln });
         }
         continue;
       }
@@ -801,6 +936,10 @@ export default function App({
   // Store the last plan file path for post-approval rendering
   // (needed because plan mode is exited before rendering the result)
   const lastPlanFilePathRef = useRef<string | null>(null);
+
+  // Track which approval tool call IDs have had their previews eagerly committed
+  // This prevents double-committing when the approval changes
+  const eagerCommittedPreviewsRef = useRef<Set<string>>(new Set());
 
   // Recompute UI state from buffers after each streaming chunk
   const refreshDerived = useCallback(() => {
@@ -872,6 +1011,48 @@ export default function App({
       analyzeStartupApprovals();
     }
   }, [loadingState, startupApproval, startupApprovals]);
+
+  // Eager commit for ExitPlanMode: Always commit plan preview to staticItems
+  // This keeps the dynamic area small (just approval options) to avoid flicker
+  useEffect(() => {
+    if (!currentApproval) return;
+    if (currentApproval.toolName !== "ExitPlanMode") return;
+
+    const toolCallId = currentApproval.toolCallId;
+    if (!toolCallId) return;
+
+    // Already committed preview for this approval?
+    if (eagerCommittedPreviewsRef.current.has(toolCallId)) return;
+
+    const planFilePath = permissionMode.getPlanFilePath();
+    if (!planFilePath) return;
+
+    try {
+      const { readFileSync, existsSync } = require("node:fs");
+      if (!existsSync(planFilePath)) return;
+
+      const planContent = readFileSync(planFilePath, "utf-8");
+
+      // Commit preview to static area
+      const previewItem: StaticItem = {
+        kind: "approval_preview",
+        id: `approval-preview-${toolCallId}`,
+        toolCallId,
+        toolName: currentApproval.toolName,
+        toolArgs: currentApproval.toolArgs || "{}",
+        planContent,
+        planFilePath,
+      };
+
+      setStaticItems((prev) => [...prev, previewItem]);
+      eagerCommittedPreviewsRef.current.add(toolCallId);
+
+      // Also capture plan file path for post-approval rendering
+      lastPlanFilePathRef.current = planFilePath;
+    } catch {
+      // Failed to read plan, don't commit preview
+    }
+  }, [currentApproval]);
 
   // Backfill message history when resuming (only once)
   useEffect(() => {
@@ -986,11 +1167,14 @@ export default function App({
             setCurrentModelId(agentModelHandle || null);
           }
 
-          // Detect current toolset from attached tools
-          const { detectToolsetFromAgent } = await import("../tools/toolset");
-          const detected = await detectToolsetFromAgent(client, agentId);
-          if (detected) {
-            setCurrentToolset(detected);
+          // Derive toolset from agent's model (not persisted, computed on resume)
+          if (agentModelHandle) {
+            const derivedToolset = isOpenAIModel(agentModelHandle)
+              ? "codex"
+              : isGeminiModel(agentModelHandle)
+                ? "gemini"
+                : "default";
+            setCurrentToolset(derivedToolset);
           }
         } catch (error) {
           console.error("Error fetching agent config:", error);
@@ -1037,7 +1221,8 @@ export default function App({
       initialInput: Array<MessageCreate | ApprovalCreate>,
       options?: { allowReentry?: boolean },
     ): Promise<void> => {
-      const currentInput = initialInput;
+      // Copy so we can safely mutate for retry recovery flows
+      const currentInput = [...initialInput];
       const allowReentry = options?.allowReentry ?? false;
 
       // Guard against concurrent processConversation calls
@@ -1171,6 +1356,8 @@ export default function App({
           sessionStatsRef.current.updateUsageFromBuffers(buffersRef.current);
 
           const wasInterrupted = !!buffersRef.current.interrupted;
+          const wasAborted = !!signal?.aborted;
+          let stopReasonToHandle = wasAborted ? "cancelled" : stopReason;
 
           // Immediate refresh after stream completes to show final state unless
           // the user already cancelled (handleInterrupt rendered the UI).
@@ -1178,8 +1365,15 @@ export default function App({
             refreshDerived();
           }
 
+          // If the turn was interrupted client-side but the backend had already emitted
+          // requires_approval, treat it as a cancel. This avoids re-entering approval flow
+          // and keeps queue-cancel flags consistent with the normal cancel branch below.
+          if (wasInterrupted && stopReasonToHandle === "requires_approval") {
+            stopReasonToHandle = "cancelled";
+          }
+
           // Case 1: Turn ended normally
-          if (stopReason === "end_turn") {
+          if (stopReasonToHandle === "end_turn") {
             setStreaming(false);
             llmApiErrorRetriesRef.current = 0; // Reset retry counter on success
 
@@ -1217,7 +1411,7 @@ export default function App({
           }
 
           // Case 1.5: Stream was cancelled by user
-          if (stopReason === "cancelled") {
+          if (stopReasonToHandle === "cancelled") {
             setStreaming(false);
 
             // Check if this cancel was triggered by queue threshold
@@ -1245,7 +1439,7 @@ export default function App({
             } else {
               // Regular user cancellation - show error
               if (!EAGER_CANCEL) {
-                appendError("Stream interrupted by user", true);
+                appendError(INTERRUPT_MESSAGE, true);
               }
             }
 
@@ -1253,7 +1447,7 @@ export default function App({
           }
 
           // Case 2: Requires approval
-          if (stopReason === "requires_approval") {
+          if (stopReasonToHandle === "requires_approval") {
             // Clear stale state immediately to prevent ID mismatch bugs
             setAutoHandledResults([]);
             setAutoDeniedApprovals([]);
@@ -1666,8 +1860,80 @@ export default function App({
           }
 
           // Unexpected stop reason (error, llm_api_error, etc.)
+          // Cache desync detection and last failure for consistent handling
+          const isApprovalPayload =
+            currentInput.length === 1 && currentInput[0]?.type === "approval";
+
+          // Capture the most recent error text in this turn (if any)
+          let latestErrorText: string | null = null;
+          for (let i = buffersRef.current.order.length - 1; i >= 0; i -= 1) {
+            const id = buffersRef.current.order[i];
+            if (!id) continue;
+            const entry = buffersRef.current.byId.get(id);
+            if (entry?.kind === "error" && typeof entry.text === "string") {
+              latestErrorText = entry.text;
+              break;
+            }
+          }
+
+          // Detect approval desync once per turn
+          const detailFromRun = await fetchRunErrorDetail(lastRunId);
+          const desyncDetected =
+            isApprovalStateDesyncError(detailFromRun) ||
+            isApprovalStateDesyncError(latestErrorText);
+
+          // Track last failure info so we can emit it if retries stop
+          const lastFailureMessage = latestErrorText || detailFromRun || null;
+
+          // Check for approval desync errors even if stop_reason isn't llm_api_error.
+          if (isApprovalPayload && desyncDetected) {
+            if (llmApiErrorRetriesRef.current < LLM_API_ERROR_MAX_RETRIES) {
+              llmApiErrorRetriesRef.current += 1;
+              const statusId = uid("status");
+              buffersRef.current.byId.set(statusId, {
+                kind: "status",
+                id: statusId,
+                lines: [
+                  "Approval state desynced; resending keep-alive recovery prompt...",
+                ],
+              });
+              buffersRef.current.order.push(statusId);
+              refreshDerived();
+
+              currentInput.splice(
+                0,
+                currentInput.length,
+                buildApprovalRecoveryMessage(),
+              );
+
+              // Remove the transient status before retrying
+              buffersRef.current.byId.delete(statusId);
+              buffersRef.current.order = buffersRef.current.order.filter(
+                (id) => id !== statusId,
+              );
+              refreshDerived();
+
+              // Reset interrupted flag so retry stream chunks are processed
+              buffersRef.current.interrupted = false;
+              continue;
+            }
+
+            // No retries left: emit the failure and exit
+            const errorToShow =
+              lastFailureMessage ||
+              `An error occurred during agent execution\n(run_id: ${lastRunId ?? "unknown"}, stop_reason: ${stopReasonToHandle})`;
+            appendError(errorToShow, true);
+            setStreaming(false);
+            sendDesktopNotification();
+            refreshDerived();
+            return;
+          }
+
           // Check if this is a retriable error (transient LLM API error)
-          const retriable = await isRetriableError(stopReason, lastRunId);
+          const retriable = await isRetriableError(
+            stopReasonToHandle,
+            lastRunId,
+          );
 
           if (
             retriable &&
@@ -1679,10 +1945,13 @@ export default function App({
 
             // Show subtle grey status message
             const statusId = uid("status");
+            const statusLines = [
+              "Unexpected downstream LLM API error, retrying...",
+            ];
             buffersRef.current.byId.set(statusId, {
               kind: "status",
               id: statusId,
-              lines: ["Unexpected downstream LLM API error, retrying..."],
+              lines: statusLines,
             });
             buffersRef.current.order.push(statusId);
             refreshDerived();
@@ -1709,6 +1978,8 @@ export default function App({
             refreshDerived();
 
             if (!cancelled) {
+              // Reset interrupted flag so retry stream chunks are processed
+              buffersRef.current.interrupted = false;
               // Retry by continuing the while loop (same currentInput)
               continue;
             }
@@ -1725,8 +1996,9 @@ export default function App({
           telemetry.trackError(
             fallbackError
               ? "FallbackError"
-              : stopReason || "unknown_stop_reason",
-            fallbackError || `Stream stopped with reason: ${stopReason}`,
+              : stopReasonToHandle || "unknown_stop_reason",
+            fallbackError ||
+              `Stream stopped with reason: ${stopReasonToHandle}`,
             "message_stream",
             {
               modelId: currentModelId || undefined,
@@ -1930,13 +2202,37 @@ export default function App({
   }, []);
 
   const handleInterrupt = useCallback(async () => {
-    // If we're executing client-side tools, abort them locally instead of hitting the backend
-    // Don't show "Stream interrupted" banner - the tool result will show "Interrupted by user"
+    // If we're executing client-side tools, abort them AND the main stream
     if (isExecutingTool && toolAbortControllerRef.current) {
       toolAbortControllerRef.current.abort();
+
+      // ALSO abort the main stream - don't leave it running
+      buffersRef.current.abortGeneration =
+        (buffersRef.current.abortGeneration || 0) + 1;
+      const toolsCancelled = markIncompleteToolsAsCancelled(buffersRef.current);
+
+      // Show interrupt feedback (yellow message if no tools were cancelled)
+      if (!toolsCancelled) {
+        appendError(INTERRUPT_MESSAGE, true);
+      }
+
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+
+      userCancelledRef.current = true; // Prevent dequeue
       setStreaming(false);
       setIsExecutingTool(false);
       refreshDerived();
+
+      // Delay flag reset to ensure React has flushed state updates before dequeue can fire.
+      // Use setTimeout(50) instead of setTimeout(0) - the longer delay ensures React's
+      // batched state updates have been fully processed before we allow the dequeue effect.
+      setTimeout(() => {
+        userCancelledRef.current = false;
+      }, 50);
+
       return;
     }
 
@@ -1953,7 +2249,13 @@ export default function App({
       // Prevent multiple handleInterrupt calls while state updates are pending
       setInterruptRequested(true);
 
-      // Abort the stream via abort signal
+      // Set interrupted flag FIRST, before abort() triggers any async work.
+      // This ensures onChunk and other guards see interrupted=true immediately.
+      buffersRef.current.abortGeneration =
+        (buffersRef.current.abortGeneration || 0) + 1;
+      const toolsCancelled = markIncompleteToolsAsCancelled(buffersRef.current);
+
+      // NOW abort the stream - interrupted flag is already set
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
         abortControllerRef.current = null; // Clear ref so isAgentBusy() returns false
@@ -1965,9 +2267,8 @@ export default function App({
       // Stop streaming and show error message (unless tool calls were cancelled,
       // since the tool result will show "Interrupted by user")
       setStreaming(false);
-      const toolsCancelled = markIncompleteToolsAsCancelled(buffersRef.current);
       if (!toolsCancelled) {
-        appendError("Stream interrupted by user", true);
+        appendError(INTERRUPT_MESSAGE, true);
       }
       refreshDerived();
 
@@ -2015,13 +2316,13 @@ export default function App({
         });
 
       // Reset cancellation flags after cleanup is complete.
-      // This allows the dequeue effect to process any queued messages.
-      // We use setTimeout to ensure React state updates (setStreaming, etc.)
-      // have been processed before the dequeue effect runs.
+      // Use setTimeout(50) instead of setTimeout(0) to ensure React has fully processed
+      // the streaming=false state before we allow the dequeue effect to start a new conversation.
+      // This prevents the "Maximum update depth exceeded" infinite render loop.
       setTimeout(() => {
         userCancelledRef.current = false;
         setInterruptRequested(false);
-      }, 0);
+      }, 50);
 
       return;
     } else {
@@ -3250,96 +3551,6 @@ export default function App({
           };
           const argsStr = msg.trim().slice(6).trim();
           handleUnpin(profileCtx, msg, argsStr);
-          return { submitted: true };
-        }
-
-        // Special handling for /link command - attach all Letta Code tools (deprecated)
-        if (msg.trim() === "/link" || msg.trim().startsWith("/link ")) {
-          const cmdId = uid("cmd");
-          buffersRef.current.byId.set(cmdId, {
-            kind: "command",
-            id: cmdId,
-            input: msg,
-            output: "Attaching Letta Code tools...",
-            phase: "running",
-          });
-          buffersRef.current.order.push(cmdId);
-          refreshDerived();
-
-          setCommandRunning(true);
-
-          try {
-            const { linkToolsToAgent } = await import("../agent/modify");
-            const result = await linkToolsToAgent(agentId);
-
-            buffersRef.current.byId.set(cmdId, {
-              kind: "command",
-              id: cmdId,
-              input: msg,
-              output: result.message,
-              phase: "finished",
-              success: result.success,
-            });
-            refreshDerived();
-          } catch (error) {
-            const errorDetails = formatErrorDetails(error, agentId);
-            buffersRef.current.byId.set(cmdId, {
-              kind: "command",
-              id: cmdId,
-              input: msg,
-              output: `Failed to link tools: ${errorDetails}`,
-              phase: "finished",
-              success: false,
-            });
-            refreshDerived();
-          } finally {
-            setCommandRunning(false);
-          }
-          return { submitted: true };
-        }
-
-        // Special handling for /unlink command - remove all Letta Code tools (deprecated)
-        if (msg.trim() === "/unlink" || msg.trim().startsWith("/unlink ")) {
-          const cmdId = uid("cmd");
-          buffersRef.current.byId.set(cmdId, {
-            kind: "command",
-            id: cmdId,
-            input: msg,
-            output: "Removing Letta Code tools...",
-            phase: "running",
-          });
-          buffersRef.current.order.push(cmdId);
-          refreshDerived();
-
-          setCommandRunning(true);
-
-          try {
-            const { unlinkToolsFromAgent } = await import("../agent/modify");
-            const result = await unlinkToolsFromAgent(agentId);
-
-            buffersRef.current.byId.set(cmdId, {
-              kind: "command",
-              id: cmdId,
-              input: msg,
-              output: result.message,
-              phase: "finished",
-              success: result.success,
-            });
-            refreshDerived();
-          } catch (error) {
-            const errorDetails = formatErrorDetails(error, agentId);
-            buffersRef.current.byId.set(cmdId, {
-              kind: "command",
-              id: cmdId,
-              input: msg,
-              output: `Failed to unlink tools: ${errorDetails}`,
-              phase: "finished",
-              success: false,
-            });
-            refreshDerived();
-          } finally {
-            setCommandRunning(false);
-          }
           return { submitted: true };
         }
 
@@ -4667,11 +4878,18 @@ DO NOT respond to these messages or otherwise consider them in your response unl
 
           setIsExecutingTool(true);
 
-          // Build ALL decisions: current + auto-allowed remaining
-          const allDecisions: Array<{
-            type: "approve";
-            approval: ApprovalRequest;
-          }> = [
+          // Snapshot current state BEFORE clearing (critical for ID matching!)
+          // This must include ALL previous decisions, auto-handled, and auto-denied
+          const approvalResultsSnapshot = [...approvalResults];
+          const autoHandledSnapshot = [...autoHandledResults];
+          const autoDeniedSnapshot = [...autoDeniedApprovals];
+
+          // Build ALL decisions: previous + current + auto-allowed remaining
+          const allDecisions: Array<
+            | { type: "approve"; approval: ApprovalRequest }
+            | { type: "deny"; approval: ApprovalRequest; reason: string }
+          > = [
+            ...approvalResultsSnapshot, // Include decisions from previous rounds
             { type: "approve", approval: currentApproval },
             ...nowAutoAllowed.map((r) => ({
               type: "approve" as const,
@@ -4702,6 +4920,25 @@ DO NOT respond to these messages or otherwise consider them in your response unl
               },
             );
 
+            // Combine with auto-handled and auto-denied results (from initial check)
+            const allResults = [
+              ...autoHandledSnapshot.map((ar) => ({
+                type: "tool" as const,
+                tool_call_id: ar.toolCallId,
+                tool_return: ar.result.toolReturn,
+                status: ar.result.status,
+                stdout: ar.result.stdout,
+                stderr: ar.result.stderr,
+              })),
+              ...autoDeniedSnapshot.map((ad) => ({
+                type: "approval" as const,
+                tool_call_id: ad.approval.toolCallId,
+                approve: false,
+                reason: ad.reason,
+              })),
+              ...executedResults,
+            ];
+
             setThinkingMessage(getRandomThinkingVerb());
             refreshDerived();
 
@@ -4709,7 +4946,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
             await processConversation([
               {
                 type: "approval",
-                approvals: executedResults as ApprovalResult[],
+                approvals: allResults as ApprovalResult[],
               },
             ]);
           } finally {
@@ -4726,6 +4963,8 @@ DO NOT respond to these messages or otherwise consider them in your response unl
       approvalResults,
       approvalContexts,
       pendingApprovals,
+      autoHandledResults,
+      autoDeniedApprovals,
       handleApproveCurrent,
       processConversation,
       refreshDerived,
@@ -5475,16 +5714,12 @@ Plan file path: ${planFilePath}`;
         return ln.phase === "running";
       }
       if (ln.kind === "tool_call") {
-        // Skip Task tool_calls UNLESS they have a pending approval
-        // SubagentGroupDisplay handles running/completed Task tools,
-        // but we need to show them here when approval is required
+        // Task tool_calls need special handling:
+        // - Only include if pending approval (phase: "ready" or "streaming")
+        // - Running/finished Task tools are handled by SubagentGroupDisplay
         if (ln.name && isTaskTool(ln.name)) {
-          // Check if this Task tool has a pending approval
-          const hasPendingApproval = pendingApprovals.some(
-            (a) => a.toolCallId === ln.toolCallId,
-          );
-          // Only include in liveItems if it needs approval UI
-          return hasPendingApproval;
+          // Only show Task tools that are awaiting approval (not running/finished)
+          return ln.phase === "ready" || ln.phase === "streaming";
         }
         // Always show other tool calls in progress
         return ln.phase !== "finished";
@@ -5615,6 +5850,16 @@ Plan file path: ${planFilePath}`;
               <CommandMessage line={item} />
             ) : item.kind === "bash_command" ? (
               <BashCommandMessage line={item} />
+            ) : item.kind === "approval_preview" ? (
+              <ApprovalPreview
+                toolName={item.toolName}
+                toolArgs={item.toolArgs}
+                precomputedDiff={item.precomputedDiff}
+                allDiffs={precomputedDiffsRef.current}
+                planContent={item.planContent}
+                planFilePath={item.planFilePath}
+                toolCallId={item.toolCallId}
+              />
             ) : null}
           </Box>
         )}
@@ -5670,6 +5915,13 @@ Plan file path: ${planFilePath}`;
                     ln.kind === "tool_call" &&
                     currentApproval?.toolName === "AskUserQuestion" &&
                     ln.toolCallId === currentApproval?.toolCallId;
+
+                  // Check if this tool call matches a Task tool approval
+                  const isTaskToolApproval =
+                    ln.kind === "tool_call" &&
+                    currentApproval &&
+                    isTaskTool(currentApproval.toolName) &&
+                    ln.toolCallId === currentApproval.toolCallId;
 
                   // Parse file edit info from approval args
                   const getFileEditInfo = () => {
@@ -5758,12 +6010,42 @@ Plan file path: ${planFilePath}`;
 
                   const bashInfo = getBashInfo();
 
+                  // Parse Task tool info from approval args
+                  const getTaskInfo = () => {
+                    if (!isTaskToolApproval || !currentApproval) return null;
+                    try {
+                      const args = JSON.parse(currentApproval.toolArgs || "{}");
+                      return {
+                        subagentType:
+                          typeof args.subagent_type === "string"
+                            ? args.subagent_type
+                            : "unknown",
+                        description:
+                          typeof args.description === "string"
+                            ? args.description
+                            : "(no description)",
+                        prompt:
+                          typeof args.prompt === "string"
+                            ? args.prompt
+                            : "(no prompt)",
+                        model:
+                          typeof args.model === "string"
+                            ? args.model
+                            : undefined,
+                      };
+                    } catch {
+                      return null;
+                    }
+                  };
+
+                  const taskInfo = getTaskInfo();
+
                   return (
                     <Box key={ln.id} flexDirection="column" marginTop={1}>
-                      {/* For ExitPlanMode awaiting approval: render InlinePlanApproval */}
+                      {/* For ExitPlanMode awaiting approval: render StaticPlanApproval */}
+                      {/* Plan preview is eagerly committed to staticItems, so this only shows options */}
                       {isExitPlanModeApproval ? (
-                        <InlinePlanApproval
-                          plan={readPlanFile()}
+                        <StaticPlanApproval
                           onApprove={() => handlePlanApprove(false)}
                           onApproveAndAcceptEdits={() =>
                             handlePlanApprove(true)
@@ -5824,6 +6106,23 @@ Plan file path: ${planFilePath}`;
                           onCancel={handleCancelApprovals}
                           isFocused={true}
                         />
+                      ) : isTaskToolApproval && taskInfo ? (
+                        <InlineTaskApproval
+                          taskInfo={taskInfo}
+                          onApprove={() => handleApproveCurrent()}
+                          onApproveAlways={(scope) =>
+                            handleApproveAlways(scope)
+                          }
+                          onDeny={(reason) => handleDenyCurrent(reason)}
+                          onCancel={handleCancelApprovals}
+                          isFocused={true}
+                          approveAlwaysText={
+                            currentApprovalContext?.approveAlwaysText
+                          }
+                          allowPersistence={
+                            currentApprovalContext?.allowPersistence ?? true
+                          }
+                        />
                       ) : ln.kind === "tool_call" &&
                         currentApproval &&
                         ln.toolCallId === currentApproval.toolCallId ? (
@@ -5851,6 +6150,31 @@ Plan file path: ${planFilePath}`;
                         <ReasoningMessage line={ln} />
                       ) : ln.kind === "assistant" ? (
                         <AssistantMessage line={ln} />
+                      ) : ln.kind === "tool_call" &&
+                        ln.toolCallId &&
+                        queuedIds.has(ln.toolCallId) ? (
+                        // Render stub for queued (decided but not executed) approval
+                        <PendingApprovalStub
+                          toolName={
+                            approvalMap.get(ln.toolCallId)?.toolName ||
+                            ln.name ||
+                            "Unknown"
+                          }
+                          description={stubDescriptions.get(ln.toolCallId)}
+                          decision={queuedDecisions.get(ln.toolCallId)}
+                        />
+                      ) : ln.kind === "tool_call" &&
+                        ln.toolCallId &&
+                        pendingIds.has(ln.toolCallId) ? (
+                        // Render stub for pending (undecided) approval
+                        <PendingApprovalStub
+                          toolName={
+                            approvalMap.get(ln.toolCallId)?.toolName ||
+                            ln.name ||
+                            "Unknown"
+                          }
+                          description={stubDescriptions.get(ln.toolCallId)}
+                        />
                       ) : ln.kind === "tool_call" ? (
                         <ToolCallMessage
                           line={ln}

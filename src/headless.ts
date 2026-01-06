@@ -1,11 +1,20 @@
 import { parseArgs } from "node:util";
+import type { Letta } from "@letta-ai/letta-client";
 import type {
   AgentState,
   MessageCreate,
 } from "@letta-ai/letta-client/resources/agents/agents";
-import type { ApprovalCreate } from "@letta-ai/letta-client/resources/agents/messages";
+import type {
+  ApprovalCreate,
+  LettaStreamingResponse,
+} from "@letta-ai/letta-client/resources/agents/messages";
 import type { StopReasonType } from "@letta-ai/letta-client/resources/runs/runs";
 import type { ApprovalResult } from "./agent/approval-execution";
+import {
+  buildApprovalRecoveryMessage,
+  fetchRunErrorDetail,
+  isApprovalStateDesyncError,
+} from "./agent/approval-recovery";
 import { getClient } from "./agent/client";
 import { initializeLoadedSkillsFlag, setAgentContext } from "./agent/context";
 import { createAgent } from "./agent/create";
@@ -22,11 +31,20 @@ import { formatErrorDetails } from "./cli/helpers/errorFormatter";
 import { safeJsonParseOr } from "./cli/helpers/safeJsonParse";
 import { drainStreamWithResume } from "./cli/helpers/stream";
 import { settingsManager } from "./settings-manager";
-import {
-  checkToolPermission,
-  forceUpsertTools,
-  isToolsNotFoundError,
-} from "./tools/manager";
+import { checkToolPermission } from "./tools/manager";
+import type {
+  AutoApprovalMessage,
+  CanUseToolControlRequest,
+  CanUseToolResponse,
+  ControlRequest,
+  ControlResponse,
+  ErrorMessage,
+  MessageWire,
+  ResultMessage,
+  RetryMessage,
+  StreamEvent,
+  SystemInitMessage,
+} from "./types/protocol";
 
 // Maximum number of times to retry a turn when the backend
 // reports an `llm_api_error` stop reason. This helps smooth
@@ -52,9 +70,14 @@ export async function handleHeadlessCommand(
       agent: { type: "string", short: "a" },
       model: { type: "string", short: "m" },
       system: { type: "string", short: "s" },
+      "system-custom": { type: "string" },
+      "system-append": { type: "string" },
+      "memory-blocks": { type: "string" },
+      "block-value": { type: "string", multiple: true },
       toolset: { type: "string" },
       prompt: { type: "boolean", short: "p" },
       "output-format": { type: "string" },
+      "input-format": { type: "string" },
       "include-partial-messages": { type: "boolean" },
       // Additional flags from index.ts that need to be filtered out
       help: { type: "boolean", short: "h" },
@@ -66,8 +89,6 @@ export async function handleHeadlessCommand(
       "permission-mode": { type: "string" },
       yolo: { type: "boolean" },
       skills: { type: "string" },
-      link: { type: "boolean" },
-      unlink: { type: "boolean" },
       sleeptime: { type: "boolean" },
       "init-blocks": { type: "string" },
       "base-tools": { type: "string" },
@@ -83,11 +104,41 @@ export async function handleHeadlessCommand(
     toolFilter.setEnabledTools(values.tools as string);
   }
 
-  // Get prompt from either positional args or stdin
+  // Set permission mode if provided (or via --yolo alias)
+  const permissionModeValue = values["permission-mode"] as string | undefined;
+  const yoloMode = values.yolo as boolean | undefined;
+  if (yoloMode || permissionModeValue) {
+    const { permissionMode } = await import("./permissions/mode");
+    if (yoloMode) {
+      permissionMode.setMode("bypassPermissions");
+    } else if (permissionModeValue) {
+      const validModes = [
+        "default",
+        "acceptEdits",
+        "bypassPermissions",
+        "plan",
+      ];
+      if (validModes.includes(permissionModeValue)) {
+        permissionMode.setMode(
+          permissionModeValue as
+            | "default"
+            | "acceptEdits"
+            | "bypassPermissions"
+            | "plan",
+        );
+      }
+    }
+  }
+
+  // Check for input-format early - if stream-json, we don't need a prompt
+  const inputFormat = values["input-format"] as string | undefined;
+  const isBidirectionalMode = inputFormat === "stream-json";
+
+  // Get prompt from either positional args or stdin (unless in bidirectional mode)
   let prompt = positionals.slice(2).join(" ");
 
-  // If no prompt provided as args, try reading from stdin
-  if (!prompt) {
+  // If no prompt provided as args, try reading from stdin (unless in bidirectional mode)
+  if (!prompt && !isBidirectionalMode) {
     // Check if stdin is available (piped input)
     if (!process.stdin.isTTY) {
       const chunks: Buffer[] = [];
@@ -98,25 +149,23 @@ export async function handleHeadlessCommand(
     }
   }
 
-  if (!prompt) {
+  if (!prompt && !isBidirectionalMode) {
     console.error("Error: No prompt provided");
     process.exit(1);
   }
 
   const client = await getClient();
 
-  // Get base URL for tool upsert operations
-  const baseURL =
-    process.env.LETTA_BASE_URL ||
-    settings.env?.LETTA_BASE_URL ||
-    "https://api.letta.com";
-
   // Resolve agent (same logic as interactive mode)
   let agent: AgentState | null = null;
   const specifiedAgentId = values.agent as string | undefined;
   const shouldContinue = values.continue as boolean | undefined;
   const forceNew = values.new as boolean | undefined;
-  const systemPromptId = values.system as string | undefined;
+  const systemPromptPreset = values.system as string | undefined;
+  const systemCustom = values["system-custom"] as string | undefined;
+  const systemAppend = values["system-append"] as string | undefined;
+  const memoryBlocksJson = values["memory-blocks"] as string | undefined;
+  const blockValueArgs = values["block-value"] as string[] | undefined;
   const initBlocksRaw = values["init-blocks"] as string | undefined;
   const baseToolsRaw = values["base-tools"] as string | undefined;
   const sleeptimeFlag = (values.sleeptime as boolean | undefined) ?? undefined;
@@ -178,6 +227,84 @@ export async function handleHeadlessCommand(
     }
   }
 
+  // Validate system prompt options (--system and --system-custom are mutually exclusive)
+  if (systemPromptPreset && systemCustom) {
+    console.error(
+      "Error: --system and --system-custom are mutually exclusive. Use one or the other.",
+    );
+    process.exit(1);
+  }
+
+  // Parse memory blocks JSON if provided
+  // Supports two formats:
+  // - CreateBlock: { label: string, value: string, description?: string }
+  // - BlockReference: { blockId: string }
+  let memoryBlocks:
+    | Array<
+        | { label: string; value: string; description?: string }
+        | { blockId: string }
+      >
+    | undefined;
+  if (memoryBlocksJson !== undefined) {
+    if (!forceNew) {
+      console.error(
+        "Error: --memory-blocks can only be used together with --new to provide initial memory blocks.",
+      );
+      process.exit(1);
+    }
+    try {
+      memoryBlocks = JSON.parse(memoryBlocksJson);
+      if (!Array.isArray(memoryBlocks)) {
+        throw new Error("memory-blocks must be a JSON array");
+      }
+      // Validate each block has required fields
+      for (const block of memoryBlocks) {
+        const hasBlockId =
+          "blockId" in block && typeof block.blockId === "string";
+        const hasLabelValue =
+          "label" in block &&
+          "value" in block &&
+          typeof block.label === "string" &&
+          typeof block.value === "string";
+
+        if (!hasBlockId && !hasLabelValue) {
+          throw new Error(
+            "Each memory block must have either 'blockId' (string) or 'label' and 'value' (strings)",
+          );
+        }
+      }
+    } catch (error) {
+      console.error(
+        `Error: Invalid --memory-blocks JSON: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exit(1);
+    }
+  }
+
+  // Parse --block-value args (format: label=value)
+  let blockValues: Record<string, string> | undefined;
+  if (blockValueArgs && blockValueArgs.length > 0) {
+    if (!forceNew) {
+      console.error(
+        "Error: --block-value can only be used together with --new to set block values.",
+      );
+      process.exit(1);
+    }
+    blockValues = {};
+    for (const arg of blockValueArgs) {
+      const eqIndex = arg.indexOf("=");
+      if (eqIndex === -1) {
+        console.error(
+          `Error: Invalid --block-value format "${arg}". Expected format: label=value`,
+        );
+        process.exit(1);
+      }
+      const label = arg.slice(0, eqIndex);
+      const value = arg.slice(eqIndex + 1);
+      blockValues[label] = value;
+    }
+  }
+
   // Priority 1: Import from AgentFile template
   if (fromAfFile) {
     const { importAgentFromFile } = await import("./agent/import");
@@ -201,41 +328,22 @@ export async function handleHeadlessCommand(
   // Priority 3: Check if --new flag was passed (skip all resume logic)
   if (!agent && forceNew) {
     const updateArgs = getModelUpdateArgs(model);
-    try {
-      const result = await createAgent(
-        undefined,
-        model,
-        undefined,
-        updateArgs,
-        skillsDirectory,
-        true, // parallelToolCalls always enabled
-        sleeptimeFlag ?? settings.enableSleeptime,
-        systemPromptId,
-        initBlocks,
-        baseTools,
-      );
-      agent = result.agent;
-    } catch (err) {
-      if (isToolsNotFoundError(err)) {
-        console.warn("Tools missing on server, re-uploading and retrying...");
-        await forceUpsertTools(client, baseURL);
-        const result = await createAgent(
-          undefined,
-          model,
-          undefined,
-          updateArgs,
-          skillsDirectory,
-          true,
-          sleeptimeFlag ?? settings.enableSleeptime,
-          systemPromptId,
-          initBlocks,
-          baseTools,
-        );
-        agent = result.agent;
-      } else {
-        throw err;
-      }
-    }
+    const createOptions = {
+      model,
+      updateArgs,
+      skillsDirectory,
+      parallelToolCalls: true,
+      enableSleeptime: sleeptimeFlag ?? settings.enableSleeptime,
+      systemPromptPreset,
+      systemPromptCustom: systemCustom,
+      systemPromptAppend: systemAppend,
+      initBlocks,
+      baseTools,
+      memoryBlocks,
+      blockValues,
+    };
+    const result = await createAgent(createOptions);
+    agent = result.agent;
   }
 
   // Priority 4: Try to resume from project settings (.letta/settings.local.json)
@@ -267,41 +375,17 @@ export async function handleHeadlessCommand(
   // Priority 6: Create a new agent
   if (!agent) {
     const updateArgs = getModelUpdateArgs(model);
-    try {
-      const result = await createAgent(
-        undefined,
-        model,
-        undefined,
-        updateArgs,
-        skillsDirectory,
-        true, // parallelToolCalls always enabled
-        sleeptimeFlag ?? settings.enableSleeptime,
-        systemPromptId,
-        undefined,
-        undefined,
-      );
-      agent = result.agent;
-    } catch (err) {
-      if (isToolsNotFoundError(err)) {
-        console.warn("Tools missing on server, re-uploading and retrying...");
-        await forceUpsertTools(client, baseURL);
-        const result = await createAgent(
-          undefined,
-          model,
-          undefined,
-          updateArgs,
-          skillsDirectory,
-          true,
-          sleeptimeFlag ?? settings.enableSleeptime,
-          systemPromptId,
-          undefined,
-          undefined,
-        );
-        agent = result.agent;
-      } else {
-        throw err;
-      }
-    }
+    const createOptions = {
+      model,
+      updateArgs,
+      skillsDirectory,
+      parallelToolCalls: true,
+      enableSleeptime: sleeptimeFlag ?? settings.enableSleeptime,
+      systemPromptPreset,
+      // Note: systemCustom, systemAppend, and memoryBlocks only apply with --new flag
+    };
+    const result = await createAgent(createOptions);
+    agent = result.agent;
   }
 
   // Check if we're resuming an existing agent (not creating a new one)
@@ -312,7 +396,7 @@ export async function handleHeadlessCommand(
   );
 
   // If resuming and a model or system prompt was specified, apply those changes
-  if (isResumingAgent && (model || systemPromptId)) {
+  if (isResumingAgent && (model || systemPromptPreset)) {
     if (model) {
       const { resolveModelAsync } = await import("./agent/model");
       const modelHandle = await resolveModelAsync(model);
@@ -335,9 +419,12 @@ export async function handleHeadlessCommand(
       }
     }
 
-    if (systemPromptId) {
+    if (systemPromptPreset) {
       const { updateAgentSystemPrompt } = await import("./agent/modify");
-      const result = await updateAgentSystemPrompt(agent.id, systemPromptId);
+      const result = await updateAgentSystemPrompt(
+        agent.id,
+        systemPromptPreset,
+      );
       if (!result.success || !result.agent) {
         console.error(`Failed to update system prompt: ${result.message}`);
         process.exit(1);
@@ -399,6 +486,23 @@ export async function handleHeadlessCommand(
     );
     process.exit(1);
   }
+  if (inputFormat && inputFormat !== "stream-json") {
+    console.error(
+      `Error: Invalid input format "${inputFormat}". Valid formats: stream-json`,
+    );
+    process.exit(1);
+  }
+
+  // If input-format is stream-json, use bidirectional mode
+  if (isBidirectionalMode) {
+    await runBidirectionalMode(
+      agent,
+      client,
+      outputFormat,
+      includePartialMessages,
+    );
+    return;
+  }
 
   // Create buffers to accumulate stream
   const buffers = createBuffers();
@@ -411,14 +515,18 @@ export async function handleHeadlessCommand(
 
   // Output init event for stream-json format
   if (outputFormat === "stream-json") {
-    const initEvent = {
+    const initEvent: SystemInitMessage = {
       type: "system",
       subtype: "init",
       session_id: sessionId,
       agent_id: agent.id,
-      model: agent.llm_config?.model,
-      tools: agent.tools?.map((t) => t.name) || [],
+      model: agent.llm_config?.model ?? "",
+      tools:
+        agent.tools?.map((t) => t.name).filter((n): n is string => !!n) || [],
       cwd: process.cwd(),
+      mcp_servers: [],
+      permission_mode: "",
+      slash_commands: [],
       uuid: `init-${agent.id}`,
     };
     console.log(JSON.stringify(initEvent));
@@ -445,6 +553,8 @@ export async function handleHeadlessCommand(
               toolName: string;
               toolArgs: string;
             };
+            reason: string;
+            matchedRule: string;
           }
         | {
             type: "deny";
@@ -500,6 +610,8 @@ export async function handleHeadlessCommand(
         decisions.push({
           type: "approve",
           approval: currentApproval,
+          reason: permission.reason || "Allowed by permission rule",
+          matchedRule: permission.matchedRule || "auto-approved",
         });
       }
 
@@ -512,16 +624,19 @@ export async function handleHeadlessCommand(
       if (outputFormat === "stream-json") {
         for (const decision of decisions) {
           if (decision.type === "approve") {
-            console.log(
-              JSON.stringify({
-                type: "auto_approval",
-                tool_name: decision.approval.toolName,
+            const autoApprovalMsg: AutoApprovalMessage = {
+              type: "auto_approval",
+              tool_call: {
+                name: decision.approval.toolName,
                 tool_call_id: decision.approval.toolCallId,
-                tool_args: decision.approval.toolArgs,
-                session_id: sessionId,
-                uuid: `auto-approval-${decision.approval.toolCallId}`,
-              }),
-            );
+                arguments: decision.approval.toolArgs,
+              },
+              reason: decision.reason,
+              matched_rule: decision.matchedRule,
+              session_id: sessionId,
+              uuid: `auto-approval-${decision.approval.toolCallId}`,
+            };
+            console.log(JSON.stringify(autoApprovalMsg));
           }
         }
       }
@@ -617,28 +732,54 @@ export async function handleHeadlessCommand(
             runIds.add(chunk.run_id);
           }
 
-          // Detect mid-stream errors (errors without message_type)
+          // Detect mid-stream errors
+          // Case 1: LettaErrorMessage from the API (has message_type: "error_message")
+          if (
+            "message_type" in chunk &&
+            chunk.message_type === "error_message"
+          ) {
+            // This is a LettaErrorMessage - nest it in our wire format
+            const apiError = chunk as LettaStreamingResponse.LettaErrorMessage;
+            const errorEvent: ErrorMessage = {
+              type: "error",
+              message: apiError.message,
+              stop_reason: "error",
+              run_id: apiError.run_id,
+              api_error: apiError,
+              session_id: sessionId,
+              uuid: crypto.randomUUID(),
+            };
+            console.log(JSON.stringify(errorEvent));
+
+            // Still accumulate for tracking
+            const { onChunk: accumulatorOnChunk } = await import(
+              "./cli/helpers/accumulator"
+            );
+            accumulatorOnChunk(buffers, chunk);
+            continue;
+          }
+
+          // Case 2: Generic error object without message_type
           const chunkWithError = chunk as typeof chunk & {
             error?: { message?: string; detail?: string };
           };
-          if (chunkWithError.error && !chunk.message_type) {
+          if (chunkWithError.error && !("message_type" in chunk)) {
             // Emit as error event
-            const errorMsg =
+            const errorText =
               chunkWithError.error.message || "An error occurred";
             const errorDetail = chunkWithError.error.detail || "";
             const fullErrorText = errorDetail
-              ? `${errorMsg}: ${errorDetail}`
-              : errorMsg;
+              ? `${errorText}: ${errorDetail}`
+              : errorText;
 
-            console.log(
-              JSON.stringify({
-                type: "error",
-                message: fullErrorText,
-                detail: errorDetail,
-                session_id: sessionId,
-                uuid: crypto.randomUUID(),
-              }),
-            );
+            const errorEvent: ErrorMessage = {
+              type: "error",
+              message: fullErrorText,
+              stop_reason: "error",
+              session_id: sessionId,
+              uuid: crypto.randomUUID(),
+            };
+            console.log(JSON.stringify(errorEvent));
 
             // Still accumulate for tracking
             const { onChunk: accumulatorOnChunk } = await import(
@@ -763,18 +904,19 @@ export async function handleHeadlessCommand(
                   );
                   if (missing.length === 0) {
                     shouldOutputChunk = false;
-                    console.log(
-                      JSON.stringify({
-                        type: "auto_approval",
-                        tool_name: nextName,
+                    const autoApprovalMsg: AutoApprovalMessage = {
+                      type: "auto_approval",
+                      tool_call: {
+                        name: nextName,
                         tool_call_id: id,
-                        tool_args: incomingArgs,
-                        reason: permission.reason,
-                        matched_rule: permission.matchedRule,
-                        session_id: sessionId,
-                        uuid: `auto-approval-${id}`,
-                      }),
-                    );
+                        arguments: incomingArgs || "{}",
+                      },
+                      reason: permission.reason || "Allowed by permission rule",
+                      matched_rule: permission.matchedRule || "auto-approved",
+                      session_id: sessionId,
+                      uuid: `auto-approval-${id}`,
+                    };
+                    console.log(JSON.stringify(autoApprovalMsg));
                     autoApprovalEmitted.add(id);
                   }
                 }
@@ -793,24 +935,22 @@ export async function handleHeadlessCommand(
 
             if (includePartialMessages) {
               // Emit as stream_event wrapper (like Claude Code with --include-partial-messages)
-              console.log(
-                JSON.stringify({
-                  type: "stream_event",
-                  event: chunk,
-                  session_id: sessionId,
-                  uuid,
-                }),
-              );
+              const streamEvent: StreamEvent = {
+                type: "stream_event",
+                event: chunk,
+                session_id: sessionId,
+                uuid: uuid || crypto.randomUUID(),
+              };
+              console.log(JSON.stringify(streamEvent));
             } else {
               // Emit as regular message (default)
-              console.log(
-                JSON.stringify({
-                  type: "message",
-                  ...chunk,
-                  session_id: sessionId,
-                  uuid,
-                }),
-              );
+              const msg: MessageWire = {
+                type: "message",
+                ...chunk,
+                session_id: sessionId,
+                uuid: uuid || crypto.randomUUID(),
+              };
+              console.log(JSON.stringify(msg));
             }
           }
 
@@ -958,8 +1098,41 @@ export async function handleHeadlessCommand(
         continue;
       }
 
+      // Cache latest error text for this turn
+      let latestErrorText: string | null = null;
+      const linesForTurn = toLines(buffers);
+      for (let i = linesForTurn.length - 1; i >= 0; i -= 1) {
+        const line = linesForTurn[i];
+        if (
+          line?.kind === "error" &&
+          "text" in line &&
+          typeof line.text === "string"
+        ) {
+          latestErrorText = line.text;
+          break;
+        }
+      }
+
+      // Detect approval desync once per turn
+      const detailFromRun = await fetchRunErrorDetail(lastRunId);
+      const approvalDesynced =
+        currentInput.length === 1 &&
+        currentInput[0]?.type === "approval" &&
+        (isApprovalStateDesyncError(detailFromRun) ||
+          isApprovalStateDesyncError(latestErrorText));
+
+      // Track last failure text for emitting on exit
+      const lastFailureText =
+        latestErrorText ||
+        detailFromRun ||
+        (lastRunId
+          ? `An error occurred during agent execution\n(run_id: ${lastRunId}, stop_reason: ${stopReason})`
+          : `An error occurred during agent execution\n(stop_reason: ${stopReason})`);
+
       // Case 3: Transient LLM API error - retry with exponential backoff up to a limit
       if (stopReason === "llm_api_error") {
+        const shouldUseApprovalRecovery = approvalDesynced;
+
         if (llmApiErrorRetries < LLM_API_ERROR_MAX_RETRIES) {
           const attempt = llmApiErrorRetries + 1;
           const baseDelayMs = 1000;
@@ -968,29 +1141,84 @@ export async function handleHeadlessCommand(
           llmApiErrorRetries = attempt;
 
           if (outputFormat === "stream-json") {
-            console.log(
-              JSON.stringify({
-                type: "retry",
-                reason: "llm_api_error",
-                attempt,
-                max_attempts: LLM_API_ERROR_MAX_RETRIES,
-                delay_ms: delayMs,
-                run_id: lastRunId,
-                session_id: sessionId,
-                uuid: `retry-${lastRunId || crypto.randomUUID()}`,
-              }),
-            );
+            const retryMsg: RetryMessage = {
+              type: "retry",
+              reason: "llm_api_error",
+              attempt,
+              max_attempts: LLM_API_ERROR_MAX_RETRIES,
+              delay_ms: delayMs,
+              run_id: lastRunId ?? undefined,
+              session_id: sessionId,
+              uuid: `retry-${lastRunId || crypto.randomUUID()}`,
+            };
+            console.log(JSON.stringify(retryMsg));
           } else {
             const delaySeconds = Math.round(delayMs / 1000);
+            const recoveryNote = shouldUseApprovalRecovery
+              ? " (approval state desynced - sending keep-going prompt)"
+              : "";
             console.error(
-              `LLM API error encountered (attempt ${attempt} of ${LLM_API_ERROR_MAX_RETRIES}), retrying in ${delaySeconds}s...`,
+              `LLM API error encountered (attempt ${attempt} of ${LLM_API_ERROR_MAX_RETRIES}), retrying in ${delaySeconds}s...${recoveryNote}`,
             );
           }
 
           // Exponential backoff before retrying the same input
           await new Promise((resolve) => setTimeout(resolve, delayMs));
+
+          if (shouldUseApprovalRecovery) {
+            currentInput = [buildApprovalRecoveryMessage()];
+          }
           continue;
         }
+      }
+
+      // Fallback: if we were sending only approvals and hit an internal error that
+      // says there is no pending approval, resend using the keep-alive recovery prompt.
+      if (approvalDesynced) {
+        if (llmApiErrorRetries < LLM_API_ERROR_MAX_RETRIES) {
+          llmApiErrorRetries += 1;
+
+          const retryReason = stopReason ?? "error";
+          if (outputFormat === "stream-json") {
+            const retryMsg: RetryMessage = {
+              type: "retry",
+              reason: retryReason,
+              attempt: llmApiErrorRetries,
+              max_attempts: LLM_API_ERROR_MAX_RETRIES,
+              delay_ms: 0,
+              run_id: lastRunId ?? undefined,
+              session_id: sessionId,
+              uuid: `retry-${lastRunId || crypto.randomUUID()}`,
+            };
+            console.log(JSON.stringify(retryMsg));
+          } else {
+            console.error(
+              "Approval state desynced; resending keep-alive recovery prompt...",
+            );
+          }
+
+          // Small pause to avoid rapid-fire retries
+          await new Promise((resolve) => setTimeout(resolve, 250));
+
+          currentInput = [buildApprovalRecoveryMessage()];
+          continue;
+        }
+
+        // No retries left or non-retriable: emit error and exit
+        if (outputFormat === "stream-json") {
+          const errorMsg: ErrorMessage = {
+            type: "error",
+            message: lastFailureText,
+            stop_reason: stopReason,
+            run_id: lastRunId ?? undefined,
+            session_id: sessionId,
+            uuid: `error-${lastRunId || crypto.randomUUID()}`,
+          };
+          console.log(JSON.stringify(errorMsg));
+        } else {
+          console.error(lastFailureText);
+        }
+        process.exit(1);
       }
 
       // Unexpected stop reason (error, llm_api_error, etc.)
@@ -1042,18 +1270,17 @@ export async function handleHeadlessCommand(
             llmApiErrorRetries = attempt;
 
             if (outputFormat === "stream-json") {
-              console.log(
-                JSON.stringify({
-                  type: "retry",
-                  reason: "llm_api_error",
-                  attempt,
-                  max_attempts: LLM_API_ERROR_MAX_RETRIES,
-                  delay_ms: delayMs,
-                  run_id: lastRunId,
-                  session_id: sessionId,
-                  uuid: `retry-${lastRunId || crypto.randomUUID()}`,
-                }),
-              );
+              const retryMsg: RetryMessage = {
+                type: "retry",
+                reason: "llm_api_error",
+                attempt,
+                max_attempts: LLM_API_ERROR_MAX_RETRIES,
+                delay_ms: delayMs,
+                run_id: lastRunId ?? undefined,
+                session_id: sessionId,
+                uuid: `retry-${lastRunId || crypto.randomUUID()}`,
+              };
+              console.log(JSON.stringify(retryMsg));
             } else {
               const delaySeconds = Math.round(delayMs / 1000);
               console.error(
@@ -1112,16 +1339,15 @@ export async function handleHeadlessCommand(
 
       if (outputFormat === "stream-json") {
         // Emit error event
-        console.log(
-          JSON.stringify({
-            type: "error",
-            message: errorMessage,
-            stop_reason: stopReason,
-            run_id: lastRunId,
-            session_id: sessionId,
-            uuid: `error-${lastRunId || crypto.randomUUID()}`,
-          }),
-        );
+        const errorMsg: ErrorMessage = {
+          type: "error",
+          message: errorMessage,
+          stop_reason: stopReason,
+          run_id: lastRunId ?? undefined,
+          session_id: sessionId,
+          uuid: `error-${lastRunId || crypto.randomUUID()}`,
+        };
+        console.log(JSON.stringify(errorMsg));
       } else {
         console.error(`Error: ${errorMessage}`);
       }
@@ -1135,15 +1361,15 @@ export async function handleHeadlessCommand(
     const errorDetails = formatErrorDetails(error, agent.id);
 
     if (outputFormat === "stream-json") {
-      console.log(
-        JSON.stringify({
-          type: "error",
-          message: errorDetails,
-          run_id: lastKnownRunId,
-          session_id: sessionId,
-          uuid: `error-${lastKnownRunId || crypto.randomUUID()}`,
-        }),
-      );
+      const errorMsg: ErrorMessage = {
+        type: "error",
+        message: errorDetails,
+        stop_reason: "error",
+        run_id: lastKnownRunId ?? undefined,
+        session_id: sessionId,
+        uuid: `error-${lastKnownRunId || crypto.randomUUID()}`,
+      };
+      console.log(JSON.stringify(errorMsg));
     } else {
       console.error(`Error: ${errorDetails}`);
     }
@@ -1227,10 +1453,9 @@ export async function handleHeadlessCommand(
       allRunIds.size > 0
         ? `result-${Array.from(allRunIds).pop()}`
         : `result-${agent.id}`;
-    const resultEvent = {
+    const resultEvent: ResultMessage = {
       type: "result",
       subtype: "success",
-      is_error: false,
       session_id: sessionId,
       duration_ms: Math.round(stats.totalWallMs),
       duration_api_ms: Math.round(stats.totalApiMs),
@@ -1254,4 +1479,550 @@ export async function handleHeadlessCommand(
     }
     console.log(resultText);
   }
+}
+
+/**
+ * Bidirectional mode for SDK communication.
+ * Reads JSON messages from stdin, processes them, and outputs responses.
+ * Stays alive until stdin closes.
+ */
+async function runBidirectionalMode(
+  agent: AgentState,
+  _client: Letta,
+  _outputFormat: string,
+  includePartialMessages: boolean,
+): Promise<void> {
+  const sessionId = agent.id;
+  const readline = await import("node:readline");
+
+  // Emit init event
+  const initEvent = {
+    type: "system",
+    subtype: "init",
+    session_id: sessionId,
+    agent_id: agent.id,
+    model: agent.llm_config?.model,
+    tools: agent.tools?.map((t) => t.name) || [],
+    cwd: process.cwd(),
+    uuid: `init-${agent.id}`,
+  };
+  console.log(JSON.stringify(initEvent));
+
+  // Track current operation for interrupt support
+  let currentAbortController: AbortController | null = null;
+
+  // Create readline interface for stdin
+  const rl = readline.createInterface({
+    input: process.stdin,
+    terminal: false,
+  });
+
+  // Create async iterator and line queue for permission callbacks
+  const lineQueue: string[] = [];
+  let lineResolver: ((line: string | null) => void) | null = null;
+
+  // Feed lines into queue or resolver
+  rl.on("line", (line) => {
+    if (lineResolver) {
+      const resolve = lineResolver;
+      lineResolver = null;
+      resolve(line);
+    } else {
+      lineQueue.push(line);
+    }
+  });
+
+  rl.on("close", () => {
+    if (lineResolver) {
+      const resolve = lineResolver;
+      lineResolver = null;
+      resolve(null);
+    }
+  });
+
+  // Helper to get next line (from queue or wait)
+  async function getNextLine(): Promise<string | null> {
+    if (lineQueue.length > 0) {
+      return lineQueue.shift() ?? null;
+    }
+    return new Promise<string | null>((resolve) => {
+      lineResolver = resolve;
+    });
+  }
+
+  // Helper to send permission request and wait for response
+  // Uses Claude SDK's control_request/control_response format for compatibility
+  async function requestPermission(
+    toolCallId: string,
+    toolName: string,
+    toolInput: Record<string, unknown>,
+  ): Promise<{ decision: "allow" | "deny"; reason?: string }> {
+    const requestId = `perm-${toolCallId}`;
+
+    // Build can_use_tool control request (Claude SDK format)
+    const canUseToolRequest: CanUseToolControlRequest = {
+      subtype: "can_use_tool",
+      tool_name: toolName,
+      input: toolInput,
+      tool_call_id: toolCallId, // Letta-specific
+      permission_suggestions: [], // TODO: not implemented
+      blocked_path: null, // TODO: not implemented
+    };
+
+    const controlRequest: ControlRequest = {
+      type: "control_request",
+      request_id: requestId,
+      request: canUseToolRequest,
+    };
+
+    console.log(JSON.stringify(controlRequest));
+
+    // Wait for control_response
+    while (true) {
+      const line = await getNextLine();
+      if (line === null) {
+        return { decision: "deny", reason: "stdin closed" };
+      }
+      if (!line.trim()) continue;
+
+      try {
+        const msg = JSON.parse(line);
+        if (
+          msg.type === "control_response" &&
+          msg.response?.request_id === requestId
+        ) {
+          // Parse the can_use_tool response
+          const response = msg.response?.response as
+            | CanUseToolResponse
+            | undefined;
+          if (!response) {
+            return { decision: "deny", reason: "Invalid response format" };
+          }
+
+          if (response.behavior === "allow") {
+            return { decision: "allow" };
+          } else {
+            return {
+              decision: "deny",
+              reason: response.message,
+              // TODO: handle interrupt flag
+            };
+          }
+        }
+        // Put other messages back in queue for main loop
+        lineQueue.unshift(line);
+        // But since we're waiting for permission, we need to wait more
+        // Actually this causes issues - let's just ignore other messages
+        // during permission wait (they'll be lost)
+      } catch {
+        // Ignore parse errors
+      }
+    }
+  }
+
+  // Main processing loop
+  while (true) {
+    const line = await getNextLine();
+    if (line === null) break; // stdin closed
+    if (!line.trim()) continue;
+
+    let message: {
+      type: string;
+      message?: { role: string; content: string };
+      request_id?: string;
+      request?: { subtype: string };
+      session_id?: string;
+    };
+
+    try {
+      message = JSON.parse(line);
+    } catch {
+      const errorMsg: ErrorMessage = {
+        type: "error",
+        message: "Invalid JSON input",
+        stop_reason: "error",
+        session_id: sessionId,
+        uuid: crypto.randomUUID(),
+      };
+      console.log(JSON.stringify(errorMsg));
+      continue;
+    }
+
+    // Handle control requests
+    if (message.type === "control_request") {
+      const subtype = message.request?.subtype;
+      const requestId = message.request_id;
+
+      if (subtype === "initialize") {
+        // Return session info
+        const initResponse: ControlResponse = {
+          type: "control_response",
+          response: {
+            subtype: "success",
+            request_id: requestId ?? "",
+            response: {
+              agent_id: agent.id,
+              model: agent.llm_config?.model,
+              tools: agent.tools?.map((t) => t.name) || [],
+            },
+          },
+          session_id: sessionId,
+          uuid: crypto.randomUUID(),
+        };
+        console.log(JSON.stringify(initResponse));
+      } else if (subtype === "interrupt") {
+        // Abort current operation if any
+        if (currentAbortController !== null) {
+          (currentAbortController as AbortController).abort();
+          currentAbortController = null;
+        }
+        const interruptResponse: ControlResponse = {
+          type: "control_response",
+          response: {
+            subtype: "success",
+            request_id: requestId ?? "",
+          },
+          session_id: sessionId,
+          uuid: crypto.randomUUID(),
+        };
+        console.log(JSON.stringify(interruptResponse));
+      } else {
+        const errorResponse: ControlResponse = {
+          type: "control_response",
+          response: {
+            subtype: "error",
+            request_id: requestId ?? "",
+            error: `Unknown control request subtype: ${subtype}`,
+          },
+          session_id: sessionId,
+          uuid: crypto.randomUUID(),
+        };
+        console.log(JSON.stringify(errorResponse));
+      }
+      continue;
+    }
+
+    // Handle user messages
+    if (message.type === "user" && message.message?.content) {
+      const userContent = message.message.content;
+
+      // Create abort controller for this operation
+      currentAbortController = new AbortController();
+
+      try {
+        const buffers = createBuffers();
+        const startTime = performance.now();
+        let numTurns = 0;
+
+        // Initial input is the user message
+        let currentInput: MessageCreate[] = [
+          { role: "user", content: userContent },
+        ];
+
+        // Approval handling loop - continue until end_turn or error
+        while (true) {
+          numTurns++;
+
+          // Check if aborted
+          if (currentAbortController?.signal.aborted) {
+            break;
+          }
+
+          // Send message to agent
+          const stream = await sendMessageStream(agent.id, currentInput);
+
+          // Track stop reason and approvals during this stream
+          let stopReason: StopReasonType = "error";
+          const approvalRequests = new Map<
+            string,
+            { toolName: string; args: string }
+          >();
+
+          // Process stream
+          for await (const chunk of stream) {
+            // Check if aborted
+            if (currentAbortController?.signal.aborted) {
+              break;
+            }
+
+            // Track stop reason
+            if (chunk.message_type === "stop_reason") {
+              stopReason = chunk.stop_reason;
+            }
+
+            // Track approval requests
+            if (chunk.message_type === "approval_request_message") {
+              const chunkWithTools = chunk as typeof chunk & {
+                tool_call?: {
+                  tool_call_id?: string;
+                  name?: string;
+                  arguments?: string;
+                };
+              };
+              const toolCall = chunkWithTools.tool_call;
+              if (toolCall?.tool_call_id && toolCall?.name) {
+                const existing = approvalRequests.get(toolCall.tool_call_id);
+                approvalRequests.set(toolCall.tool_call_id, {
+                  toolName: toolCall.name,
+                  args: (existing?.args || "") + (toolCall.arguments || ""),
+                });
+              }
+            }
+
+            // Output chunk
+            const chunkWithIds = chunk as typeof chunk & {
+              otid?: string;
+              id?: string;
+            };
+            const uuid = chunkWithIds.otid || chunkWithIds.id;
+
+            if (includePartialMessages) {
+              const streamEvent: StreamEvent = {
+                type: "stream_event",
+                event: chunk,
+                session_id: sessionId,
+                uuid: uuid || crypto.randomUUID(),
+              };
+              console.log(JSON.stringify(streamEvent));
+            } else {
+              const msg: MessageWire = {
+                type: "message",
+                ...chunk,
+                session_id: sessionId,
+                uuid: uuid || crypto.randomUUID(),
+              };
+              console.log(JSON.stringify(msg));
+            }
+
+            // Accumulate for result
+            const { onChunk } = await import("./cli/helpers/accumulator");
+            onChunk(buffers, chunk);
+          }
+
+          // Case 1: Turn ended normally - break out of loop
+          if (stopReason === "end_turn") {
+            break;
+          }
+
+          // Case 2: Aborted - break out of loop
+          if (currentAbortController?.signal.aborted) {
+            break;
+          }
+
+          // Case 3: Requires approval - process approvals and continue
+          if (stopReason === "requires_approval") {
+            const approvals = Array.from(approvalRequests.entries()).map(
+              ([toolCallId, { toolName, args }]) => ({
+                toolCallId,
+                toolName,
+                toolArgs: args,
+              }),
+            );
+
+            if (approvals.length === 0) {
+              // No approvals to process - break
+              break;
+            }
+
+            // Check permissions and collect decisions
+            type Decision =
+              | {
+                  type: "approve";
+                  approval: {
+                    toolCallId: string;
+                    toolName: string;
+                    toolArgs: string;
+                  };
+                  matchedRule: string;
+                }
+              | {
+                  type: "deny";
+                  approval: {
+                    toolCallId: string;
+                    toolName: string;
+                    toolArgs: string;
+                  };
+                  reason: string;
+                };
+
+            const decisions: Decision[] = [];
+
+            for (const approval of approvals) {
+              const parsedArgs = safeJsonParseOr<Record<string, unknown>>(
+                approval.toolArgs,
+                {},
+              );
+              const permission = await checkToolPermission(
+                approval.toolName,
+                parsedArgs,
+              );
+
+              if (permission.decision === "allow") {
+                decisions.push({
+                  type: "approve",
+                  approval,
+                  matchedRule: permission.matchedRule || "auto-approved",
+                });
+
+                // Emit auto_approval event
+                const autoApprovalMsg: AutoApprovalMessage = {
+                  type: "auto_approval",
+                  tool_call: {
+                    name: approval.toolName,
+                    tool_call_id: approval.toolCallId,
+                    arguments: approval.toolArgs,
+                  },
+                  reason: permission.reason || "auto-approved",
+                  matched_rule: permission.matchedRule || "auto-approved",
+                  session_id: sessionId,
+                  uuid: `auto-approval-${approval.toolCallId}`,
+                };
+                console.log(JSON.stringify(autoApprovalMsg));
+              } else if (permission.decision === "deny") {
+                // Explicitly denied by permission rules
+                decisions.push({
+                  type: "deny",
+                  approval,
+                  reason: `Permission denied: ${permission.matchedRule || permission.reason}`,
+                });
+              } else {
+                // permission.decision === "ask" - request permission from SDK
+                const permResponse = await requestPermission(
+                  approval.toolCallId,
+                  approval.toolName,
+                  parsedArgs,
+                );
+
+                if (permResponse.decision === "allow") {
+                  decisions.push({
+                    type: "approve",
+                    approval,
+                    matchedRule: "SDK callback approved",
+                  });
+
+                  // Emit auto_approval event for SDK-approved tool
+                  const autoApprovalMsg: AutoApprovalMessage = {
+                    type: "auto_approval",
+                    tool_call: {
+                      name: approval.toolName,
+                      tool_call_id: approval.toolCallId,
+                      arguments: approval.toolArgs,
+                    },
+                    reason: permResponse.reason || "SDK callback approved",
+                    matched_rule: "canUseTool callback",
+                    session_id: sessionId,
+                    uuid: `auto-approval-${approval.toolCallId}`,
+                  };
+                  console.log(JSON.stringify(autoApprovalMsg));
+                } else {
+                  decisions.push({
+                    type: "deny",
+                    approval,
+                    reason: permResponse.reason || "Denied by SDK callback",
+                  });
+                }
+              }
+            }
+
+            // Execute approved tools
+            const { executeApprovalBatch } = await import(
+              "./agent/approval-execution"
+            );
+            const executedResults = await executeApprovalBatch(decisions);
+
+            // Send approval results back to continue
+            currentInput = [
+              {
+                type: "approval",
+                approvals: executedResults,
+              } as unknown as MessageCreate,
+            ];
+
+            // Continue the loop to process the next stream
+            continue;
+          }
+
+          // Other stop reasons - break
+          break;
+        }
+
+        // Emit result
+        const durationMs = performance.now() - startTime;
+        const lines = toLines(buffers);
+        const reversed = [...lines].reverse();
+        const lastAssistant = reversed.find(
+          (line) =>
+            line.kind === "assistant" &&
+            "text" in line &&
+            typeof line.text === "string" &&
+            line.text.trim().length > 0,
+        ) as Extract<Line, { kind: "assistant" }> | undefined;
+        const lastReasoning = reversed.find(
+          (line) =>
+            line.kind === "reasoning" &&
+            "text" in line &&
+            typeof line.text === "string" &&
+            line.text.trim().length > 0,
+        ) as Extract<Line, { kind: "reasoning" }> | undefined;
+        const lastToolResult = reversed.find(
+          (line) =>
+            line.kind === "tool_call" &&
+            "resultText" in line &&
+            typeof (line as Extract<Line, { kind: "tool_call" }>).resultText ===
+              "string" &&
+            (
+              (line as Extract<Line, { kind: "tool_call" }>).resultText ?? ""
+            ).trim().length > 0,
+        ) as Extract<Line, { kind: "tool_call" }> | undefined;
+        const resultText =
+          lastAssistant?.text ||
+          lastReasoning?.text ||
+          lastToolResult?.resultText ||
+          "";
+
+        const resultMsg: ResultMessage = {
+          type: "result",
+          subtype: currentAbortController?.signal.aborted
+            ? "interrupted"
+            : "success",
+          session_id: sessionId,
+          duration_ms: Math.round(durationMs),
+          duration_api_ms: 0, // Not tracked in bidirectional mode
+          num_turns: numTurns,
+          result: resultText,
+          agent_id: agent.id,
+          run_ids: [],
+          usage: null,
+          uuid: `result-${agent.id}-${Date.now()}`,
+        };
+        console.log(JSON.stringify(resultMsg));
+      } catch (error) {
+        const errorMsg: ErrorMessage = {
+          type: "error",
+          message:
+            error instanceof Error ? error.message : "Unknown error occurred",
+          stop_reason: "error",
+          session_id: sessionId,
+          uuid: crypto.randomUUID(),
+        };
+        console.log(JSON.stringify(errorMsg));
+      } finally {
+        currentAbortController = null;
+      }
+      continue;
+    }
+
+    // Unknown message type
+    const errorMsg: ErrorMessage = {
+      type: "error",
+      message: `Unknown message type: ${message.type}`,
+      stop_reason: "error",
+      session_id: sessionId,
+      uuid: crypto.randomUUID(),
+    };
+    console.log(JSON.stringify(errorMsg));
+  }
+
+  // Stdin closed, exit gracefully
+  process.exit(0);
 }

@@ -516,8 +516,8 @@ async function executeSubagent(
       if (isRateLimitError(stderr) && expansionChain.length > 0) {
         // Find next available model in the chain after current one
         const nextIndex = chainIndex + 1;
-        if (nextIndex < expansionChain.length) {
-          const nextModel = expansionChain[nextIndex];
+        const nextModel = expansionChain[nextIndex];
+        if (nextIndex < expansionChain.length && nextModel) {
           console.warn(
             `[subagent] Rate limit error on ${model}, trying next model in chain: ${nextModel}`,
           );
@@ -540,8 +540,8 @@ async function executeSubagent(
         isProviderNotSupportedError(stderr) || isUnknownModelError(stderr);
       if (chainIndex === 0 && isRecoverableError) {
         // Try next model in chain first
-        if (expansionChain.length > 1) {
-          const nextModel = expansionChain[1];
+        const nextModel = expansionChain[1];
+        if (expansionChain.length > 1 && nextModel) {
           console.warn(
             `[subagent] Model error on ${model}, trying next model in chain: ${nextModel}`,
           );
