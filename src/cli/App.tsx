@@ -5908,7 +5908,7 @@ Plan file path: ${planFilePath}`;
   ]);
 
   return (
-    <Box key={resumeKey} flexDirection="column" gap={1}>
+    <Box key={resumeKey} flexDirection="column">
       <Static
         key={staticRenderEpoch}
         items={staticItems}
@@ -5957,7 +5957,7 @@ Plan file path: ${planFilePath}`;
         )}
       </Static>
 
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column">
         {/* Loading screen / intro text */}
         {loadingState !== "ready" && (
           <WelcomeScreen
@@ -6312,7 +6312,7 @@ Plan file path: ${planFilePath}`;
             )}
 
             {/* Input row - always mounted to preserve state */}
-            <Box marginTop={liveItems.length > 0 ? 0 : 1}>
+            <Box marginTop={1}>
               <Input
                 visible={
                   !showExitStats &&
