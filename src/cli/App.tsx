@@ -1,7 +1,9 @@
 // src/cli/App.tsx
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+
 import {
+  APIError,
   APIUserAbortError,
   ConflictError,
 } from "@letta-ai/letta-client/core/error";
@@ -36,6 +38,11 @@ import { getModelDisplayName, getModelInfo } from "../agent/model";
 import { SessionStats } from "../agent/stats";
 import type { ApprovalContext } from "../permissions/analyzer";
 import { type PermissionMode, permissionMode } from "../permissions/mode";
+import {
+  DEFAULT_COMPLETION_PROMISE,
+  type RalphState,
+  ralphMode,
+} from "../ralph/mode";
 import { updateProjectSettings } from "../settings";
 import { settingsManager } from "../settings-manager";
 import { telemetry } from "../telemetry";
@@ -366,6 +373,100 @@ function getSkillUnloadReminder(): string {
   return "";
 }
 
+// Parse /ralph or /yolo-ralph command arguments
+function parseRalphArgs(input: string): {
+  prompt: string | null;
+  completionPromise: string | null | undefined; // undefined = use default, null = no promise
+  maxIterations: number;
+} {
+  let rest = input.replace(/^\/(yolo-)?ralph\s*/, "");
+
+  // Extract --completion-promise "value" or --completion-promise 'value'
+  // Also handles --completion-promise "" or none for opt-out
+  let completionPromise: string | null | undefined;
+  const promiseMatch = rest.match(/--completion-promise\s+["']([^"']*)["']/);
+  if (promiseMatch) {
+    const val = promiseMatch[1] ?? "";
+    completionPromise = val === "" || val.toLowerCase() === "none" ? null : val;
+    rest = rest.replace(/--completion-promise\s+["'][^"']*["']\s*/, "");
+  }
+
+  // Extract --max-iterations N
+  const maxMatch = rest.match(/--max-iterations\s+(\d+)/);
+  const maxIterations = maxMatch?.[1] ? parseInt(maxMatch[1], 10) : 0;
+  rest = rest.replace(/--max-iterations\s+\d+\s*/, "");
+
+  // Remaining text is the inline prompt (may be quoted)
+  const prompt = rest.trim().replace(/^["']|["']$/g, "") || null;
+  return { prompt, completionPromise, maxIterations };
+}
+
+// Build Ralph first-turn reminder (when activating)
+// Uses exact wording from claude-code/plugins/ralph-wiggum/scripts/setup-ralph-loop.sh
+function buildRalphFirstTurnReminder(state: RalphState): string {
+  const iterInfo =
+    state.maxIterations > 0
+      ? `${state.currentIteration}/${state.maxIterations}`
+      : `${state.currentIteration}`;
+
+  let reminder = `<system-reminder>
+🔄 Ralph Wiggum mode activated (iteration ${iterInfo})
+`;
+
+  if (state.completionPromise) {
+    reminder += `
+═══════════════════════════════════════════════════════════
+RALPH LOOP COMPLETION PROMISE
+═══════════════════════════════════════════════════════════
+
+To complete this loop, output this EXACT text:
+  <promise>${state.completionPromise}</promise>
+
+STRICT REQUIREMENTS (DO NOT VIOLATE):
+  ✓ Use <promise> XML tags EXACTLY as shown above
+  ✓ The statement MUST be completely and unequivocally TRUE
+  ✓ Do NOT output false statements to exit the loop
+  ✓ Do NOT lie even if you think you should exit
+
+IMPORTANT - Do not circumvent the loop:
+  Even if you believe you're stuck, the task is impossible,
+  or you've been running too long - you MUST NOT output a
+  false promise statement. The loop is designed to continue
+  until the promise is GENUINELY TRUE. Trust the process.
+
+  If the loop should stop, the promise statement will become
+  true naturally. Do not force it by lying.
+═══════════════════════════════════════════════════════════
+`;
+  } else {
+    reminder += `
+No completion promise set - loop runs until --max-iterations or ESC/Shift+Tab to exit.
+`;
+  }
+
+  reminder += `</system-reminder>`;
+  return reminder;
+}
+
+// Build Ralph continuation reminder (on subsequent iterations)
+// Exact format from claude-code/plugins/ralph-wiggum/hooks/stop-hook.sh line 160
+function buildRalphContinuationReminder(state: RalphState): string {
+  const iterInfo =
+    state.maxIterations > 0
+      ? `${state.currentIteration}/${state.maxIterations}`
+      : `${state.currentIteration}`;
+
+  if (state.completionPromise) {
+    return `<system-reminder>
+🔄 Ralph iteration ${iterInfo} | To stop: output <promise>${state.completionPromise}</promise> (ONLY when statement is TRUE - do not lie to exit!)
+</system-reminder>`;
+  } else {
+    return `<system-reminder>
+🔄 Ralph iteration ${iterInfo} | No completion promise set - loop runs infinitely
+</system-reminder>`;
+  }
+}
+
 // Items that have finished rendering and no longer change
 type StaticItem =
   | {
@@ -494,6 +595,10 @@ export default function App({
   // Tracks depth to allow intentional reentry while blocking parallel calls
   const processingConversationRef = useRef(0);
 
+  // Generation counter - incremented on each ESC interrupt.
+  // Allows processConversation to detect if it's been superseded.
+  const conversationGenerationRef = useRef(0);
+
   // Whether an interrupt has been requested for the current stream
   const [interruptRequested, setInterruptRequested] = useState(false);
 
@@ -549,6 +654,18 @@ export default function App({
   // Use ref instead of state to avoid stale closure issues in onSubmit
   const bashCommandCacheRef = useRef<Array<{ input: string; output: string }>>(
     [],
+  );
+
+  // Ralph Wiggum mode: config waiting for next message to capture as prompt
+  const [pendingRalphConfig, setPendingRalphConfig] = useState<{
+    completionPromise: string | null | undefined;
+    maxIterations: number;
+    isYolo: boolean;
+  } | null>(null);
+
+  // Track ralph mode for UI updates (singleton state doesn't trigger re-renders)
+  const [uiRalphActive, setUiRalphActive] = useState(
+    ralphMode.getState().isActive,
   );
 
   // Derive current approval from pending approvals and results
@@ -1221,11 +1338,108 @@ export default function App({
   const processConversation = useCallback(
     async (
       initialInput: Array<MessageCreate | ApprovalCreate>,
-      options?: { allowReentry?: boolean },
+      options?: { allowReentry?: boolean; submissionGeneration?: number },
     ): Promise<void> => {
+      // Helper function for Ralph Wiggum mode continuation
+      // Defined here to have access to buffersRef, processConversation via closure
+      const handleRalphContinuation = () => {
+        const ralphState = ralphMode.getState();
+
+        // Extract LAST assistant message from buffers to check for promise
+        // (We only want to check the most recent response, not the entire transcript)
+        const lines = toLines(buffersRef.current);
+        const assistantLines = lines.filter(
+          (l): l is Line & { kind: "assistant" } => l.kind === "assistant",
+        );
+        const lastAssistantText =
+          assistantLines.length > 0
+            ? (assistantLines[assistantLines.length - 1]?.text ?? "")
+            : "";
+
+        // Check for completion promise
+        if (ralphMode.checkForPromise(lastAssistantText)) {
+          // Promise matched - exit ralph mode
+          const wasYolo = ralphState.isYolo;
+          ralphMode.deactivate();
+          setUiRalphActive(false);
+          if (wasYolo) {
+            permissionMode.setMode("default");
+          }
+
+          // Add completion status to transcript
+          const statusId = uid("status");
+          buffersRef.current.byId.set(statusId, {
+            kind: "status",
+            id: statusId,
+            lines: [
+              `✅ Ralph loop complete: promise detected after ${ralphState.currentIteration} iteration(s)`,
+            ],
+          });
+          buffersRef.current.order.push(statusId);
+          refreshDerived();
+          return;
+        }
+
+        // Check iteration limit
+        if (!ralphMode.shouldContinue()) {
+          // Max iterations reached - exit ralph mode
+          const wasYolo = ralphState.isYolo;
+          ralphMode.deactivate();
+          setUiRalphActive(false);
+          if (wasYolo) {
+            permissionMode.setMode("default");
+          }
+
+          // Add status to transcript
+          const statusId = uid("status");
+          buffersRef.current.byId.set(statusId, {
+            kind: "status",
+            id: statusId,
+            lines: [
+              `🛑 Ralph loop: Max iterations (${ralphState.maxIterations}) reached`,
+            ],
+          });
+          buffersRef.current.order.push(statusId);
+          refreshDerived();
+          return;
+        }
+
+        // Continue loop - increment iteration and re-send prompt
+        ralphMode.incrementIteration();
+        const newState = ralphMode.getState();
+        const systemMsg = buildRalphContinuationReminder(newState);
+
+        // Re-inject original prompt with ralph reminder prepended
+        // Use setTimeout to avoid blocking the current render cycle
+        setTimeout(() => {
+          processConversation(
+            [
+              {
+                type: "message",
+                role: "user",
+                content: `${systemMsg}\n\n${newState.originalPrompt}`,
+              },
+            ],
+            { allowReentry: true },
+          );
+        }, 0);
+      };
+
       // Copy so we can safely mutate for retry recovery flows
       const currentInput = [...initialInput];
       const allowReentry = options?.allowReentry ?? false;
+
+      // Use provided generation (from onSubmit) or capture current
+      // This allows detecting if ESC was pressed during async work before this function was called
+      const myGeneration =
+        options?.submissionGeneration ?? conversationGenerationRef.current;
+
+      // Check if we're already stale (ESC was pressed while we were queued in onSubmit).
+      // This can happen if ESC was pressed during async work before processConversation was called.
+      // We check early to avoid setting state (streaming, etc.) for stale conversations.
+      if (myGeneration !== conversationGenerationRef.current) {
+        return;
+      }
 
       // Guard against concurrent processConversation calls
       // This can happen if user submits two messages in quick succession
@@ -1250,12 +1464,19 @@ export default function App({
           return;
         }
 
+        // Double-check we haven't become stale between entry and try block
+        if (myGeneration !== conversationGenerationRef.current) {
+          return;
+        }
+
         setStreaming(true);
         abortControllerRef.current = new AbortController();
 
         // Clear any stale pending tool calls from previous turns
         // If we're sending a new message, old pending state is no longer relevant
-        markIncompleteToolsAsCancelled(buffersRef.current);
+        // Pass false to avoid setting interrupted=true, which causes race conditions
+        // with concurrent processConversation calls reading the flag
+        markIncompleteToolsAsCancelled(buffersRef.current, false);
         // Reset interrupted flag since we're starting a fresh stream
         buffersRef.current.interrupted = false;
 
@@ -1269,19 +1490,133 @@ export default function App({
 
           // Check if cancelled before starting new stream
           if (signal?.aborted) {
-            setStreaming(false);
+            const isStaleAtAbort =
+              myGeneration !== conversationGenerationRef.current;
+            // Only set streaming=false if this is the current generation.
+            // If stale, a newer processConversation might be running and we shouldn't affect its UI.
+            if (!isStaleAtAbort) {
+              setStreaming(false);
+            }
             return;
           }
 
           // Stream one turn - use ref to always get the latest agentId
-          const stream = await sendMessageStream(
-            agentIdRef.current,
-            currentInput,
-          );
+          // Wrap in try-catch to handle pre-stream desync errors (when sendMessageStream
+          // throws before streaming begins, e.g., retry after LLM error when backend
+          // already cleared the approval)
+          let stream: Awaited<ReturnType<typeof sendMessageStream>>;
+          try {
+            stream = await sendMessageStream(agentIdRef.current, currentInput);
+          } catch (preStreamError) {
+            // Check if this is a pre-stream approval desync error
+            const hasApprovalInPayload = currentInput.some(
+              (item) => item?.type === "approval",
+            );
+
+            if (hasApprovalInPayload) {
+              // Extract error detail from APIError (handles both direct and nested structures)
+              // Direct: e.error.detail | Nested: e.error.error.detail (matches formatErrorDetails)
+              let errorDetail = "";
+              if (
+                preStreamError instanceof APIError &&
+                preStreamError.error &&
+                typeof preStreamError.error === "object"
+              ) {
+                const errObj = preStreamError.error as Record<string, unknown>;
+                // Check nested structure first: e.error.error.detail
+                if (
+                  errObj.error &&
+                  typeof errObj.error === "object" &&
+                  "detail" in errObj.error
+                ) {
+                  const nested = errObj.error as Record<string, unknown>;
+                  errorDetail =
+                    typeof nested.detail === "string" ? nested.detail : "";
+                }
+                // Fallback to direct structure: e.error.detail
+                if (!errorDetail && typeof errObj.detail === "string") {
+                  errorDetail = errObj.detail;
+                }
+              }
+              // Final fallback: use Error.message
+              if (!errorDetail && preStreamError instanceof Error) {
+                errorDetail = preStreamError.message;
+              }
+
+              // If desync detected and retries available, recover with keep-alive prompt
+              if (
+                isApprovalStateDesyncError(errorDetail) &&
+                llmApiErrorRetriesRef.current < LLM_API_ERROR_MAX_RETRIES
+              ) {
+                llmApiErrorRetriesRef.current += 1;
+
+                // Show transient status (matches post-stream desync handler UX)
+                const statusId = uid("status");
+                buffersRef.current.byId.set(statusId, {
+                  kind: "status",
+                  id: statusId,
+                  lines: [
+                    "Approval state desynced; resending keep-alive recovery prompt...",
+                  ],
+                });
+                buffersRef.current.order.push(statusId);
+                refreshDerived();
+
+                // Swap payload to recovery message (or strip stale approvals)
+                const isApprovalOnlyPayload =
+                  hasApprovalInPayload && currentInput.length === 1;
+                if (isApprovalOnlyPayload) {
+                  currentInput.splice(
+                    0,
+                    currentInput.length,
+                    buildApprovalRecoveryMessage(),
+                  );
+                } else {
+                  // Mixed payload: strip stale approvals, keep user message
+                  const messageItems = currentInput.filter(
+                    (item) => item?.type !== "approval",
+                  );
+                  if (messageItems.length > 0) {
+                    currentInput.splice(
+                      0,
+                      currentInput.length,
+                      ...messageItems,
+                    );
+                  } else {
+                    currentInput.splice(
+                      0,
+                      currentInput.length,
+                      buildApprovalRecoveryMessage(),
+                    );
+                  }
+                }
+
+                // Remove transient status before retry
+                buffersRef.current.byId.delete(statusId);
+                buffersRef.current.order = buffersRef.current.order.filter(
+                  (id) => id !== statusId,
+                );
+                refreshDerived();
+
+                // Reset interrupted flag so retry stream chunks are processed
+                buffersRef.current.interrupted = false;
+                continue;
+              }
+            }
+
+            // Not a recoverable desync - re-throw to outer catch
+            throw preStreamError;
+          }
 
           // Check again after network call - user may have pressed Escape during sendMessageStream
           if (signal?.aborted) {
-            setStreaming(false);
+            const isStaleAtAbort =
+              myGeneration !== conversationGenerationRef.current;
+            // Only set streaming=false if this is the current generation.
+            // If stale, a newer processConversation might be running and we shouldn't affect its UI.
+            if (!isStaleAtAbort) {
+              setStreaming(false);
+            }
             return;
           }
 
@@ -1361,6 +1696,17 @@ export default function App({
           const wasAborted = !!signal?.aborted;
           let stopReasonToHandle = wasAborted ? "cancelled" : stopReason;
 
+          // Check if this conversation became stale while the stream was running.
+          // If stale, a newer processConversation is running and we shouldn't modify UI state.
+          const isStaleAfterDrain =
+            myGeneration !== conversationGenerationRef.current;
+
+          // If this conversation is stale, exit without modifying UI state.
+          // A newer conversation is running and should control the UI.
+          if (isStaleAfterDrain) {
+            return;
+          }
+
           // Immediate refresh after stream completes to show final state unless
           // the user already cancelled (handleInterrupt rendered the UI).
           if (!wasInterrupted) {
@@ -1409,6 +1755,14 @@ export default function App({
               queueSnapshotRef.current = [];
             }
 
+            // === RALPH WIGGUM CONTINUATION CHECK ===
+            // Check if ralph mode is active and should auto-continue
+            // This happens at the very end, right before we'd release input
+            if (ralphMode.getState().isActive) {
+              handleRalphContinuation();
+              return;
+            }
+
             return;
           }
 
@@ -1442,6 +1796,23 @@ export default function App({
               // Regular user cancellation - show error
               if (!EAGER_CANCEL) {
                 appendError(INTERRUPT_MESSAGE, true);
+              }
+
+              // In ralph mode, ESC interrupts but does NOT exit ralph
+              // User can type additional instructions, which will get ralph prefix prepended
+              // (Similar to how plan mode works)
+              if (ralphMode.getState().isActive) {
+                // Add status to transcript showing ralph is paused
+                const statusId = uid("status");
+                buffersRef.current.byId.set(statusId, {
+                  kind: "status",
+                  id: statusId,
+                  lines: [
+                    `⏸️ Ralph loop paused - type to continue or shift+tab to exit`,
+                  ],
+                });
+                buffersRef.current.order.push(statusId);
+                refreshDerived();
               }
             }
 
@@ -1863,8 +2234,12 @@ export default function App({
 
           // Unexpected stop reason (error, llm_api_error, etc.)
           // Cache desync detection and last failure for consistent handling
-          const isApprovalPayload =
-            currentInput.length === 1 && currentInput[0]?.type === "approval";
+          // Check if payload contains approvals (could be approval-only or mixed with user message)
+          const hasApprovalInPayload = currentInput.some(
+            (item) => item?.type === "approval",
+          );
+          const isApprovalOnlyPayload =
+            hasApprovalInPayload && currentInput.length === 1;
 
           // Capture the most recent error text in this turn (if any)
           let latestErrorText: string | null = null;
@@ -1888,7 +2263,8 @@ export default function App({
           const lastFailureMessage = latestErrorText || detailFromRun || null;
 
           // Check for approval desync errors even if stop_reason isn't llm_api_error.
-          if (isApprovalPayload && desyncDetected) {
+          // Handle both approval-only payloads and mixed [approval, message] payloads.
+          if (hasApprovalInPayload && desyncDetected) {
             if (llmApiErrorRetriesRef.current < LLM_API_ERROR_MAX_RETRIES) {
               llmApiErrorRetriesRef.current += 1;
               const statusId = uid("status");
@@ -1902,11 +2278,29 @@ export default function App({
               buffersRef.current.order.push(statusId);
               refreshDerived();
 
-              currentInput.splice(
-                0,
-                currentInput.length,
-                buildApprovalRecoveryMessage(),
-              );
+              if (isApprovalOnlyPayload) {
+                // Approval-only payload: send recovery prompt
+                currentInput.splice(
+                  0,
+                  currentInput.length,
+                  buildApprovalRecoveryMessage(),
+                );
+              } else {
+                // Mixed payload [approval, message]: strip stale approval, keep user message
+                const messageItems = currentInput.filter(
+                  (item) => item?.type !== "approval",
+                );
+                if (messageItems.length > 0) {
+                  currentInput.splice(0, currentInput.length, ...messageItems);
+                } else {
+                  // Fallback if somehow no message items remain
+                  currentInput.splice(
+                    0,
+                    currentInput.length,
+                    buildApprovalRecoveryMessage(),
+                  );
+                }
+              }
 
               // Remove the transient status before retrying
               buffersRef.current.byId.delete(statusId);
@@ -2165,11 +2559,19 @@ export default function App({
         sendDesktopNotification(); // Notify user of error
         refreshDerived();
       } finally {
+        // Check if this conversation was superseded by an ESC interrupt
+        const isStale = myGeneration !== conversationGenerationRef.current;
+
         abortControllerRef.current = null;
-        processingConversationRef.current = Math.max(
-          0,
-          processingConversationRef.current - 1,
-        );
+
+        // Only decrement ref if this conversation is still current.
+        // If stale (ESC was pressed), handleInterrupt already reset ref to 0.
+        if (!isStale) {
+          processingConversationRef.current = Math.max(
+            0,
+            processingConversationRef.current - 1,
+          );
+        }
       }
     },
     [
@@ -2302,7 +2704,9 @@ export default function App({
       return;
     }
 
-    if (!streaming || interruptRequested) return;
+    if (!streaming || interruptRequested) {
+      return;
+    }
 
     // If we're in the middle of queue cancel, set flag to restore instead of auto-send
     if (waitingForQueueCancelRef.current) {
@@ -2330,6 +2734,14 @@ export default function App({
       // Set cancellation flag to prevent processConversation from starting
       userCancelledRef.current = true;
 
+      // Increment generation to mark any in-flight processConversation as stale.
+      // The stale processConversation will check this and exit quietly without
+      // decrementing the ref (since we reset it here).
+      conversationGenerationRef.current += 1;
+
+      // Reset the processing guard so the next message can start a new conversation.
+      processingConversationRef.current = 0;
+
       // Stop streaming and show error message (unless tool calls were cancelled,
       // since the tool result will show "Interrupted by user")
       setStreaming(false);
@@ -2338,7 +2750,19 @@ export default function App({
       }
       refreshDerived();
 
-      // Clear any pending approvals since we're cancelling
+      // Cache any pending approvals as denials to send with the next message
+      // This tells the server "I'm rejecting these approvals" so it doesn't stay stuck waiting
+      if (pendingApprovals.length > 0) {
+        const denialResults = pendingApprovals.map((approval) => ({
+          type: "approval" as const,
+          tool_call_id: approval.toolCallId,
+          approve: false,
+          reason: "User interrupted the stream",
+        }));
+        setQueuedApprovalResults(denialResults);
+      }
+
+      // Clear local approval state
       setPendingApprovals([]);
       setApprovalContexts([]);
       setApprovalResults([]);
@@ -2435,6 +2859,7 @@ export default function App({
     refreshDerived,
     setStreaming,
     setIsExecutingTool,
+    pendingApprovals,
   ]);
 
   // Keep ref to latest processConversation to avoid circular deps in useEffect
@@ -2732,6 +3157,154 @@ export default function App({
     [refreshDerived],
   );
 
+  /**
+   * Check and handle any pending approvals before sending a slash command.
+   * Returns true if approvals need user input (caller should return { submitted: false }).
+   * Returns false if no approvals or all auto-handled (caller can proceed).
+   */
+  const checkPendingApprovalsForSlashCommand = useCallback(async (): Promise<
+    { blocked: true } | { blocked: false }
+  > => {
+    if (!CHECK_PENDING_APPROVALS_BEFORE_SEND) {
+      return { blocked: false };
+    }
+
+    try {
+      const client = await getClient();
+      const agent = await client.agents.retrieve(agentId);
+      const { pendingApprovals: existingApprovals } = await getResumeData(
+        client,
+        agent,
+      );
+
+      if (!existingApprovals || existingApprovals.length === 0) {
+        return { blocked: false };
+      }
+
+      // There are pending approvals - check permissions (respects yolo mode)
+      const approvalResults = await Promise.all(
+        existingApprovals.map(async (approvalItem) => {
+          if (!approvalItem.toolName) {
+            return {
+              approval: approvalItem,
+              permission: {
+                decision: "deny" as const,
+                reason: "Tool call incomplete - missing name",
+              },
+              context: null,
+            };
+          }
+          const parsedArgs = safeJsonParseOr<Record<string, unknown>>(
+            approvalItem.toolArgs,
+            {},
+          );
+          const permission = await checkToolPermission(
+            approvalItem.toolName,
+            parsedArgs,
+          );
+          const context = await analyzeToolApproval(
+            approvalItem.toolName,
+            parsedArgs,
+          );
+          return { approval: approvalItem, permission, context };
+        }),
+      );
+
+      // Categorize by permission decision
+      const needsUserInput: typeof approvalResults = [];
+      const autoAllowed: typeof approvalResults = [];
+      const autoDenied: typeof approvalResults = [];
+
+      for (const ac of approvalResults) {
+        const { approval, permission } = ac;
+        let decision = permission.decision;
+
+        if (
+          alwaysRequiresUserInput(approval.toolName) &&
+          decision === "allow"
+        ) {
+          decision = "ask";
+        }
+
+        if (decision === "ask") {
+          needsUserInput.push(ac);
+        } else if (decision === "deny") {
+          autoDenied.push(ac);
+        } else {
+          autoAllowed.push(ac);
+        }
+      }
+
+      // If any approvals need user input, show dialog
+      if (needsUserInput.length > 0) {
+        setPendingApprovals(needsUserInput.map((ac) => ac.approval));
+        setApprovalContexts(
+          needsUserInput
+            .map((ac) => ac.context)
+            .filter((ctx): ctx is ApprovalContext => ctx !== null),
+        );
+        return { blocked: true };
+      }
+
+      // All approvals can be auto-handled - execute them before proceeding
+      const allResults: ApprovalResult[] = [];
+
+      // Execute auto-allowed tools
+      if (autoAllowed.length > 0) {
+        const autoAllowedResults = await executeAutoAllowedTools(
+          autoAllowed,
+          (chunk) => onChunk(buffersRef.current, chunk),
+        );
+        // Map to ApprovalResult format (ToolReturn)
+        allResults.push(
+          ...autoAllowedResults.map((ar) => ({
+            type: "tool" as const,
+            tool_call_id: ar.toolCallId,
+            tool_return: ar.result.toolReturn,
+            status: ar.result.status,
+            stdout: ar.result.stdout,
+            stderr: ar.result.stderr,
+          })),
+        );
+      }
+
+      // Create denial results for auto-denied
+      for (const ac of autoDenied) {
+        const reason = ac.permission.reason || "Permission denied";
+        // Update UI with denial
+        onChunk(buffersRef.current, {
+          message_type: "tool_return_message",
+          id: "dummy",
+          date: new Date().toISOString(),
+          tool_call_id: ac.approval.toolCallId,
+          tool_return: `Error: request to call tool denied. User reason: ${reason}`,
+          status: "error",
+          stdout: null,
+          stderr: null,
+        });
+        // Map to ApprovalResult format (ApprovalReturn)
+        allResults.push({
+          type: "approval" as const,
+          tool_call_id: ac.approval.toolCallId,
+          approve: false,
+          reason,
+        });
+      }
+
+      // Send all results to server if any
+      if (allResults.length > 0) {
+        await processConversation([
+          { type: "approval", approvals: allResults },
+        ]);
+      }
+
+      return { blocked: false };
+    } catch {
+      // If check fails, proceed anyway (don't block user)
+      return { blocked: false };
+    }
+  }, [agentId, processConversation]);
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: refs read .current dynamically, complex callback with intentional deps
   const onSubmit = useCallback(
     async (message?: string): Promise<{ submitted: boolean }> => {
@@ -2768,6 +3341,10 @@ export default function App({
 
       if (!msg) return { submitted: false };
 
+      // Capture the generation at submission time, BEFORE any async work.
+      // This allows detecting if ESC was pressed during async operations.
+      const submissionGeneration = conversationGenerationRef.current;
+
       // Track user input (agent_id automatically added from telemetry.currentAgentId)
       telemetry.trackUserInput(msg, "user", currentModelId || "unknown");
 
@@ -2801,6 +3378,12 @@ export default function App({
             waitingForQueueCancelRef.current = true;
             queueSnapshotRef.current = [...newQueue];
 
+            // Abort client-side tool execution if in progress
+            // This makes tool interruption visible immediately instead of waiting for completion
+            if (toolAbortControllerRef.current) {
+              toolAbortControllerRef.current.abort();
+            }
+
             // Send cancel request to backend (fire-and-forget)
             getClient()
               .then((client) => client.agents.messages.cancel(agentId))
@@ -2818,6 +3401,44 @@ export default function App({
 
       // Note: userCancelledRef.current was already reset above before the queue check
       // to ensure the dequeue effect isn't blocked by a stale cancellation flag.
+
+      // Handle pending Ralph config - activate ralph mode but let message flow through normal path
+      // This ensures session context and other reminders are included
+      // Track if we just activated so we can use first turn reminder vs continuation
+      let justActivatedRalph = false;
+      if (pendingRalphConfig && !msg.startsWith("/")) {
+        const { completionPromise, maxIterations, isYolo } = pendingRalphConfig;
+        ralphMode.activate(msg, completionPromise, maxIterations, isYolo);
+        setUiRalphActive(true);
+        setPendingRalphConfig(null);
+        justActivatedRalph = true;
+        if (isYolo) {
+          permissionMode.setMode("bypassPermissions");
+        }
+
+        const ralphState = ralphMode.getState();
+
+        // Add status to transcript
+        const statusId = uid("status");
+        const promiseDisplay = ralphState.completionPromise
+          ? `"${ralphState.completionPromise.slice(0, 50)}${ralphState.completionPromise.length > 50 ? "..." : ""}"`
+          : "(none)";
+        buffersRef.current.byId.set(statusId, {
+          kind: "status",
+          id: statusId,
+          lines: [
+            `🔄 ${isYolo ? "yolo-ralph" : "ralph"} mode started (iter 1/${maxIterations || "∞"})`,
+            `Promise: ${promiseDisplay}`,
+          ],
+        });
+        buffersRef.current.order.push(statusId);
+        refreshDerived();
+
+        // Don't return - let message flow through normal path which will:
+        // 1. Add session context reminder (if first message)
+        // 2. Add ralph mode reminder (since ralph is now active)
+        // 3. Add other reminders (skill unload, memory, etc.)
+      }
 
       let aliasedMsg = msg;
       if (msg === "exit" || msg === "quit") {
@@ -3140,6 +3761,75 @@ export default function App({
             refreshDerived();
           } finally {
             setCommandRunning(false);
+          }
+          return { submitted: true };
+        }
+
+        // Special handling for /ralph and /yolo-ralph commands - Ralph Wiggum mode
+        if (trimmed.startsWith("/yolo-ralph") || trimmed.startsWith("/ralph")) {
+          const isYolo = trimmed.startsWith("/yolo-ralph");
+          const { prompt, completionPromise, maxIterations } =
+            parseRalphArgs(trimmed);
+
+          const cmdId = uid("cmd");
+
+          if (prompt) {
+            // Inline prompt - activate immediately and send
+            ralphMode.activate(
+              prompt,
+              completionPromise,
+              maxIterations,
+              isYolo,
+            );
+            setUiRalphActive(true);
+            if (isYolo) {
+              permissionMode.setMode("bypassPermissions");
+            }
+
+            const ralphState = ralphMode.getState();
+            const promiseDisplay = ralphState.completionPromise
+              ? `"${ralphState.completionPromise.slice(0, 50)}${ralphState.completionPromise.length > 50 ? "..." : ""}"`
+              : "(none)";
+
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: trimmed,
+              output: `🔄 ${isYolo ? "yolo-ralph" : "ralph"} mode activated (iter 1/${maxIterations || "∞"})\nPromise: ${promiseDisplay}`,
+              phase: "finished",
+              success: true,
+            });
+            buffersRef.current.order.push(cmdId);
+            refreshDerived();
+
+            // Send the prompt with ralph reminder prepended
+            const systemMsg = buildRalphFirstTurnReminder(ralphState);
+            processConversation([
+              {
+                type: "message",
+                role: "user",
+                content: `${systemMsg}\n\n${prompt}`,
+              },
+            ]);
+          } else {
+            // No inline prompt - wait for next message
+            setPendingRalphConfig({ completionPromise, maxIterations, isYolo });
+
+            const defaultPromisePreview = DEFAULT_COMPLETION_PROMISE.slice(
+              0,
+              40,
+            );
+
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: trimmed,
+              output: `🔄 ${isYolo ? "yolo-ralph" : "ralph"} mode ready (waiting for task)\nMax iterations: ${maxIterations || "unlimited"}\nPromise: ${completionPromise === null ? "(none)" : (completionPromise ?? `"${defaultPromisePreview}..." (default)`)}\n\nType your task to begin the loop.`,
+              phase: "finished",
+              success: true,
+            });
+            buffersRef.current.order.push(cmdId);
+            refreshDerived();
           }
           return { submitted: true };
         }
@@ -3727,6 +4417,12 @@ export default function App({
 
         // Special handling for /skill command - enter skill creation mode
         if (trimmed.startsWith("/skill")) {
+          // Check for pending approvals before sending
+          const approvalCheck = await checkPendingApprovalsForSlashCommand();
+          if (approvalCheck.blocked) {
+            return { submitted: false }; // Keep /skill in input box, user handles approval first
+          }
+
           const cmdId = uid("cmd");
 
           // Extract optional description after `/skill`
@@ -3802,6 +4498,12 @@ export default function App({
 
         // Special handling for /remember command - remember something from conversation
         if (trimmed.startsWith("/remember")) {
+          // Check for pending approvals before sending (mirrors regular message flow)
+          const approvalCheck = await checkPendingApprovalsForSlashCommand();
+          if (approvalCheck.blocked) {
+            return { submitted: false }; // Keep /remember in input box, user handles approval first
+          }
+
           const cmdId = uid("cmd");
 
           // Extract optional description after `/remember`
@@ -3876,6 +4578,12 @@ export default function App({
 
         // Special handling for /init command - initialize agent memory
         if (trimmed === "/init") {
+          // Check for pending approvals before sending
+          const approvalCheck = await checkPendingApprovalsForSlashCommand();
+          if (approvalCheck.blocked) {
+            return { submitted: false }; // Keep /init in input box, user handles approval first
+          }
+
           const cmdId = uid("cmd");
           buffersRef.current.byId.set(cmdId, {
             kind: "command",
@@ -4022,6 +4730,12 @@ ${gitContext}
         const matchedCustom = await findCustomCommand(commandName);
 
         if (matchedCustom) {
+          // Check for pending approvals before sending
+          const approvalCheck = await checkPendingApprovalsForSlashCommand();
+          if (approvalCheck.blocked) {
+            return { submitted: false }; // Keep custom command in input box, user handles approval first
+          }
+
           const cmdId = uid("cmd");
 
           // Extract arguments (everything after command name)
@@ -4141,6 +4855,21 @@ ${gitContext}
       // Prepend plan mode reminder if in plan mode
       const planModeReminder = getPlanModeReminder();
 
+      // Prepend ralph mode reminder if in ralph mode
+      let ralphModeReminder = "";
+      if (ralphMode.getState().isActive) {
+        if (justActivatedRalph) {
+          // First turn - use full first turn reminder, don't increment (already at 1)
+          const ralphState = ralphMode.getState();
+          ralphModeReminder = `${buildRalphFirstTurnReminder(ralphState)}\n\n`;
+        } else {
+          // Continuation after ESC - increment iteration and use shorter reminder
+          ralphMode.incrementIteration();
+          const ralphState = ralphMode.getState();
+          ralphModeReminder = `${buildRalphContinuationReminder(ralphState)}\n\n`;
+        }
+      }
+
       // Prepend skill unload reminder if skills are loaded (using cached flag)
       const skillUnloadReminder = getSkillUnloadReminder();
 
@@ -4187,10 +4916,11 @@ DO NOT respond to these messages or otherwise consider them in your response unl
       // Increment turn count for next iteration
       turnCountRef.current += 1;
 
-      // Combine reminders with content (session context first, then plan mode, then skill unload, then bash commands, then memory reminder)
+      // Combine reminders with content (session context first, then plan mode, then ralph mode, then skill unload, then bash commands, then memory reminder)
       const allReminders =
         sessionContextReminder +
         planModeReminder +
+        ralphModeReminder +
         skillUnloadReminder +
         bashCommandPrefix +
         memoryReminderContent;
@@ -4614,7 +5344,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         content: messageContent as unknown as MessageCreate["content"],
       });
 
-      await processConversation(initialInput);
+      await processConversation(initialInput, { submissionGeneration });
 
       // Clean up placeholders after submission
       clearPlaceholdersInText(msg);
@@ -4640,6 +5370,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
       isAgentBusy,
       setStreaming,
       setCommandRunning,
+      pendingRalphConfig,
     ],
   );
 
@@ -4811,6 +5542,10 @@ DO NOT respond to these messages or otherwise consider them in your response unl
             setQueuedApprovalResults(allResults as ApprovalResult[]);
           }
           setStreaming(false);
+
+          // Reset queue-cancel flag so dequeue effect can fire
+          waitingForQueueCancelRef.current = false;
+          queueSnapshotRef.current = [];
         } else {
           // Continue conversation with all results
           await processConversation([
@@ -5528,6 +6263,20 @@ DO NOT respond to these messages or otherwise consider them in your response unl
   const [uiPermissionMode, setUiPermissionMode] = useState(
     permissionMode.getMode(),
   );
+
+  // Handle ralph mode exit from Input component (shift+tab)
+  const handleRalphExit = useCallback(() => {
+    const ralph = ralphMode.getState();
+    if (ralph.isActive) {
+      const wasYolo = ralph.isYolo;
+      ralphMode.deactivate();
+      setUiRalphActive(false);
+      if (wasYolo) {
+        permissionMode.setMode("default");
+        setUiPermissionMode("default");
+      }
+    }
+  }, []);
 
   // Handle permission mode changes from the Input component (e.g., shift+tab cycling)
   const handlePermissionModeChange = useCallback((mode: PermissionMode) => {
@@ -6340,6 +7089,10 @@ Plan file path: ${planFilePath}`;
                 onEscapeCancel={
                   profileConfirmPending ? handleProfileEscapeCancel : undefined
                 }
+                ralphActive={uiRalphActive}
+                ralphPending={pendingRalphConfig !== null}
+                ralphPendingYolo={pendingRalphConfig?.isYolo ?? false}
+                onRalphExit={handleRalphExit}
               />
             </Box>
 
