@@ -524,7 +524,8 @@ export default function App({
       | { type: "deny"; approval: ApprovalRequest; reason: string }
     >
   >([]);
-  const [isExecutingTool, setIsExecutingTool] = useState(false);
+  const [isExecutingTool, setIsExecutingTool, isExecutingToolRef] =
+    useSyncedState(false);
   const [queuedApprovalResults, setQueuedApprovalResults] = useState<
     ApprovalResult[] | null
   >(null);
@@ -782,11 +783,11 @@ export default function App({
   const isAgentBusy = useCallback(() => {
     return (
       streamingRef.current ||
-      isExecutingTool ||
+      isExecutingToolRef.current ||
       commandRunningRef.current ||
       abortControllerRef.current !== null
     );
-  }, [isExecutingTool]);
+  }, []);
 
   // Helper to wrap async handlers that need to close overlay and lock input
   // Closes overlay and sets commandRunning before executing, releases lock in finally
@@ -2225,7 +2226,71 @@ export default function App({
       userCancelledRef.current = true; // Prevent dequeue
       setStreaming(false);
       setIsExecutingTool(false);
+
+      // Clear any pending approvals since we're cancelling
+      setPendingApprovals([]);
+      setApprovalContexts([]);
+      setApprovalResults([]);
+      setAutoHandledResults([]);
+      setAutoDeniedApprovals([]);
+
       refreshDerived();
+
+      // If the backend has already created an approval_request_message, it will refuse
+      // new user messages until it receives an approval/denial. Best-effort: detect
+      // any server-side pending approvals and queue denials to be sent with the next
+      // user message (same logic as EAGER_CANCEL branch).
+      // Capture the current agent id before the async call to avoid stale state
+      // if the user switches agents while the promise is pending.
+      const capturedAgentId = agentIdRef.current;
+      getClient()
+        .then(async (client) => {
+          // Check if agent changed during the async call - if so, skip to avoid
+          // enqueuing denials for a different agent
+          if (capturedAgentId !== agentIdRef.current) {
+            return;
+          }
+
+          // Fire-and-forget cancel request to backend (do not await)
+          client.agents.messages.cancel(capturedAgentId).catch(() => {
+            // Silently ignore - cancellation already happened client-side
+          });
+
+          try {
+            const agent = await client.agents.retrieve(capturedAgentId);
+
+            // Check again after retrieve in case agent switched during the await
+            if (capturedAgentId !== agentIdRef.current) {
+              return;
+            }
+
+            const { pendingApprovals: existingApprovals } = await getResumeData(
+              client,
+              agent,
+            );
+
+            // Final check before setting state
+            if (capturedAgentId !== agentIdRef.current) {
+              return;
+            }
+
+            if (existingApprovals.length > 0) {
+              setQueuedApprovalResults(
+                existingApprovals.map((a) => ({
+                  type: "approval" as const,
+                  tool_call_id: a.toolCallId,
+                  approve: false,
+                  reason: "User cancelled",
+                })),
+              );
+            }
+          } catch {
+            // Best-effort only; failing to fetch approvals should not block interrupt UX.
+          }
+        })
+        .catch(() => {
+          // Silently ignore - cancellation already happened client-side
+        });
 
       // Delay flag reset to ensure React has flushed state updates before dequeue can fire.
       // Use setTimeout(50) instead of setTimeout(0) - the longer delay ensures React's
@@ -2284,19 +2349,39 @@ export default function App({
       // new user messages until it receives an approval/denial. Best-effort: detect
       // any server-side pending approvals and queue denials to be sent with the next
       // user message (see queuedApprovalResults flow below).
+      // Capture the current agent id before the async call to avoid stale state
+      // if the user switches agents while the promise is pending.
+      const capturedAgentIdEager = agentIdRef.current;
       getClient()
         .then(async (client) => {
+          // Check if agent changed during the async call - if so, skip to avoid
+          // enqueuing denials for a different agent
+          if (capturedAgentIdEager !== agentIdRef.current) {
+            return;
+          }
+
           // Fire-and-forget cancel request to backend (do not await)
-          client.agents.messages.cancel(agentId).catch(() => {
+          client.agents.messages.cancel(capturedAgentIdEager).catch(() => {
             // Silently ignore - cancellation already happened client-side
           });
 
           try {
-            const agent = await client.agents.retrieve(agentId);
+            const agent = await client.agents.retrieve(capturedAgentIdEager);
+
+            // Check again after retrieve in case agent switched during the await
+            if (capturedAgentIdEager !== agentIdRef.current) {
+              return;
+            }
+
             const { pendingApprovals: existingApprovals } = await getResumeData(
               client,
               agent,
             );
+
+            // Final check before setting state
+            if (capturedAgentIdEager !== agentIdRef.current) {
+              return;
+            }
 
             if (existingApprovals.length > 0) {
               setQueuedApprovalResults(
@@ -2349,6 +2434,7 @@ export default function App({
     isExecutingTool,
     refreshDerived,
     setStreaming,
+    setIsExecutingTool,
   ]);
 
   // Keep ref to latest processConversation to avoid circular deps in useEffect
@@ -4749,6 +4835,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
       refreshDerived,
       appendError,
       setStreaming,
+      setIsExecutingTool,
     ],
   );
 
@@ -4803,6 +4890,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
       appendError,
       isExecutingTool,
       setStreaming,
+      setIsExecutingTool,
     ],
   );
 
@@ -4971,6 +5059,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
       refreshDerived,
       isExecutingTool,
       setStreaming,
+      setIsExecutingTool,
     ],
   );
 
@@ -5019,6 +5108,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
       appendError,
       isExecutingTool,
       setStreaming,
+      setIsExecutingTool,
     ],
   );
 
@@ -5516,6 +5606,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
       appendError,
       refreshDerived,
       setStreaming,
+      setIsExecutingTool,
     ],
   );
 
@@ -5545,7 +5636,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         setApprovalResults((prev) => [...prev, decision]);
       }
     },
-    [pendingApprovals, approvalResults, sendAllResults],
+    [pendingApprovals, approvalResults, sendAllResults, setIsExecutingTool],
   );
 
   // Auto-reject ExitPlanMode if plan file doesn't exist
@@ -5616,7 +5707,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         setApprovalResults((prev) => [...prev, decision]);
       }
     },
-    [pendingApprovals, approvalResults, sendAllResults, refreshDerived],
+    [pendingApprovals, approvalResults, sendAllResults, refreshDerived, setIsExecutingTool],
   );
 
   const handleEnterPlanModeApprove = useCallback(async () => {
@@ -5681,7 +5772,7 @@ Plan file path: ${planFilePath}`;
     } else {
       setApprovalResults((prev) => [...prev, decision]);
     }
-  }, [pendingApprovals, approvalResults, sendAllResults, refreshDerived]);
+  }, [pendingApprovals, approvalResults, sendAllResults, refreshDerived, setIsExecutingTool]);
 
   const handleEnterPlanModeReject = useCallback(async () => {
     const currentIndex = approvalResults.length;
@@ -5705,7 +5796,7 @@ Plan file path: ${planFilePath}`;
     } else {
       setApprovalResults((prev) => [...prev, decision]);
     }
-  }, [pendingApprovals, approvalResults, sendAllResults]);
+  }, [pendingApprovals, approvalResults, sendAllResults, setIsExecutingTool]);
 
   // Live area shows only in-progress items
   const liveItems = useMemo(() => {

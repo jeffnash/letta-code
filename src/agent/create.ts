@@ -8,6 +8,7 @@ import type {
   AgentType,
 } from "@letta-ai/letta-client/resources/agents/agents";
 import { DEFAULT_AGENT_NAME } from "../constants";
+import { settingsManager } from "../settings-manager";
 import { getClient } from "./client";
 import { getDefaultMemoryBlocks } from "./memory";
 import {
@@ -71,6 +72,30 @@ export interface CreateAgentOptions {
   blockValues?: Record<string, string>;
 }
 
+/**
+ * Resolve the default model from server-side model groups
+ * Used when no user default model is set
+ */
+async function resolveServerDefaultModel(): Promise<string> {
+  // Use server-side groups when possible.
+  // Prefer planning-capable models, then fall back to the server default.
+  const client = await getClient();
+  try {
+    const response = await client.request<{ resolved_handle: string }>({
+      method: "post",
+      path: "/v1/models/resolve",
+      body: {
+        selector: ["group:planning", "any"],
+        parent_model_handle: undefined,
+      },
+    });
+    return response.resolved_handle;
+  } catch {
+    // Offline / older server: fall back to a static default.
+    return getDefaultModel();
+  }
+}
+
 export async function createAgent(
   nameOrOptions: string | CreateAgentOptions = DEFAULT_AGENT_NAME,
   model?: string,
@@ -120,22 +145,22 @@ export async function createAgent(
     }
     modelHandle = resolved;
   } else {
-    // Use server-side groups when possible.
-    // Prefer planning-capable models, then fall back to the server default.
-    const client = await getClient();
-    try {
-      const response = await client.request<{ resolved_handle: string }>({
-        method: "post",
-        path: "/v1/models/resolve",
-        body: {
-          selector: ["group:planning", "any"],
-          parent_model_handle: undefined,
-        },
-      });
-      modelHandle = response.resolved_handle;
-    } catch {
-      // Offline / older server: fall back to a static default.
-      modelHandle = getDefaultModel();
+    // Check user's default model setting first (use safe getter in case settings not initialized)
+    const userDefaultModel = settingsManager.getSettingSafe("defaultModel");
+    if (userDefaultModel) {
+      const resolved = await resolveModelAsync(userDefaultModel);
+      if (resolved) {
+        modelHandle = resolved;
+      } else {
+        // User's default model is no longer available, fall back to server default
+        console.warn(
+          `Warning: Default model "${userDefaultModel}" is not available, using server default`,
+        );
+        modelHandle = await resolveServerDefaultModel();
+      }
+    } else {
+      // No user default set, use server-side groups
+      modelHandle = await resolveServerDefaultModel();
     }
   }
 

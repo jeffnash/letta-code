@@ -20,6 +20,7 @@ export interface Settings {
   enableSleeptime: boolean;
   sessionContextEnabled: boolean; // Send device/agent context on first message of each session
   memoryReminderInterval: number | null; // null = disabled, number = prompt memory check every N turns
+  defaultModel: string | null; // Default model ID for new agents (null = use server default)
   globalSharedBlockIds: Record<string, string>; // DEPRECATED: kept for backwards compat
   profiles?: Record<string, string>; // DEPRECATED: old format, kept for migration
   pinnedAgents?: string[]; // Array of agent IDs pinned globally
@@ -65,6 +66,7 @@ const DEFAULT_SETTINGS: Settings = {
   enableSleeptime: false,
   sessionContextEnabled: true,
   memoryReminderInterval: 5, // number = prompt memory check every N turns
+  defaultModel: null,
   globalSharedBlockIds: {},
 };
 
@@ -253,6 +255,17 @@ class SettingsManager {
    */
   getSetting<K extends keyof Settings>(key: K): Settings[K] {
     return this.getSettings()[key];
+  }
+
+  /**
+   * Get a specific setting value safely (returns default if not initialized)
+   * Use this in contexts where settings may not be initialized yet.
+   */
+  getSettingSafe<K extends keyof Settings>(key: K): Settings[K] {
+    if (!this.initialized || !this.settings) {
+      return DEFAULT_SETTINGS[key];
+    }
+    return this.settings[key];
   }
 
   /**

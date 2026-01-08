@@ -7,6 +7,7 @@ import {
   getAvailableModelsCacheInfo,
 } from "../../agent/available-models";
 import { models } from "../../agent/model";
+import { settingsManager } from "../../settings-manager";
 import { colors } from "./colors";
 
 const PAGE_SIZE = 10;
@@ -39,6 +40,13 @@ export function ModelSelector({
   const [category, setCategory] = useState<ModelCategory>("supported");
   const [currentPage, setCurrentPage] = useState(0);
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [settingsReady, setSettingsReady] = useState(false);
+  const [defaultModelId, setDefaultModelId] = useState<string | null>(
+    settingsManager.getSettingSafe("defaultModel"),
+  );
+  const [defaultSetMessage, setDefaultSetMessage] = useState<string | null>(
+    null,
+  );
 
   // undefined: not loaded yet (show spinner)
   // Set<string>: loaded and filtered
@@ -59,6 +67,17 @@ export function ModelSelector({
     return () => {
       mountedRef.current = false;
     };
+  }, []);
+
+  // Ensure settings manager is initialized before handling key input
+  useEffect(() => {
+    settingsManager.initialize().then(() => {
+      if (mountedRef.current) {
+        setSettingsReady(true);
+        // Update defaultModelId with actual value after initialization
+        setDefaultModelId(settingsManager.getSettingSafe("defaultModel"));
+      }
+    });
   }, []);
 
   // Fetch available models from the API (with caching + inflight dedupe)
@@ -258,6 +277,18 @@ export function ModelSelector({
         if (selectedModel) {
           onSelect(selectedModel.id);
         }
+      } else if (input === "d" || input === "D") {
+        // Set selected model as default for new agents
+        const selectedModel = visibleModels[selectedIndex];
+        if (selectedModel && settingsReady) {
+          settingsManager.updateSettings({ defaultModel: selectedModel.id });
+          setDefaultModelId(selectedModel.id);
+          setDefaultSetMessage(`Set "${selectedModel.label}" as default`);
+          // Clear message after 2 seconds
+          setTimeout(() => {
+            setDefaultSetMessage(null);
+          }, 2000);
+        }
       } else if (category === "all" && input && input.length === 1) {
         // Capture text input for search (only in "all" category)
         setSearchQuery((prev) => prev + input);
@@ -278,8 +309,8 @@ export function ModelSelector({
     <Box flexDirection="column" gap={1}>
       <Box flexDirection="column">
         <Text bold color={colors.selector.title}>
-          Select Model (↑↓ navigate, ←→/jk page, Tab category, Enter select, ESC
-          cancel)
+          Select Model (↑↓ navigate, ←→/jk page, Tab category, Enter select, 'd'
+          set default, ESC cancel)
         </Text>
         {!isLoading && !refreshing && (
           <Box>
@@ -350,6 +381,7 @@ export function ModelSelector({
         {visibleModels.map((model, index) => {
           const isSelected = index === selectedIndex;
           const isCurrent = model.id === currentModelId;
+          const isDefault = model.id === defaultModelId;
 
           return (
             <Box key={model.id} flexDirection="row" gap={1}>
@@ -371,6 +403,7 @@ export function ModelSelector({
                 >
                   {model.label}
                   {isCurrent && <Text> (current)</Text>}
+                  {isDefault && <Text color="green"> (default)</Text>}
                 </Text>
                 {model.description && (
                   <Text dimColor> {model.description}</Text>
@@ -380,6 +413,12 @@ export function ModelSelector({
           );
         })}
       </Box>
+
+      {defaultSetMessage && (
+        <Box>
+          <Text color="green">{defaultSetMessage}</Text>
+        </Box>
+      )}
     </Box>
   );
 }

@@ -92,6 +92,15 @@ describe("Settings Manager - Initialization", () => {
       "Settings not initialized",
     );
   });
+
+  test("getSettingSafe returns defaults before initialization", () => {
+    // Should NOT throw, should return default values
+    const defaultModel = settingsManager.getSettingSafe("defaultModel");
+    expect(defaultModel).toBeNull();
+
+    const tokenStreaming = settingsManager.getSettingSafe("tokenStreaming");
+    expect(typeof tokenStreaming).toBe("boolean");
+  });
 });
 
 // ============================================================================
@@ -562,5 +571,66 @@ describe("Settings Manager - Edge Cases", () => {
     expect(settings.tokenStreaming).toBe(true); // Preserved
     expect(settings.enableSleeptime).toBe(true); // Preserved
     expect(settings.lastAgent).toBe("agent-2"); // Updated
+  });
+});
+
+// ============================================================================
+// Default Model Settings Tests
+// ============================================================================
+
+describe("Settings Manager - Default Model", () => {
+  beforeEach(async () => {
+    await settingsManager.initialize();
+  });
+
+  test("Default model is null by default", () => {
+    const defaultModel = settingsManager.getSetting("defaultModel");
+    expect(defaultModel).toBeNull();
+  });
+
+  test("Can set default model", () => {
+    settingsManager.updateSettings({ defaultModel: "cliproxy-gpt-5.2-medium" });
+
+    const defaultModel = settingsManager.getSetting("defaultModel");
+    expect(defaultModel).toBe("cliproxy-gpt-5.2-medium");
+  });
+
+  test("Can clear default model by setting to null", () => {
+    settingsManager.updateSettings({ defaultModel: "some-model" });
+    expect(settingsManager.getSetting("defaultModel")).toBe("some-model");
+
+    settingsManager.updateSettings({ defaultModel: null });
+    expect(settingsManager.getSetting("defaultModel")).toBeNull();
+  });
+
+  test("Default model persists to disk", async () => {
+    settingsManager.updateSettings({ defaultModel: "opus" });
+
+    // Wait for async persist
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // Reset and reload
+    await settingsManager.reset();
+    await settingsManager.initialize();
+
+    const defaultModel = settingsManager.getSetting("defaultModel");
+    expect(defaultModel).toBe("opus");
+  });
+
+  test("Default model is independent of other settings", () => {
+    settingsManager.updateSettings({
+      defaultModel: "haiku",
+      tokenStreaming: true,
+      lastAgent: "agent-123",
+    });
+
+    // Update other settings
+    settingsManager.updateSettings({
+      tokenStreaming: false,
+    });
+
+    // Default model should be preserved
+    expect(settingsManager.getSetting("defaultModel")).toBe("haiku");
+    expect(settingsManager.getSetting("tokenStreaming")).toBe(false);
   });
 });
