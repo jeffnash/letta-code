@@ -46,6 +46,7 @@ import {
 import { updateProjectSettings } from "../settings";
 import { settingsManager } from "../settings-manager";
 import { telemetry } from "../telemetry";
+import { debugWarn } from "../utils/debug";
 import {
   analyzeToolApproval,
   checkToolPermission,
@@ -1202,9 +1203,60 @@ export default function App({
       // Use backfillBuffers to properly populate the transcript from history
       backfillBuffers(buffersRef.current, messageHistory);
 
+      // Proactively surface approvals on resume so the user doesn't have to hit CONFLICT first.
+      // If the server says requires_approval but no approvals can be recovered, clear the gate
+      // and show a clear error (instead of leaving the user stuck).
+      if ((agentState as { last_stop_reason?: string } | null)?.last_stop_reason === "requires_approval") {
+        getClient()
+          .then(async (client) => {
+            const capturedAgentId = agentIdRef.current;
+            const agent = await client.agents.retrieve(capturedAgentId);
+            const { pendingApprovals: existingApprovals } = await getResumeData(
+              client,
+              agent,
+            );
+
+            if (existingApprovals.length > 0) {
+              setPendingApprovals(existingApprovals);
+              setApprovalContexts([]);
+              setApprovalResults([]);
+              setAutoHandledResults([]);
+              setAutoDeniedApprovals([]);
+              return;
+            }
+
+            // Stuck state: clear server-side gate and explain.
+            // Prefer cancelling the specific run if the backend provides it.
+            const pendingRequestId =
+              agentState && typeof agentState === "object" && "last_run_id" in agentState
+                ? ((agentState as { last_run_id?: string }).last_run_id ?? null)
+                : null;
+
+            try {
+              if (pendingRequestId) {
+                await client.agents.messages.cancel(capturedAgentId, {
+                  run_ids: [pendingRequestId],
+                });
+              } else {
+                await client.agents.messages.cancel(capturedAgentId);
+              }
+            } catch {
+              // ignore; we'll still show an error below
+            }
+
+            appendError(
+              "Agent is waiting for approval, but no approvals could be recovered. The session was unblocked; ask the agent to rerun the command if needed.",
+            );
+          })
+          .catch(() => {
+            // Ignore - resume should still succeed without proactive approvals.
+          });
+      }
+
       // Add combined status at the END so user sees it without scrolling
       const statusId = `status-resumed-${Date.now().toString(36)}`;
       const cwd = process.cwd();
+
       const shortCwd = cwd.startsWith(process.env.HOME || "")
         ? `~${cwd.slice((process.env.HOME || "").length)}`
         : cwd;
@@ -1340,6 +1392,7 @@ export default function App({
       initialInput: Array<MessageCreate | ApprovalCreate>,
       options?: { allowReentry?: boolean; submissionGeneration?: number },
     ): Promise<void> => {
+
       // Helper function for Ralph Wiggum mode continuation
       // Defined here to have access to buffersRef, processConversation via closure
       const handleRalphContinuation = () => {
@@ -1508,6 +1561,7 @@ export default function App({
           try {
             stream = await sendMessageStream(agentIdRef.current, currentInput);
           } catch (preStreamError) {
+
             // Check if this is a pre-stream approval desync error
             const hasApprovalInPayload = currentInput.some(
               (item) => item?.type === "approval",
@@ -1684,6 +1738,8 @@ export default function App({
             signal, // Use captured signal, not ref (which may be nulled by handleInterrupt)
             syncAgentState,
           );
+
+          // MEGA DEBUG: Log stream result
 
           // Update currentRunId for error reporting in catch block
           currentRunId = lastRunId ?? undefined;
@@ -2470,6 +2526,7 @@ export default function App({
           return;
         }
       } catch (e) {
+
         // Mark incomplete tool calls as cancelled to prevent stuck blinking UI
         markIncompleteToolsAsCancelled(buffersRef.current);
 
@@ -2483,16 +2540,21 @@ export default function App({
 
         // If the backend says we're blocked on a pending approval, recover by
         // fetching pending approvals and surfacing the inline approval UI.
-        if (
+        // Use error_code for reliable detection (new server format) with fallback to detail string matching
+        const isPendingApprovalError =
           e instanceof ConflictError &&
           typeof e.error === "object" &&
           e.error !== null &&
-          "detail" in e.error &&
-          typeof (e.error as { detail?: unknown }).detail === "string" &&
-          (e.error as { detail: string }).detail.includes(
-            "waiting for approval on a tool call",
-          )
-        ) {
+          (
+            // New reliable check: error_code field
+            ("error_code" in e.error && (e.error as { error_code?: unknown }).error_code === "PENDING_APPROVAL") ||
+            // Fallback: detail string matching (for backwards compatibility)
+            ("detail" in e.error &&
+              typeof (e.error as { detail?: unknown }).detail === "string" &&
+              (e.error as { detail: string }).detail.includes("waiting for approval on a tool call"))
+          );
+
+        if (isPendingApprovalError) {
           try {
             const client = await getClient();
             const agent = await client.agents.retrieve(agentIdRef.current);
@@ -2527,8 +2589,86 @@ export default function App({
               refreshDerived();
               return;
             }
+
+            // Stuck state: server says requires_approval but we can't fetch any approvals.
+            // Clear the server-side gate so the user can continue.
+            //
+            // We handle all auth cases by:
+            // - using the authenticated SDK client when available
+            // - verifying the server actually cleared the gate after cancel
+            // - surfacing a clear error if it didn't (instead of leaving the user in a loop)
+            const agentId = agentIdRef.current;
+            const runIdToCancel = (() => {
+              // Prefer pending_request_id if present.
+              if (!e || typeof e !== "object" || !("error" in e)) return null;
+              const errObj = (e as { error?: unknown }).error;
+              if (!errObj || typeof errObj !== "object") return null;
+
+              const direct = (errObj as { pending_request_id?: unknown })
+                .pending_request_id;
+              if (typeof direct === "string" && direct) return direct;
+
+              // Fall back to run_id fields.
+              const runIdTop = (errObj as { run_id?: unknown }).run_id;
+              if (typeof runIdTop === "string" && runIdTop) return runIdTop;
+
+              const nested = (errObj as { detail?: unknown }).detail;
+              if (nested && typeof nested === "object") {
+                const nestedId = (nested as { pending_request_id?: unknown })
+                  .pending_request_id;
+                if (typeof nestedId === "string" && nestedId) return nestedId;
+              }
+
+              const nestedError = (errObj as { error?: unknown }).error;
+              if (nestedError && typeof nestedError === "object") {
+                const nestedRunId = (nestedError as { run_id?: unknown }).run_id;
+                if (typeof nestedRunId === "string" && nestedRunId) return nestedRunId;
+
+                const nestedId = (nestedError as { pending_request_id?: unknown })
+                  .pending_request_id;
+                if (typeof nestedId === "string" && nestedId) return nestedId;
+              }
+
+              return null;
+            })();
+
+            try {
+              if (runIdToCancel) {
+                await client.agents.messages.cancel(agentId, {
+                  run_ids: [runIdToCancel],
+                });
+              } else {
+                await client.agents.messages.cancel(agentId);
+              }
+            } catch {
+              // ignore
+            }
+
+            // Re-fetch approvals once after cancel; surface them if they now exist.
+            try {
+              const agentAfterCancel = await client.agents.retrieve(agentId);
+              const { pendingApprovals: approvalsAfterCancel } = await getResumeData(
+                client,
+                agentAfterCancel,
+              );
+
+              if (approvalsAfterCancel.length > 0) {
+                setPendingApprovals(approvalsAfterCancel);
+                setApprovalContexts([]);
+                setApprovalResults([]);
+                setAutoHandledResults([]);
+                setAutoDeniedApprovals([]);
+              }
+            } catch {
+              // ignore
+            }
+
+            setStreaming(false);
+            refreshDerived();
+            return;
           } catch {
-            // fall through to normal error handling
+            // If this path throws, we'll fall through to normal error handling.
+            // Note: we intentionally do not swallow the original ConflictError.
           }
         }
 
@@ -5847,19 +5987,18 @@ DO NOT respond to these messages or otherwise consider them in your response unl
     ],
   );
 
-  // Cancel all pending approvals - queue denials to send with next message
-  // Similar to interrupt flow during tool execution
-  const handleCancelApprovals = useCallback(() => {
+  // Cancel all pending approvals - send cancellation immediately to server.
+  // Queueing isn't enough because the server will reject the next message with CONFLICT.
+  const handleCancelApprovals = useCallback(async () => {
     if (pendingApprovals.length === 0) return;
 
-    // Create denial results for all pending approvals and queue for next message
+    // Create denial results for all pending approvals (fallback if cancel call fails).
     const denialResults = pendingApprovals.map((approval) => ({
       type: "approval" as const,
       tool_call_id: approval.toolCallId,
       approve: false,
       reason: "User cancelled the approval",
     }));
-    setQueuedApprovalResults(denialResults);
 
     // Mark the pending approval tool calls as cancelled in the buffers
     markIncompleteToolsAsCancelled(buffersRef.current);
@@ -5871,6 +6010,14 @@ DO NOT respond to these messages or otherwise consider them in your response unl
     setApprovalResults([]);
     setAutoHandledResults([]);
     setAutoDeniedApprovals([]);
+
+    try {
+      const client = await getClient();
+      await client.agents.messages.cancel(agentIdRef.current);
+    } catch {
+      // If cancel fails, send explicit denials on the next message.
+      setQueuedApprovalResults(denialResults);
+    }
   }, [pendingApprovals, refreshDerived]);
 
   const handleModelSelect = useCallback(

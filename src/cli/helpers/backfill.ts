@@ -261,28 +261,17 @@ export function backfillBuffers(buffers: Buffers, history: Message[]): void {
     }
   }
 
-  // Mark stray tool calls as closed
-  // Walk backwards: any pending tool_call before the first "transition" (non-pending-tool-call) is stray
-  let foundTransition = false;
-  for (let i = buffers.order.length - 1; i >= 0; i--) {
-    const lineId = buffers.order[i];
-    if (!lineId) continue;
-    const line = buffers.byId.get(lineId);
-
+  // Backfill is historical: never show tool calls as actively running.
+  // Any tool_call without a corresponding tool_return in the backfilled window is marked finished.
+  for (const id of buffers.order) {
+    const line = buffers.byId.get(id);
     if (line?.kind === "tool_call" && line.phase === "ready") {
-      if (foundTransition) {
-        // This is a stray - mark it closed
-        buffers.byId.set(lineId, {
-          ...line,
-          phase: "finished",
-          resultText: "[Tool return not found in history]",
-          resultOk: false,
-        });
-      }
-      // else: legit pending, leave it
-    } else {
-      // Hit something that's not a pending tool_call - transition point
-      foundTransition = true;
+      buffers.byId.set(id, {
+        ...line,
+        phase: "finished",
+        resultText: "[Interrupted - tool return not found in history]",
+        resultOk: false,
+      });
     }
   }
 }
