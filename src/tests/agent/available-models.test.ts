@@ -1,7 +1,7 @@
 /**
  * Tests for available model cache and context window parsing.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, mock, test } from "bun:test";
 
 import {
   clearAvailableModelsCache,
@@ -9,19 +9,19 @@ import {
 } from "../../agent/available-models";
 import { getClient } from "../../agent/client";
 
-vi.mock("../../agent/client", () => ({
-  getClient: vi.fn(),
+mock.module("../../agent/client", () => ({
+  getClient: mock(),
 }));
 
-const mockGetClient = getClient as unknown as ReturnType<typeof vi.fn>;
+const mockGetClient = getClient as unknown as ReturnType<typeof mock>;
 
 describe("getAvailableModelHandles", () => {
   beforeEach(() => {
     clearAvailableModelsCache();
-    vi.resetAllMocks();
+    mockGetClient.mockReset?.();
   });
 
-  it("prefers context_window over max_context_window", async () => {
+  test("prefers context_window over max_context_window", async () => {
     const modelsList = [
       {
         handle: "cliproxy/gpt-5-mini",
@@ -36,7 +36,7 @@ describe("getAvailableModelHandles", () => {
 
     mockGetClient.mockResolvedValue({
       models: {
-        list: vi.fn().mockResolvedValue(modelsList),
+        list: mock().mockResolvedValue(modelsList),
       },
     });
 
@@ -46,7 +46,7 @@ describe("getAvailableModelHandles", () => {
     expect(result.contextWindows?.get("cliproxy/gpt-5-strong")).toBe(16000);
   });
 
-  it("uses context_window_limit alias when present", async () => {
+  test("uses context_window_limit alias when present", async () => {
     const modelsList = [
       {
         handle: "cliproxy/gpt-5-alias",
@@ -56,7 +56,7 @@ describe("getAvailableModelHandles", () => {
 
     mockGetClient.mockResolvedValue({
       models: {
-        list: vi.fn().mockResolvedValue(modelsList),
+        list: mock().mockResolvedValue(modelsList),
       },
     });
 
@@ -65,7 +65,7 @@ describe("getAvailableModelHandles", () => {
     expect(result.contextWindows?.get("cliproxy/gpt-5-alias")).toBe(18000);
   });
 
-  it("uses max_context_window_limit alias when present", async () => {
+  test("uses max_context_window_limit alias when present", async () => {
     const modelsList = [
       {
         handle: "cliproxy/gpt-5-max-alias",
@@ -75,7 +75,7 @@ describe("getAvailableModelHandles", () => {
 
     mockGetClient.mockResolvedValue({
       models: {
-        list: vi.fn().mockResolvedValue(modelsList),
+        list: mock().mockResolvedValue(modelsList),
       },
     });
 

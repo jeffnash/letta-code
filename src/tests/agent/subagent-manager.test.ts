@@ -1,44 +1,40 @@
 /**
  * Tests for subagent manager helpers.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 
-vi.mock("../../agent/client", () => ({
-  getClient: vi.fn(),
-}));
-
-vi.mock("../../agent/context", () => ({
-  getCurrentAgentId: vi.fn(() => "agent-1"),
-}));
-
-vi.mock("../../agent/model", () => ({
-  getDefaultModel: vi.fn(),
-  resolveModel: vi.fn(),
-  resolveModelAsync: vi.fn(),
-}));
-
-import { getClient } from "../../agent/client";
-import { resolveModelAsync } from "../../agent/model";
+import * as clientModule from "../../agent/client";
+import * as contextModule from "../../agent/context";
+import * as modelModule from "../../agent/model";
 import { getPrimaryAgentModelHandle } from "../../agent/subagents/manager";
 
-const mockGetClient = getClient as unknown as ReturnType<typeof vi.fn>;
-const mockResolveModelAsync = resolveModelAsync as unknown as ReturnType<
-  typeof vi.fn
->;
-
 describe("getPrimaryAgentModelHandle", () => {
+  let mockGetClient: ReturnType<typeof spyOn>;
+  let mockGetCurrentAgentId: ReturnType<typeof spyOn>;
+  let mockResolveModelAsync: ReturnType<typeof spyOn>;
+
   beforeEach(() => {
-    vi.resetAllMocks();
+    mockGetClient?.mockRestore?.();
+    mockGetCurrentAgentId?.mockRestore?.();
+    mockResolveModelAsync?.mockRestore?.();
+
+    // Set up default mock for getCurrentAgentId
+    mockGetCurrentAgentId = spyOn(
+      contextModule,
+      "getCurrentAgentId",
+    ).mockReturnValue("agent-1");
   });
 
-  it("returns handle when present on llm_config", async () => {
-    mockGetClient.mockResolvedValue({
+  test("returns handle when present on llm_config", async () => {
+    mockGetClient = spyOn(clientModule, "getClient").mockResolvedValue({
       agents: {
-        retrieve: vi.fn().mockResolvedValue({
+        retrieve: mock().mockResolvedValue({
           llm_config: { handle: "openai/gpt-5.2" },
         }),
       },
-    });
+    } as unknown as Awaited<ReturnType<typeof clientModule.getClient>>);
+
+    mockResolveModelAsync = spyOn(modelModule, "resolveModelAsync");
 
     const result = await getPrimaryAgentModelHandle();
 
@@ -46,15 +42,19 @@ describe("getPrimaryAgentModelHandle", () => {
     expect(mockResolveModelAsync).not.toHaveBeenCalled();
   });
 
-  it("resolves handle from llm_config.model when handle missing", async () => {
-    mockGetClient.mockResolvedValue({
+  test("resolves handle from llm_config.model when handle missing", async () => {
+    mockGetClient = spyOn(clientModule, "getClient").mockResolvedValue({
       agents: {
-        retrieve: vi.fn().mockResolvedValue({
+        retrieve: mock().mockResolvedValue({
           llm_config: { model: "gpt-5.2" },
         }),
       },
-    });
-    mockResolveModelAsync.mockResolvedValue("openai/gpt-5.2");
+    } as unknown as Awaited<ReturnType<typeof clientModule.getClient>>);
+
+    mockResolveModelAsync = spyOn(
+      modelModule,
+      "resolveModelAsync",
+    ).mockResolvedValue("openai/gpt-5.2");
 
     const result = await getPrimaryAgentModelHandle();
 
@@ -62,27 +62,31 @@ describe("getPrimaryAgentModelHandle", () => {
     expect(mockResolveModelAsync).toHaveBeenCalledWith("gpt-5.2");
   });
 
-  it("returns undefined when resolution fails", async () => {
-    mockGetClient.mockResolvedValue({
+  test("returns undefined when resolution fails", async () => {
+    mockGetClient = spyOn(clientModule, "getClient").mockResolvedValue({
       agents: {
-        retrieve: vi.fn().mockResolvedValue({
+        retrieve: mock().mockResolvedValue({
           llm_config: { model: "unknown-model" },
         }),
       },
-    });
-    mockResolveModelAsync.mockResolvedValue(null);
+    } as unknown as Awaited<ReturnType<typeof clientModule.getClient>>);
+
+    mockResolveModelAsync = spyOn(
+      modelModule,
+      "resolveModelAsync",
+    ).mockResolvedValue(null);
 
     const result = await getPrimaryAgentModelHandle();
 
     expect(result).toBeUndefined();
   });
 
-  it("returns undefined when llm_config missing", async () => {
-    mockGetClient.mockResolvedValue({
+  test("returns undefined when llm_config missing", async () => {
+    mockGetClient = spyOn(clientModule, "getClient").mockResolvedValue({
       agents: {
-        retrieve: vi.fn().mockResolvedValue({}),
+        retrieve: mock().mockResolvedValue({}),
       },
-    });
+    } as unknown as Awaited<ReturnType<typeof clientModule.getClient>>);
 
     const result = await getPrimaryAgentModelHandle();
 

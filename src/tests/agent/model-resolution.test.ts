@@ -1,7 +1,7 @@
 /**
  * Tests for model resolution utilities including dynamic model support.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import {
   formatAvailableModels,
   getModelInfo,
@@ -11,34 +11,25 @@ import {
   resolveModelAsync,
 } from "../../agent/model";
 
-// Mock the available-models module
-vi.mock("../../agent/available-models", () => ({
-  getAvailableModelHandles: vi.fn(),
-  getModelContextWindow: vi.fn(),
-}));
-
-import {
-  getAvailableModelHandles,
-  getModelContextWindow,
-} from "../../agent/available-models";
+import * as availableModelsModule from "../../agent/available-models";
 
 describe("resolveModel (synchronous)", () => {
-  it("should resolve a static model by ID", () => {
+  test("should resolve a static model by ID", () => {
     const result = resolveModel("sonnet-4.5");
     expect(result).toBe("anthropic/claude-sonnet-4-5-20250929");
   });
 
-  it("should resolve a static model by handle", () => {
+  test("should resolve a static model by handle", () => {
     const result = resolveModel("anthropic/claude-sonnet-4-5-20250929");
     expect(result).toBe("anthropic/claude-sonnet-4-5-20250929");
   });
 
-  it("should return null for unknown model", () => {
+  test("should return null for unknown model", () => {
     const result = resolveModel("unknown-model-xyz");
     expect(result).toBeNull();
   });
 
-  it("should return null for dynamic model (not in static list)", () => {
+  test("should return null for dynamic model (not in static list)", () => {
     // Use a fictional model name that will never be in models.json
     const result = resolveModel("fictional-dynamic-model-xyz");
     expect(result).toBeNull();
@@ -46,41 +37,58 @@ describe("resolveModel (synchronous)", () => {
 });
 
 describe("resolveModelAsync", () => {
+  let mockGetAvailableModelHandles: ReturnType<typeof spyOn>;
+
   beforeEach(() => {
-    vi.clearAllMocks();
+    mockGetAvailableModelHandles?.mockRestore?.();
   });
 
-  it("should resolve a static model by ID without server call", async () => {
+  test("should resolve a static model by ID without server call", async () => {
+    mockGetAvailableModelHandles = spyOn(
+      availableModelsModule,
+      "getAvailableModelHandles",
+    );
+
     const result = await resolveModelAsync("sonnet-4.5");
     expect(result).toBe("anthropic/claude-sonnet-4-5-20250929");
-    expect(getAvailableModelHandles).not.toHaveBeenCalled();
+    expect(mockGetAvailableModelHandles).not.toHaveBeenCalled();
   });
 
-  it("should resolve a static model by handle without server call", async () => {
+  test("should resolve a static model by handle without server call", async () => {
+    mockGetAvailableModelHandles = spyOn(
+      availableModelsModule,
+      "getAvailableModelHandles",
+    );
+
     const result = await resolveModelAsync(
       "anthropic/claude-sonnet-4-5-20250929",
     );
     expect(result).toBe("anthropic/claude-sonnet-4-5-20250929");
-    expect(getAvailableModelHandles).not.toHaveBeenCalled();
+    expect(mockGetAvailableModelHandles).not.toHaveBeenCalled();
   });
 
-  it("should resolve a dynamic model from server by exact handle", async () => {
-    (
-      getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>
+  test("should resolve a dynamic model from server by exact handle", async () => {
+    mockGetAvailableModelHandles = spyOn(
+      availableModelsModule,
+      "getAvailableModelHandles",
     ).mockResolvedValue({
-      handles: new Set(["cliproxy/fictional-dynamic-xyz", "cliproxy/other-model"]),
+      handles: new Set([
+        "cliproxy/fictional-dynamic-xyz",
+        "cliproxy/other-model",
+      ]),
       source: "network",
       fetchedAt: Date.now(),
     });
 
     const result = await resolveModelAsync("cliproxy/fictional-dynamic-xyz");
     expect(result).toBe("cliproxy/fictional-dynamic-xyz");
-    expect(getAvailableModelHandles).toHaveBeenCalled();
+    expect(mockGetAvailableModelHandles).toHaveBeenCalled();
   });
 
-  it("should resolve a dynamic model from server by short name", async () => {
-    (
-      getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>
+  test("should resolve a dynamic model from server by short name", async () => {
+    mockGetAvailableModelHandles = spyOn(
+      availableModelsModule,
+      "getAvailableModelHandles",
     ).mockResolvedValue({
       handles: new Set(["cliproxy/fictional-dynamic-xyz"]),
       source: "network",
@@ -91,9 +99,10 @@ describe("resolveModelAsync", () => {
     expect(result).toBe("cliproxy/fictional-dynamic-xyz");
   });
 
-  it("should return null if dynamic model not found on server", async () => {
-    (
-      getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>
+  test("should return null if dynamic model not found on server", async () => {
+    mockGetAvailableModelHandles = spyOn(
+      availableModelsModule,
+      "getAvailableModelHandles",
     ).mockResolvedValue({
       handles: new Set(["cliproxy/other-model"]),
       source: "network",
@@ -104,9 +113,10 @@ describe("resolveModelAsync", () => {
     expect(result).toBeNull();
   });
 
-  it("should return null if server call fails", async () => {
-    (
-      getAvailableModelHandles as unknown as ReturnType<typeof vi.fn>
+  test("should return null if server call fails", async () => {
+    mockGetAvailableModelHandles = spyOn(
+      availableModelsModule,
+      "getAvailableModelHandles",
     ).mockRejectedValue(new Error("Network error"));
 
     // Use a fictional model that's not in static list
@@ -116,39 +126,42 @@ describe("resolveModelAsync", () => {
 });
 
 describe("getModelInfo", () => {
-  it("should return info for static model by ID", () => {
+  test("should return info for static model by ID", () => {
     const info = getModelInfo("sonnet-4.5");
     expect(info).not.toBeNull();
     expect(info?.id).toBe("sonnet-4.5");
     expect(info?.handle).toBe("anthropic/claude-sonnet-4-5-20250929");
   });
 
-  it("should return info for static model by handle", () => {
+  test("should return info for static model by handle", () => {
     const info = getModelInfo("anthropic/claude-sonnet-4-5-20250929");
     expect(info).not.toBeNull();
     expect(info?.id).toBe("sonnet-4.5");
   });
 
-  it("should return null for unknown model", () => {
+  test("should return null for unknown model", () => {
     const info = getModelInfo("unknown-model");
     expect(info).toBeNull();
   });
 });
 
 describe("getModelUpdateArgs", () => {
+  let mockGetModelContextWindow: ReturnType<typeof spyOn>;
+
   beforeEach(() => {
-    vi.clearAllMocks();
+    mockGetModelContextWindow?.mockRestore?.();
   });
 
-  it("should return updateArgs for static model", () => {
+  test("should return updateArgs for static model", () => {
     const args = getModelUpdateArgs("sonnet-4.5");
     expect(args).toBeDefined();
     expect(args?.context_window).toBe(180000);
   });
 
-  it("should return defaults for dynamic model", () => {
-    (
-      getModelContextWindow as unknown as ReturnType<typeof vi.fn>
+  test("should return defaults for dynamic model", () => {
+    mockGetModelContextWindow = spyOn(
+      availableModelsModule,
+      "getModelContextWindow",
     ).mockReturnValue(undefined);
 
     // Use a fictional model that's not in static list
@@ -158,9 +171,10 @@ describe("getModelUpdateArgs", () => {
     expect(args?.max_output_tokens).toBe(32000); // Default
   });
 
-  it("should use cached context window for dynamic model", () => {
-    (
-      getModelContextWindow as unknown as ReturnType<typeof vi.fn>
+  test("should use cached context window for dynamic model", () => {
+    mockGetModelContextWindow = spyOn(
+      availableModelsModule,
+      "getModelContextWindow",
     ).mockReturnValue(256000);
 
     // Use a fictional model that's not in static list
@@ -169,14 +183,14 @@ describe("getModelUpdateArgs", () => {
     expect(args?.context_window).toBe(256000);
   });
 
-  it("should return undefined for undefined input", () => {
+  test("should return undefined for undefined input", () => {
     const args = getModelUpdateArgs(undefined);
     expect(args).toBeUndefined();
   });
 });
 
 describe("isDynamicModel", () => {
-  it("should return false for static model", () => {
+  test("should return false for static model", () => {
     expect(isDynamicModel("sonnet-4.5")).toBe(false);
     expect(isDynamicModel("anthropic/claude-sonnet-4-5-20250929")).toBe(false);
     // zai-glm-4.7 is now in models.json, so it's static
@@ -184,7 +198,7 @@ describe("isDynamicModel", () => {
     expect(isDynamicModel("cliproxy/zai-glm-4.7")).toBe(false);
   });
 
-  it("should return true for dynamic model", () => {
+  test("should return true for dynamic model", () => {
     // Use fictional models that will never be in models.json
     expect(isDynamicModel("fictional-dynamic-xyz")).toBe(true);
     expect(isDynamicModel("cliproxy/fictional-dynamic-xyz")).toBe(true);
@@ -193,7 +207,7 @@ describe("isDynamicModel", () => {
 });
 
 describe("formatAvailableModels", () => {
-  it("should format static models", () => {
+  test("should format static models", () => {
     const formatted = formatAvailableModels();
     expect(formatted).toContain("sonnet-4.5");
     expect(formatted).toContain("anthropic/claude-sonnet-4-5-20250929");
