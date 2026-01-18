@@ -4568,6 +4568,96 @@ export default function App({
           return { submitted: true };
         }
 
+        // Special handling for /repair command - fix corrupted message history
+        if (msg.trim() === "/repair") {
+          const cmdId = uid("cmd");
+          buffersRef.current.byId.set(cmdId, {
+            kind: "command",
+            id: cmdId,
+            input: msg,
+            output: "Repairing message history...",
+            phase: "running",
+          });
+          buffersRef.current.order.push(cmdId);
+          refreshDerived();
+
+          setCommandRunning(true);
+
+          try {
+            const client = await getClient();
+
+            // Call the repair-message-history endpoint
+            // Note: Using fetch directly since SDK may not have this endpoint yet
+            const baseUrl = client.baseURL || "";
+            const response = await fetch(
+              `${baseUrl}/v1/agents/${agentId}/repair-message-history`,
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${(client as unknown as { authToken?: string }).authToken || ""}`,
+                },
+              },
+            );
+
+            if (!response.ok) {
+              const errorText = await response.text();
+              throw new Error(`API error: ${response.status} - ${errorText}`);
+            }
+
+            const result = (await response.json()) as {
+              status: "ok" | "repaired" | "error";
+              message: string;
+              orphaned_tool_calls: Array<{
+                message_id: string;
+                tool_call_id: string;
+                tool_name: string;
+                reason: string;
+              }>;
+              removed_message_ids: string[];
+            };
+
+            let outputMsg = "";
+            if (result.status === "ok") {
+              outputMsg = "✓ No issues found in message history";
+            } else if (result.status === "repaired") {
+              outputMsg = `✓ Repaired: ${result.message}`;
+              if (result.orphaned_tool_calls.length > 0) {
+                outputMsg += "\n\nOrphaned tool calls fixed:";
+                for (const tc of result.orphaned_tool_calls) {
+                  outputMsg += `\n  • ${tc.tool_name} (${tc.reason})`;
+                }
+              }
+            } else {
+              outputMsg = `⚠ ${result.message}`;
+            }
+
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: msg,
+              output: outputMsg,
+              phase: "finished",
+              success: result.status !== "error",
+            });
+            refreshDerived();
+          } catch (error) {
+            const errorDetails = formatErrorDetails(error, agentId);
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: msg,
+              output: `Failed: ${errorDetails}`,
+              phase: "finished",
+              success: false,
+            });
+            refreshDerived();
+          } finally {
+            setCommandRunning(false);
+          }
+          return { submitted: true };
+        }
+
         // Special handling for /compact command - summarize conversation history
         if (msg.trim() === "/compact") {
           const cmdId = uid("cmd");

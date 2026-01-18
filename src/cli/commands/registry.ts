@@ -332,6 +332,15 @@ export const commands: Record<string, Command> = {
       return "Toggling token streaming...";
     },
   },
+  "/repair": {
+    desc: "Repair corrupted message history (fixes orphaned tool_use errors)",
+    hidden: false,
+    order: 47,
+    handler: () => {
+      // Handled specially in App.tsx to call repair-message-history API
+      return "Repairing message history...";
+    },
+  },
   "/compact": {
     desc: "Summarize conversation history (compaction)",
     hidden: true,
