@@ -39,7 +39,8 @@ import {
 } from "../agent/approval-recovery";
 import { prefetchAvailableModelHandles } from "../agent/available-models";
 import { getResumeData } from "../agent/check-approval";
-import { getClient } from "../agent/client";
+import { getClient, getServerUrl } from "../agent/client";
+import packageJson from "../../package.json";
 import { getCurrentAgentId, setCurrentAgentId } from "../agent/context";
 import { type AgentProvenance, createAgent } from "../agent/create";
 import { ISOLATED_BLOCK_LABELS } from "../agent/memory";
@@ -4689,18 +4690,25 @@ export default function App({
           setCommandRunning(true);
 
           try {
-            const client = await getClient();
+            // Call getClient() first so token refresh can run
+            await getClient();
+
+            // Get base URL and API key from proper sources (not SDK internals)
+            const baseUrl = getServerUrl();
+            const settings = await settingsManager.getSettingsWithSecureTokens();
+            const apiKey = process.env.LETTA_API_KEY || settings.env?.LETTA_API_KEY || "";
 
             // Call the repair-message-history endpoint
             // Note: Using fetch directly since SDK may not have this endpoint yet
-            const baseUrl = client.baseURL || "";
             const response = await fetch(
               `${baseUrl}/v1/agents/${agentId}/repair-message-history`,
               {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
-                  Authorization: `Bearer ${(client as unknown as { authToken?: string }).authToken || ""}`,
+                  Authorization: `Bearer ${apiKey}`,
+                  "X-Letta-Source": "letta-code",
+                  "User-Agent": `letta-code/${packageJson.version}`,
                 },
               },
             );
