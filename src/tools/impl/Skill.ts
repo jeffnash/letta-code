@@ -149,7 +149,7 @@ async function readSkillContent(
   try {
     const content = await readFile(projectSkillPath, "utf-8");
     return { content, path: projectSkillPath };
-  } catch (primaryError) {
+  } catch {
     // Fallback: check for bundled skills in a repo-level skills directory (legacy)
     try {
       const bundledSkillsDir = join(process.cwd(), "skills", "skills");
@@ -157,8 +157,11 @@ async function readSkillContent(
       const content = await readFile(bundledSkillPath, "utf-8");
       return { content, path: bundledSkillPath };
     } catch {
-      // If all fallbacks fail, rethrow the original error
-      throw primaryError;
+      // If all fallbacks fail, throw a helpful error message (LET-7101)
+      // Suggest refresh in case skills sync is still running in background
+      throw new Error(
+        `Skill "${skillId}" not found. If you recently added this skill, try Skill({ command: "refresh" }) to re-scan the skills directory.`,
+      );
     }
   }
 }
@@ -283,8 +286,11 @@ export async function skill(args: SkillArgs): Promise<SkillResult> {
           const { content: skillContent, path: skillPath } =
             await readSkillContent(skillId, skillsDir);
 
-          // Replace placeholder if this is the first skill
-          if (currentValue === "[CURRENTLY EMPTY]") {
+          // Replace placeholder if this is the first skill (support old and new formats)
+          if (
+            currentValue === "No skills currently loaded." ||
+            currentValue === "[CURRENTLY EMPTY]"
+          ) {
             currentValue = "";
           }
 
@@ -321,7 +327,9 @@ export async function skill(args: SkillArgs): Promise<SkillResult> {
 
         // Now we can report success
         for (const skillId of preparedSkills) {
-          results.push(`"${skillId}" loaded`);
+          results.push(
+            `"${skillId}" loaded. Contents have been placed into your memory - check your 'loaded_skills' block for instructions.`,
+          );
         }
 
         // Update the cached flag
@@ -378,7 +386,7 @@ export async function skill(args: SkillArgs): Promise<SkillResult> {
       // Clean up the value
       currentValue = currentValue.trim();
       if (currentValue === "") {
-        currentValue = "[CURRENTLY EMPTY]";
+        currentValue = "No skills currently loaded.";
       }
 
       // Update the block

@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import type { AgentState } from "@letta-ai/letta-client/resources/agents/agents";
 import { getClient } from "./client";
 import { getModelUpdateArgs } from "./model";
-import { updateAgentLLMConfig, linkToolsToAgent } from "./modify";
+import { linkToolsToAgent, updateAgentLLMConfig } from "./modify";
 
 export interface ImportAgentOptions {
   filePath: string;

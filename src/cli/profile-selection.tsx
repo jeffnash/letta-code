@@ -120,7 +120,9 @@ function ProfileSelectionUI({
       const fetchedOptions = await Promise.all(
         optionsToFetch.map(async (opt) => {
           try {
-            const agent = await client.agents.retrieve(opt.agentId);
+            const agent = await client.agents.retrieve(opt.agentId, {
+              include: ["agent.blocks"],
+            });
             return { ...opt, agent };
           } catch {
             return { ...opt, agent: null };
@@ -275,7 +277,7 @@ function ProfileSelectionUI({
                 {selectedIndex === totalItems - 1 ? "→ " : "  "}
                 Create a new agent
               </Text>
-              <Text dimColor> (--new)</Text>
+              <Text dimColor> (--new-agent)</Text>
             </Box>
           </Box>
 

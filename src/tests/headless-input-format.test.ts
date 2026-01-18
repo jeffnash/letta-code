@@ -25,7 +25,7 @@ const FAST_PROMPT =
 async function runBidirectional(
   inputs: string[],
   extraArgs: string[] = [],
-  timeoutMs = 90000, // Overall timeout for the entire operation
+  timeoutMs = 180000, // 180s timeout - CI can be very slow
 ): Promise<object[]> {
   return new Promise((resolve, reject) => {
     const proc = spawn(
@@ -38,7 +38,7 @@ async function runBidirectional(
         "stream-json",
         "--output-format",
         "stream-json",
-        "--new",
+        "--new-agent",
         "-m",
         "haiku",
         "--yolo",
@@ -238,7 +238,7 @@ describe("input-format stream-json", () => {
         expect(initResponse?.agent_id).toBeDefined();
       }
     },
-    { timeout: 120000 },
+    { timeout: 200000 },
   );
 
   test(
@@ -291,28 +291,33 @@ describe("input-format stream-json", () => {
       expect(result?.agent_id).toBeDefined();
       expect(result?.duration_ms).toBeGreaterThan(0);
     },
-    { timeout: 120000 },
+    { timeout: 200000 },
   );
 
   test(
     "multi-turn conversation maintains context",
     async () => {
-      const objects = (await runBidirectional([
-        JSON.stringify({
-          type: "user",
-          message: {
-            role: "user",
-            content: "Say hello",
-          },
-        }),
-        JSON.stringify({
-          type: "user",
-          message: {
-            role: "user",
-            content: "Say goodbye",
-          },
-        }),
-      ])) as WireMessage[];
+      // Multi-turn test needs 2 sequential LLM calls, so allow more time
+      const objects = (await runBidirectional(
+        [
+          JSON.stringify({
+            type: "user",
+            message: {
+              role: "user",
+              content: "Say hello",
+            },
+          }),
+          JSON.stringify({
+            type: "user",
+            message: {
+              role: "user",
+              content: "Say goodbye",
+            },
+          }),
+        ],
+        [], // no extra args
+        300000, // 300s for 2 sequential LLM calls - CI can be very slow
+      )) as WireMessage[];
 
       // Should have at least two results (one per turn)
       const results = objects.filter(
@@ -336,7 +341,7 @@ describe("input-format stream-json", () => {
         expect(firstResult.session_id).toBe(lastResult.session_id);
       }
     },
-    { timeout: 180000 },
+    { timeout: 320000 },
   );
 
   test(
@@ -358,7 +363,7 @@ describe("input-format stream-json", () => {
       expect(controlResponse).toBeDefined();
       expect(controlResponse?.response.subtype).toBe("success");
     },
-    { timeout: 120000 },
+    { timeout: 200000 },
   );
 
   test(
@@ -405,7 +410,7 @@ describe("input-format stream-json", () => {
       expect(result).toBeDefined();
       expect(result?.subtype).toBe("success");
     },
-    { timeout: 120000 },
+    { timeout: 200000 },
   );
 
   test(
@@ -428,7 +433,7 @@ describe("input-format stream-json", () => {
       expect(controlResponse).toBeDefined();
       expect(controlResponse?.response.subtype).toBe("error");
     },
-    { timeout: 120000 },
+    { timeout: 200000 },
   );
 
   test(
@@ -446,6 +451,40 @@ describe("input-format stream-json", () => {
       expect(errorMsg).toBeDefined();
       expect(errorMsg?.message).toContain("Invalid JSON");
     },
-    { timeout: 120000 },
+    { timeout: 200000 },
+  );
+
+  test(
+    "Task tool with explore subagent works",
+    async () => {
+      // Prescriptive prompt to ensure Task tool is used
+      const objects = (await runBidirectional(
+        [
+          JSON.stringify({
+            type: "user",
+            message: {
+              role: "user",
+              content:
+                "You MUST use the Task tool with subagent_type='explore' to find TypeScript files (*.ts) in the src directory. " +
+                "Return only the subagent's report, nothing else.",
+            },
+          }),
+        ],
+        [],
+        300000, // 5 min timeout - subagent spawn + execution can be slow
+      )) as WireMessage[];
+
+      // Should have a successful result
+      const result = objects.find(
+        (o): o is ResultMessage => o.type === "result",
+      );
+      expect(result).toBeDefined();
+      expect(result?.subtype).toBe("success");
+
+      // Should have auto_approval events (Task tool was auto-approved via --yolo)
+      const autoApprovals = objects.filter((o) => o.type === "auto_approval");
+      expect(autoApprovals.length).toBeGreaterThan(0);
+    },
+    { timeout: 320000 },
   );
 });

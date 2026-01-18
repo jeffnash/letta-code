@@ -1,5 +1,6 @@
 import { Box, Text, useInput } from "ink";
 import { memo, useState } from "react";
+import { useProgressIndicator } from "../hooks/useProgressIndicator";
 import { useTerminalWidth } from "../hooks/useTerminalWidth";
 import { useTextInputCursor } from "../hooks/useTextInputCursor";
 import { colors } from "./colors";
@@ -8,6 +9,7 @@ type Props = {
   onApprove: () => void;
   onApproveAndAcceptEdits: () => void;
   onKeepPlanning: (reason: string) => void;
+  onCancel: () => void; // For CTRL-C to queue denial (like other approval screens)
   isFocused?: boolean;
 };
 
@@ -27,6 +29,7 @@ export const StaticPlanApproval = memo(
     onApprove,
     onApproveAndAcceptEdits,
     onKeepPlanning,
+    onCancel,
     isFocused = true,
   }: Props) => {
     const [selectedOption, setSelectedOption] = useState(0);
@@ -37,6 +40,7 @@ export const StaticPlanApproval = memo(
       clear,
     } = useTextInputCursor();
     const columns = useTerminalWidth();
+    useProgressIndicator();
 
     const customOptionIndex = 2;
     const maxOptionIndex = customOptionIndex;
@@ -48,9 +52,9 @@ export const StaticPlanApproval = memo(
       (input, key) => {
         if (!isFocused) return;
 
-        // CTRL-C: keep planning with cancel message
+        // CTRL-C: cancel and queue denial (like other approval screens)
         if (key.ctrl && input === "c") {
-          onKeepPlanning("User pressed CTRL-C to cancel");
+          onCancel();
           return;
         }
 

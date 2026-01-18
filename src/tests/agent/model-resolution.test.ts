@@ -2,6 +2,7 @@
  * Tests for model resolution utilities including dynamic model support.
  */
 import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import * as availableModelsModule from "../../agent/available-models";
 import {
   formatAvailableModels,
   getModelInfo,
@@ -10,8 +11,6 @@ import {
   resolveModel,
   resolveModelAsync,
 } from "../../agent/model";
-
-import * as availableModelsModule from "../../agent/available-models";
 
 describe("resolveModel (synchronous)", () => {
   test("should resolve a static model by ID", () => {

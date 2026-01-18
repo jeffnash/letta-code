@@ -1,6 +1,9 @@
-import { createHash } from "crypto";
 import type Letta from "@letta-ai/letta-client";
-import { AuthenticationError, PermissionDeniedError } from "@letta-ai/letta-client";
+import {
+  AuthenticationError,
+  PermissionDeniedError,
+} from "@letta-ai/letta-client";
+import { createHash } from "crypto";
 import { getModelInfo } from "../agent/model";
 import { getAllSubagentConfigs } from "../agent/subagents";
 import { INTERRUPTED_BY_USER } from "../constants";
@@ -8,6 +11,15 @@ import { telemetry } from "../telemetry";
 import { TOOL_DEFINITIONS, type ToolName } from "./toolDefinitions";
 
 export const TOOL_NAMES = Object.keys(TOOL_DEFINITIONS) as ToolName[];
+const STREAMING_SHELL_TOOLS = new Set([
+  "Bash",
+  "shell_command",
+  "ShellCommand",
+  "shell",
+  "Shell",
+  "run_shell_command",
+  "RunShellCommand",
+]);
 
 // Maps internal tool names to server/model-facing tool names
 // This allows us to have multiple implementations (e.g., write_file_gemini, Write from Anthropic)
@@ -593,6 +605,12 @@ export function clipToolReturn(
 ): string {
   if (!text) return text;
 
+  // Don't clip user rejection reasons - they contain important feedback
+  // All denials use format: "Error: request to call tool denied. User reason: ..."
+  if (text.includes("request to call tool denied")) {
+    return text;
+  }
+
   // First apply character limit to avoid extremely long text
   let clipped = text;
   if (text.length > maxChars) {
@@ -708,13 +726,17 @@ function flattenToolResponse(result: unknown): string {
  *
  * @param name - The name of the tool to execute
  * @param args - Arguments object to pass to the tool
- * @param options - Optional execution options (abort signal, tool call ID)
+ * @param options - Optional execution options (abort signal, tool call ID, streaming callback)
  * @returns Promise with the tool's execution result including status and optional stdout/stderr
  */
 export async function executeTool(
   name: string,
   args: ToolArgs,
-  options?: { signal?: AbortSignal; toolCallId?: string },
+  options?: {
+    signal?: AbortSignal;
+    toolCallId?: string;
+    onOutput?: (chunk: string, stream: "stdout" | "stderr") => void;
+  },
 ): Promise<ToolExecutionResult> {
   const internalName = resolveInternalToolName(name);
   if (!internalName) {
@@ -738,9 +760,13 @@ export async function executeTool(
     // Inject options for tools that support them without altering schemas
     let enhancedArgs = args;
 
-    // Inject abort signal for Bash tool
-    if (internalName === "Bash" && options?.signal) {
-      enhancedArgs = { ...enhancedArgs, signal: options.signal };
+    if (STREAMING_SHELL_TOOLS.has(internalName)) {
+      if (options?.signal) {
+        enhancedArgs = { ...enhancedArgs, signal: options.signal };
+      }
+      if (options?.onOutput) {
+        enhancedArgs = { ...enhancedArgs, onOutput: options.onOutput };
+      }
     }
 
     // Inject toolCallId and abort signal for Task tool
@@ -928,7 +954,11 @@ export async function upsertToolsToServer(client: Letta): Promise<void> {
     try {
       const timeoutPromise = new Promise<never>((_, reject) => {
         setTimeout(() => {
-          reject(new Error(`Tool upsert operation timed out (${OPERATION_TIMEOUT / 1000}s)`));
+          reject(
+            new Error(
+              `Tool upsert operation timed out (${OPERATION_TIMEOUT / 1000}s)`,
+            ),
+          );
         }, OPERATION_TIMEOUT);
       });
 
@@ -962,7 +992,10 @@ export async function upsertToolsToServer(client: Letta): Promise<void> {
       const elapsed = Date.now() - attemptStartTime;
       const totalElapsed = Date.now() - startTime;
 
-      if (error instanceof AuthenticationError || error instanceof PermissionDeniedError) {
+      if (
+        error instanceof AuthenticationError ||
+        error instanceof PermissionDeniedError
+      ) {
         throw new Error(
           `Authentication failed. Please check your LETTA_API_KEY.\n` +
             `Run 'rm ~/.letta/settings.json' and restart to re-authenticate.\n` +
@@ -977,7 +1010,9 @@ export async function upsertToolsToServer(client: Letta): Promise<void> {
         console.error(
           `Tool upsert attempt ${retryCount + 1} failed after ${elapsed}ms. Retrying in ${backoffDelay}ms... (${Math.round(remainingTime / 1000)}s remaining)`,
         );
-        console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(
+          `Error: ${error instanceof Error ? error.message : String(error)}`,
+        );
 
         await new Promise((resolve) => setTimeout(resolve, backoffDelay));
         return attemptUpsert(retryCount + 1);

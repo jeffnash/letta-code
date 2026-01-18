@@ -48,7 +48,9 @@ async function fetchFromNetwork(): Promise<CacheEntry> {
   const modelsList = await client.models.list();
 
   // Client-side safety: only expose CLIProxy models, regardless of what the server returns.
-  const cliproxyModels = modelsList.filter((m) => m.handle?.startsWith("cliproxy/"));
+  const cliproxyModels = modelsList.filter((m) =>
+    m.handle?.startsWith("cliproxy/"),
+  );
 
   const handles = new Set(
     cliproxyModels.map((m) => m.handle).filter((h): h is string => !!h),

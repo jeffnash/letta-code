@@ -8,7 +8,7 @@ import type {
   OpenAIModelSettings,
 } from "@letta-ai/letta-client/resources/agents/agents";
 import type { LlmConfig } from "@letta-ai/letta-client/resources/models/models";
-import { ANTHROPIC_PROVIDER_NAME } from "../providers/anthropic-provider";
+import { OPENAI_CODEX_PROVIDER_NAME } from "../providers/openai-codex-provider";
 import { getClient } from "./client";
 
 type ModelSettings =
@@ -25,11 +25,15 @@ function buildModelSettings(
   modelHandle: string,
   updateArgs?: Record<string, unknown>,
 ): ModelSettings {
-  const isOpenAI = modelHandle.startsWith("openai/");
-  // Include our custom Anthropic OAuth provider (claude-pro-max)
+  // Include our custom ChatGPT OAuth provider (chatgpt-plus-pro)
+  const isOpenAI =
+    modelHandle.startsWith("openai/") ||
+    modelHandle.startsWith(`${OPENAI_CODEX_PROVIDER_NAME}/`);
+  // Include legacy custom Anthropic OAuth provider (claude-pro-max)
   const isAnthropic =
     modelHandle.startsWith("anthropic/") ||
-    modelHandle.startsWith(`${ANTHROPIC_PROVIDER_NAME}/`);
+    modelHandle.startsWith("claude-pro-max/");
+  const isZai = modelHandle.startsWith("zai/");
   const isGoogleAI = modelHandle.startsWith("google_ai/");
   const isGoogleVertex = modelHandle.startsWith("google_vertex/");
   const isOpenRouter = modelHandle.startsWith("openrouter/");
@@ -71,6 +75,13 @@ function buildModelSettings(
       };
     }
     settings = anthropicSettings;
+  } else if (isZai) {
+    // Zai uses the same model_settings structure as other providers.
+    // Ensure parallel_tool_calls is enabled.
+    settings = {
+      provider_type: "zai",
+      parallel_tool_calls: true,
+    };
   } else if (isGoogleAI) {
     const googleSettings: GoogleAIModelSettings & { temperature?: number } = {
       provider_type: "google_ai",
@@ -265,7 +276,9 @@ export async function linkToolsToAgent(agentId: string): Promise<LinkResult> {
         .filter((name): name is string => typeof name === "string"),
     );
 
-    const { getServerToolName, getToolNames } = await import("../tools/manager");
+    const { getServerToolName, getToolNames } = await import(
+      "../tools/manager"
+    );
     const lettaCodeToolNames = getToolNames();
 
     const toolsToAdd = lettaCodeToolNames.filter((internalName) => {
@@ -331,7 +344,9 @@ export interface UnlinkResult {
  * Remove all Letta Code tools from an agent.
  * This detaches client-side tools from the agent, typically before switching toolsets.
  */
-export async function unlinkToolsFromAgent(agentId: string): Promise<UnlinkResult> {
+export async function unlinkToolsFromAgent(
+  agentId: string,
+): Promise<UnlinkResult> {
   try {
     const client = await getClient();
 
@@ -348,7 +363,9 @@ export async function unlinkToolsFromAgent(agentId: string): Promise<UnlinkResul
         .map((t) => [t.name as string, t.id as string]),
     );
 
-    const { getAllLettaToolNames, getServerToolName } = await import("../tools/manager");
+    const { getAllLettaToolNames, getServerToolName } = await import(
+      "../tools/manager"
+    );
     const allLettaToolNames = getAllLettaToolNames();
 
     // Find tools to remove (any Letta Code tool currently attached)

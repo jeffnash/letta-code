@@ -48,6 +48,8 @@ export interface CreateAgentResult {
 
 export interface CreateAgentOptions {
   name?: string;
+  /** Agent description shown in /agents selector */
+  description?: string;
   model?: string;
   embeddingModel?: string;
   updateArgs?: Record<string, unknown>;
@@ -310,26 +312,14 @@ export async function createAgent(
   // Track provenance: which blocks were created
   // Note: We no longer reuse shared blocks - each agent gets fresh blocks
   const blockProvenance: BlockProvenance[] = [];
-  const blockIds: string[] = [];
 
-  // Create all blocks fresh for the new agent
+  // Mark new blocks for provenance tracking (actual creation happens in agents.create)
   for (const block of filteredMemoryBlocks) {
-    try {
-      const createdBlock = await client.blocks.create(block);
-      if (!createdBlock.id) {
-        throw new Error(`Created block ${block.label} has no ID`);
-      }
-      blockIds.push(createdBlock.id);
-      blockProvenance.push({ label: block.label, source: "new" });
-    } catch (error) {
-      console.error(`Failed to create block ${block.label}:`, error);
-      throw error;
-    }
+    blockProvenance.push({ label: block.label, source: "new" });
   }
 
-  // Add any referenced block IDs (existing blocks to attach)
+  // Mark referenced blocks for provenance tracking
   for (const blockId of referencedBlockIds) {
-    blockIds.push(blockId);
     blockProvenance.push({ label: blockId, source: "shared" });
   }
 
@@ -353,22 +343,31 @@ export async function createAgent(
     systemPromptContent = `${systemPromptContent}\n\n${options.systemPromptAppend}`;
   }
 
-  // Create agent with all block IDs (existing + newly created)
+  // Create agent with inline memory blocks (LET-7101: single API call instead of N+1)
+  // - memory_blocks: new blocks to create inline
+  // - block_ids: references to existing blocks (for shared memory)
   const tags = ["origin:letta-code"];
   if (process.env.LETTA_CODE_AGENT_ROLE === "subagent") {
     tags.push("role:subagent");
   }
 
+  const agentDescription =
+    options.description ?? `Letta Code agent created in ${process.cwd()}`;
+
   const agent = await client.agents.create({
     agent_type: "letta_v1_agent" as AgentType,
     system: systemPromptContent,
     name,
-    description: `Letta Code agent created in ${process.cwd()}`,
+    description: agentDescription,
     embedding: embeddingModelVal,
     model: modelHandle,
     context_window_limit: contextWindow,
     tools: toolNames,
-    block_ids: blockIds,
+    // New blocks created inline with agent (saves ~2s of sequential API calls)
+    memory_blocks:
+      filteredMemoryBlocks.length > 0 ? filteredMemoryBlocks : undefined,
+    // Referenced block IDs (existing blocks to attach)
+    block_ids: referencedBlockIds.length > 0 ? referencedBlockIds : undefined,
     tags,
     // should be default off, but just in case
     include_base_tools: false,

@@ -11,8 +11,8 @@ import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseFrontmatter } from "../utils/frontmatter";
 import type { Letta } from "@letta-ai/letta-client";
+import { parseFrontmatter } from "../utils/frontmatter";
 
 /**
  * Get the bundled skills directory path
@@ -488,52 +488,124 @@ export function formatSkillsForMemory(
   return formatSkillsAsTree(skills, skillsDirectory);
 }
 
+// ============================================================================
+// Skills Sync with Hash-Based Caching (Phase 2.5 - LET-7101)
+// ============================================================================
+
+import { createHash } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+
 /**
- * Options for refreshing skills on an agent
+ * Get the project-local skills hash file path.
+ * Uses .letta/skills-hash.json in the current working directory
+ * because the skills block content depends on the project's .skills/ folder.
  */
-export interface RefreshSkillsOptions {
-  /** Letta API client */
-  client: Letta;
-  /** Agent ID to update */
-  agentId: string;
-  /** Optional custom skills directory path */
-  skillsDirectory?: string;
-  /** Callback for logging warnings (defaults to console.warn) */
-  onWarning?: (message: string) => void;
+function getSkillsHashFilePath(): string {
+  return join(process.cwd(), ".letta", "skills-hash.json");
+}
+
+interface SkillsHashCache {
+  hash: string;
+  timestamp: string;
 }
 
 /**
- * Re-discover skills and update the agent's skills memory block.
- * Consolidates the duplicated skill refresh logic from index.ts and headless.ts.
- *
- * @param options - Configuration options for skill refresh
+ * Compute a hash of the formatted skills content
  */
-export async function refreshAgentSkills(
-  options: RefreshSkillsOptions,
-): Promise<void> {
-  const { client, agentId, skillsDirectory, onWarning = console.warn } = options;
+function computeSkillsHash(content: string): string {
+  return createHash("sha256").update(content).digest("hex").slice(0, 16);
+}
 
+/**
+ * Get the cached skills hash (if any)
+ */
+async function getCachedSkillsHash(): Promise<string | null> {
   try {
-    const resolvedSkillsDirectory =
-      skillsDirectory || join(process.cwd(), SKILLS_DIR);
-    const { skills, errors } = await discoverSkills(resolvedSkillsDirectory);
+    const hashFile = getSkillsHashFilePath();
+    const data = await readFile(hashFile, "utf-8");
+    const cache: SkillsHashCache = JSON.parse(data);
+    return cache.hash;
+  } catch {
+    return null;
+  }
+}
 
-    if (errors.length > 0) {
-      onWarning("Errors encountered during skill discovery:");
-      for (const error of errors) {
-        onWarning(`  ${error.path}: ${error.message}`);
-      }
+/**
+ * Set the cached skills hash
+ */
+async function setCachedSkillsHash(hash: string): Promise<void> {
+  try {
+    const hashFile = getSkillsHashFilePath();
+    // Ensure project .letta directory exists
+    const lettaDir = join(process.cwd(), ".letta");
+    await mkdir(lettaDir, { recursive: true });
+
+    const cache: SkillsHashCache = {
+      hash,
+      timestamp: new Date().toISOString(),
+    };
+    await writeFile(hashFile, JSON.stringify(cache, null, 2));
+  } catch {
+    // Ignore cache write failures - not critical
+  }
+}
+
+/**
+ * Sync skills to an agent's memory block.
+ * Discovers skills from filesystem and updates the skills block.
+ *
+ * @param client - Letta client
+ * @param agentId - Agent ID to update
+ * @param skillsDirectory - Path to project skills directory
+ * @param options - Optional settings
+ * @returns Object indicating if sync occurred and discovered skills
+ */
+export async function syncSkillsToAgent(
+  client: import("@letta-ai/letta-client").default,
+  agentId: string,
+  skillsDirectory: string,
+  options?: { skipIfUnchanged?: boolean },
+): Promise<{ synced: boolean; skills: Skill[] }> {
+  // Discover skills from filesystem
+  const { skills, errors } = await discoverSkills(skillsDirectory);
+
+  if (errors.length > 0) {
+    for (const error of errors) {
+      console.warn(`[skills] Discovery error: ${error.path}: ${error.message}`);
+    }
+  }
+
+  // Format skills for memory block
+  const formattedSkills = formatSkillsForMemory(skills, skillsDirectory);
+
+  // Check if we can skip the update
+  if (options?.skipIfUnchanged) {
+    const newHash = computeSkillsHash(formattedSkills);
+    const cachedHash = await getCachedSkillsHash();
+
+    if (newHash === cachedHash) {
+      return { synced: false, skills };
     }
 
-    // Update the skills memory block with freshly discovered skills
-    const formattedSkills = formatSkillsForMemory(skills, resolvedSkillsDirectory);
+    // Update the block and cache the new hash
     await client.agents.blocks.update("skills", {
       agent_id: agentId,
       value: formattedSkills,
     });
-  } catch (error) {
-    onWarning(
-      `Failed to update skills: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    await setCachedSkillsHash(newHash);
+
+    return { synced: true, skills };
   }
+
+  // No skip option - always update
+  await client.agents.blocks.update("skills", {
+    agent_id: agentId,
+    value: formattedSkills,
+  });
+
+  // Update hash cache for future runs
+  const newHash = computeSkillsHash(formattedSkills);
+  await setCachedSkillsHash(newHash);
+
+  return { synced: true, skills };
 }

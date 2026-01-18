@@ -90,9 +90,9 @@ export function setHasLoadedSkills(loaded: boolean): void {
  * Initialize the loaded skills flag by checking the block
  * Should be called after setAgentContext to sync the cached state
  */
-export async function initializeLoadedSkillsFlag(
-  options?: { enabled?: boolean },
-): Promise<void> {
+export async function initializeLoadedSkillsFlag(options?: {
+  enabled?: boolean;
+}): Promise<void> {
   if (!context.agentId) {
     return;
   }
@@ -133,7 +133,9 @@ type MemoryBlockSupport = {
  * Check which skill-related memory blocks an agent supports.
  * Used to determine if skill discovery/loading should be performed.
  */
-export function getMemoryBlockSupport(agent: AgentWithMemory): MemoryBlockSupport {
+export function getMemoryBlockSupport(
+  agent: AgentWithMemory,
+): MemoryBlockSupport {
   const blocks = agent.memory?.blocks;
   if (!Array.isArray(blocks)) {
     return { supportsSkills: false, supportsLoadedSkills: false };

@@ -255,6 +255,121 @@ After any merge, validate by:
 
 ---
 
+## Skills sync: `refreshAgentSkills` → `syncSkillsToAgent`
+
+**Background:** The fork originally had `refreshAgentSkills` in `src/agent/skills.ts`. Upstream replaced this with `syncSkillsToAgent` which is a **superset** with additional features.
+
+**Comparison:**
+
+| Feature | `refreshAgentSkills` (Fork) | `syncSkillsToAgent` (Upstream) |
+|---------|----------------------------|-------------------------------|
+| Discover skills from filesystem | ✅ | ✅ |
+| Format skills for memory block | ✅ | ✅ |
+| Update agent's skills block via API | ✅ | ✅ |
+| Handle errors gracefully | ✅ try/catch | ✅ console.warn |
+| Return discovered skills | ❌ void | ✅ `{ synced, skills }` |
+| Hash-based caching | ❌ | ✅ `skipIfUnchanged` option |
+| Skip unnecessary API calls | ❌ | ✅ |
+
+**Action during merge:** Accept upstream's `syncSkillsToAgent`. It properly replaces `refreshAgentSkills` with improvements:
+- Hash-based caching avoids redundant API calls
+- Returns sync status and skill list for caller inspection
+- Uses project-local `.letta/skills-hash.json` for cache
+
+**Call site changes:** Update any calls from:
+```typescript
+// Old fork pattern
+await refreshAgentSkills({ client, agentId, skillsDirectory });
+
+// New upstream pattern  
+await syncSkillsToAgent(client, agentId, resolvedSkillsDirectory, { skipIfUnchanged: true });
+```
+
+---
+
+## Model safety: CLIProxy-only model filtering
+
+**Where:** `src/agent/available-models.ts`
+
+**What to preserve:**
+- Filter to only expose `cliproxy/` models from the API response
+- Context window alias handling (supports `context_window`, `max_context_window`, `context_window_limit`, `max_context_window_limit`)
+
+```typescript
+// Fork's safety filter - KEEP THIS
+const cliproxyModels = modelsList.filter((m) => m.handle?.startsWith("cliproxy/"));
+```
+
+**Why:** Prevents users from accidentally selecting non-CLIProxy models that would bypass the proxy's safety features.
+
+---
+
+## Memory block support checking
+
+**Where:** `src/agent/context.ts`
+
+**What to preserve:**
+- `getMemoryBlockSupport(agent)` - checks if agent has `skills` and `loaded_skills` blocks
+- Used to skip skills operations for subagents with restricted memory blocks
+
+```typescript
+export function getMemoryBlockSupport(agent: AgentWithMemory): MemoryBlockSupport {
+  const blocks = agent.memory?.blocks;
+  if (!Array.isArray(blocks)) {
+    return { supportsSkills: false, supportsLoadedSkills: false };
+  }
+  const labels = new Set(blocks.map((block) => block?.label));
+  return {
+    supportsSkills: labels.has("skills"),
+    supportsLoadedSkills: labels.has("loaded_skills"),
+  };
+}
+```
+
+**Call sites to preserve:**
+- `src/index.ts` - before skills sync
+- `src/headless.ts` - before skills sync
+
+---
+
+## Conversation management (upstream feature)
+
+Upstream added conversation isolation which the fork should adopt:
+
+**Key additions:**
+- `ISOLATED_BLOCK_LABELS` - memory blocks isolated per conversation
+- `specifiedConversationId`, `selectedConversationId` state variables
+- `resumedExistingConversation` flag for UI messaging
+- `ConversationSelector` component for `/resume` command
+
+**What to preserve:** These are upstream features that work well with the fork. Accept them during merge.
+
+---
+
+## Merge checklist (January 2026 update)
+
+After merging upstream, verify these fork-specific features still work:
+
+### Tool management
+- [ ] `upsertToolsIfNeeded` called before agent creation in `index.ts` and `headless.ts`
+- [ ] `linkToolsToAgent` called after agent creation/resume
+- [ ] `linkToolsToAgent` called after model/system prompt updates
+- [ ] Toolset switching calls `unlinkToolsFromAgent` then `linkToolsToAgent`
+
+### Model safety  
+- [ ] `available-models.ts` filters to `cliproxy/` models only
+- [ ] Model detection functions handle `cliproxy/` prefixes (`isOpenAIModelHandle`, `isGeminiModelHandle`)
+
+### Skills
+- [ ] `getMemoryBlockSupport` check before skills operations
+- [ ] `syncSkillsToAgent` used (not old `refreshAgentSkills`)
+
+### Tests
+- [ ] `src/tests/agent/model-resolution.test.ts` passes
+- [ ] `src/tests/approval-recovery.test.ts` passes
+
+---
+
 ## If something changes upstream
 
 If upstream changes the Letta API surface:

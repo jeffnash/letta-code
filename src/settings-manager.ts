@@ -14,8 +14,18 @@ import {
   setSecureTokens,
 } from "./utils/secrets.js";
 
+/**
+ * Reference to a session (agent + conversation pair).
+ * Always tracked together since a conversation belongs to exactly one agent.
+ */
+export interface SessionRef {
+  agentId: string;
+  conversationId: string;
+}
+
 export interface Settings {
-  lastAgent: string | null;
+  lastAgent: string | null; // DEPRECATED: kept for migration to lastSession
+  lastSession?: SessionRef; // Current session (agent + conversation)
   tokenStreaming: boolean;
   enableSleeptime: boolean;
   sessionContextEnabled: boolean; // Send device/agent context on first message of each session
@@ -25,24 +35,21 @@ export interface Settings {
   globalSharedBlockIds: Record<string, string>; // DEPRECATED: kept for backwards compat
   profiles?: Record<string, string>; // DEPRECATED: old format, kept for migration
   pinnedAgents?: string[]; // Array of agent IDs pinned globally
+  createDefaultAgents?: boolean; // Create Memo/Incognito default agents on startup (default: true)
   permissions?: PermissionRules;
   env?: Record<string, string>;
   // Letta Cloud OAuth token management (stored separately in secrets)
   refreshToken?: string; // DEPRECATED: kept for migration, now stored in secrets
   tokenExpiresAt?: number; // Unix timestamp in milliseconds
   deviceId?: string;
-  // Anthropic OAuth
-  anthropicOAuth?: {
-    access_token: string;
-    refresh_token?: string;
-    expires_at: number; // Unix timestamp in milliseconds
-    scope?: string;
-  };
+  // Release notes tracking
+  lastSeenReleaseNotesVersion?: string; // Base version of last seen release notes (e.g., "0.13.0")
   // Pending OAuth state (for PKCE flow)
   oauthState?: {
     state: string;
     codeVerifier: string;
-    provider: "anthropic";
+    redirectUri: string;
+    provider: "openai";
     timestamp: number;
   };
   // Tool upserting hash cache (maps server URL to hash of tool definitions)
@@ -54,7 +61,8 @@ export interface ProjectSettings {
 }
 
 export interface LocalProjectSettings {
-  lastAgent: string | null;
+  lastAgent: string | null; // DEPRECATED: kept for migration to lastSession
+  lastSession?: SessionRef; // Current session (agent + conversation)
   permissions?: PermissionRules;
   profiles?: Record<string, string>; // DEPRECATED: old format, kept for migration
   pinnedAgents?: string[]; // Array of agent IDs pinned locally
@@ -195,8 +203,10 @@ class SettingsManager {
             console.warn("Tokens will remain in settings file for persistence");
           }
         } else {
-          // Silently continue - tokens in settings file is the expected fallback
-          // when keychain is unavailable. Don't warn as this pollutes subagent output.
+          debugWarn(
+            "settings",
+            "Secrets not available - tokens will remain in settings file for persistence",
+          );
         }
       }
     } catch (error) {
@@ -359,7 +369,11 @@ class SettingsManager {
     }
 
     if (Object.keys(secureTokens).length > 0) {
-      // Fallback: store tokens in settings file (silently - this is expected when keychain unavailable)
+      // Fallback: store tokens in settings file
+      debugWarn(
+        "settings",
+        "Secrets not available, storing tokens in settings file for persistence",
+      );
 
       // biome-ignore lint/style/noNonNullAssertion: at this point will always exist
       const fallbackSettings: Settings = { ...this.settings! };
@@ -644,6 +658,118 @@ class SettingsManager {
   }
 
   // =====================================================================
+  // Session Management Helpers
+  // =====================================================================
+
+  /**
+   * Get the last session from global settings.
+   * Migrates from lastAgent if lastSession is not set.
+   * Returns null if no session is available.
+   */
+  getGlobalLastSession(): SessionRef | null {
+    const settings = this.getSettings();
+    if (settings.lastSession) {
+      return settings.lastSession;
+    }
+    // Migration: if lastAgent exists but lastSession doesn't, return null
+    // (caller will need to create a new conversation for this agent)
+    return null;
+  }
+
+  /**
+   * Get the last agent ID from global settings (for migration purposes).
+   * Returns the agentId from lastSession if available, otherwise falls back to lastAgent.
+   */
+  getGlobalLastAgentId(): string | null {
+    const settings = this.getSettings();
+    if (settings.lastSession) {
+      return settings.lastSession.agentId;
+    }
+    return settings.lastAgent;
+  }
+
+  /**
+   * Set the last session in global settings.
+   */
+  setGlobalLastSession(session: SessionRef): void {
+    this.updateSettings({ lastSession: session, lastAgent: session.agentId });
+  }
+
+  /**
+   * Get the last session from local project settings.
+   * Migrates from lastAgent if lastSession is not set.
+   * Returns null if no session is available.
+   */
+  getLocalLastSession(
+    workingDirectory: string = process.cwd(),
+  ): SessionRef | null {
+    const localSettings = this.getLocalProjectSettings(workingDirectory);
+    if (localSettings.lastSession) {
+      return localSettings.lastSession;
+    }
+    // Migration: if lastAgent exists but lastSession doesn't, return null
+    // (caller will need to create a new conversation for this agent)
+    return null;
+  }
+
+  /**
+   * Get the last agent ID from local project settings (for migration purposes).
+   * Returns the agentId from lastSession if available, otherwise falls back to lastAgent.
+   */
+  getLocalLastAgentId(workingDirectory: string = process.cwd()): string | null {
+    const localSettings = this.getLocalProjectSettings(workingDirectory);
+    if (localSettings.lastSession) {
+      return localSettings.lastSession.agentId;
+    }
+    return localSettings.lastAgent;
+  }
+
+  /**
+   * Set the last session in local project settings.
+   */
+  setLocalLastSession(
+    session: SessionRef,
+    workingDirectory: string = process.cwd(),
+  ): void {
+    this.updateLocalProjectSettings(
+      { lastSession: session, lastAgent: session.agentId },
+      workingDirectory,
+    );
+  }
+
+  /**
+   * Get the effective last session (local overrides global).
+   * Returns null if no session is available anywhere.
+   */
+  getEffectiveLastSession(
+    workingDirectory: string = process.cwd(),
+  ): SessionRef | null {
+    // Check local first
+    const localSession = this.getLocalLastSession(workingDirectory);
+    if (localSession) {
+      return localSession;
+    }
+    // Fall back to global
+    return this.getGlobalLastSession();
+  }
+
+  /**
+   * Get the effective last agent ID (local overrides global).
+   * Useful for migration when we need an agent but don't have a conversation yet.
+   */
+  getEffectiveLastAgentId(
+    workingDirectory: string = process.cwd(),
+  ): string | null {
+    // Check local first
+    const localAgentId = this.getLocalLastAgentId(workingDirectory);
+    if (localAgentId) {
+      return localAgentId;
+    }
+    // Fall back to global
+    return this.getGlobalLastAgentId();
+  }
+
+  // =====================================================================
   // Profile Management Helpers
   // =====================================================================
 
@@ -789,6 +915,15 @@ class SettingsManager {
   }
 
   /**
+   * Check if default agents (Memo/Incognito) should be created on startup.
+   * Defaults to true if not explicitly set to false.
+   */
+  shouldCreateDefaultAgents(): boolean {
+    const settings = this.getSettings();
+    return settings.createDefaultAgents !== false;
+  }
+
+  /**
    * Pin an agent globally
    */
   pinGlobal(agentId: string): void {
@@ -849,84 +984,20 @@ class SettingsManager {
     return exists(dirPath);
   }
 
-  // =====================================================================
-  // Anthropic OAuth Management
-  // =====================================================================
-
-  /**
-   * Store Anthropic OAuth tokens
-   */
-  storeAnthropicTokens(tokens: {
-    access_token: string;
-    refresh_token?: string;
-    expires_in: number;
-    scope?: string;
-  }): void {
-    this.updateSettings({
-      anthropicOAuth: {
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-        expires_at: Date.now() + tokens.expires_in * 1000,
-        scope: tokens.scope,
-      },
-    });
-  }
-
-  /**
-   * Get Anthropic OAuth tokens (returns null if not set or expired)
-   */
-  getAnthropicTokens(): Settings["anthropicOAuth"] | null {
-    const settings = this.getSettings();
-    if (!settings.anthropicOAuth) return null;
-    return settings.anthropicOAuth;
-  }
-
-  /**
-   * Check if Anthropic OAuth tokens are expired or about to expire
-   * Returns true if token expires within the next 5 minutes
-   */
-  isAnthropicTokenExpired(): boolean {
-    const tokens = this.getAnthropicTokens();
-    if (!tokens) return true;
-
-    const fiveMinutesFromNow = Date.now() + 5 * 60 * 1000;
-    return tokens.expires_at < fiveMinutesFromNow;
-  }
-
-  /**
-   * Check if Anthropic OAuth is configured
-   */
-  hasAnthropicOAuth(): boolean {
-    return !!this.getAnthropicTokens();
-  }
-
-  /**
-   * Clear Anthropic OAuth tokens and state
-   */
-  clearAnthropicOAuth(): void {
-    const settings = this.getSettings();
-    const { anthropicOAuth: _, oauthState: __, ...rest } = settings;
-    this.settings = { ...DEFAULT_SETTINGS, ...rest };
-    this.persistSettings().catch((error) => {
-      console.error(
-        "Failed to persist settings after clearing Anthropic OAuth:",
-        error,
-      );
-    });
-  }
-
   /**
    * Store OAuth state for pending authorization
    */
   storeOAuthState(
     state: string,
     codeVerifier: string,
-    provider: "anthropic",
+    redirectUri: string,
+    provider: "openai",
   ): void {
     this.updateSettings({
       oauthState: {
         state,
         codeVerifier,
+        redirectUri,
         provider,
         timestamp: Date.now(),
       },
@@ -989,7 +1060,10 @@ class SettingsManager {
   async setSecureTokens(tokens: SecureTokens): Promise<void> {
     const available = await this.isKeychainAvailable();
     if (!available) {
-      // Silently return - caller will handle fallback storage
+      debugWarn(
+        "settings",
+        "Secrets not available, tokens will use fallback storage (not persistent across restarts)",
+      );
       return;
     }
 
