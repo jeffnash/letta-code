@@ -46,12 +46,16 @@ export function getAvailableModelsCacheInfo(): {
 async function fetchFromNetwork(): Promise<CacheEntry> {
   const client = await getClient();
   const modelsList = await client.models.list();
+
+  // Client-side safety: only expose CLIProxy models, regardless of what the server returns.
+  const cliproxyModels = modelsList.filter((m) => m.handle?.startsWith("cliproxy/"));
+
   const handles = new Set(
-    modelsList.map((m) => m.handle).filter((h): h is string => !!h),
+    cliproxyModels.map((m) => m.handle).filter((h): h is string => !!h),
   );
   // Build context window map from API response
   const contextWindows = new Map<string, number>();
-  for (const model of modelsList) {
+  for (const model of cliproxyModels) {
     const modelWithAliases = model as {
       context_window?: number;
       max_context_window?: number;

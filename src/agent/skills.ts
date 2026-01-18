@@ -12,6 +12,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseFrontmatter } from "../utils/frontmatter";
+import type { Letta } from "@letta-ai/letta-client";
 
 /**
  * Get the bundled skills directory path
@@ -485,4 +486,54 @@ export function formatSkillsForMemory(
 
   // Otherwise fall back to compact tree format
   return formatSkillsAsTree(skills, skillsDirectory);
+}
+
+/**
+ * Options for refreshing skills on an agent
+ */
+export interface RefreshSkillsOptions {
+  /** Letta API client */
+  client: Letta;
+  /** Agent ID to update */
+  agentId: string;
+  /** Optional custom skills directory path */
+  skillsDirectory?: string;
+  /** Callback for logging warnings (defaults to console.warn) */
+  onWarning?: (message: string) => void;
+}
+
+/**
+ * Re-discover skills and update the agent's skills memory block.
+ * Consolidates the duplicated skill refresh logic from index.ts and headless.ts.
+ *
+ * @param options - Configuration options for skill refresh
+ */
+export async function refreshAgentSkills(
+  options: RefreshSkillsOptions,
+): Promise<void> {
+  const { client, agentId, skillsDirectory, onWarning = console.warn } = options;
+
+  try {
+    const resolvedSkillsDirectory =
+      skillsDirectory || join(process.cwd(), SKILLS_DIR);
+    const { skills, errors } = await discoverSkills(resolvedSkillsDirectory);
+
+    if (errors.length > 0) {
+      onWarning("Errors encountered during skill discovery:");
+      for (const error of errors) {
+        onWarning(`  ${error.path}: ${error.message}`);
+      }
+    }
+
+    // Update the skills memory block with freshly discovered skills
+    const formattedSkills = formatSkillsForMemory(skills, resolvedSkillsDirectory);
+    await client.agents.blocks.update("skills", {
+      agent_id: agentId,
+      value: formattedSkills,
+    });
+  } catch (error) {
+    onWarning(
+      `Failed to update skills: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }

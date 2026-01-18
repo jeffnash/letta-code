@@ -13,7 +13,10 @@ import { colors } from "./colors";
 const PAGE_SIZE = 10;
 
 type ModelCategory = "supported" | "all";
-const MODEL_CATEGORIES: ModelCategory[] = ["supported", "all"];
+
+function getModelCategories(showNonCliProxyModels: boolean): ModelCategory[] {
+  return showNonCliProxyModels ? ["supported", "all"] : ["supported"];
+}
 
 type UiModel = {
   id: string;
@@ -38,6 +41,9 @@ export function ModelSelector({
 }: ModelSelectorProps) {
   const typedModels = models as UiModel[];
   const [category, setCategory] = useState<ModelCategory>("supported");
+  const [showNonCliProxyModels, setShowNonCliProxyModels] = useState<boolean>(
+    settingsManager.getSettingSafe("showNonCliProxyModels") ?? false,
+  );
   const [currentPage, setCurrentPage] = useState(0);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [settingsReady, setSettingsReady] = useState(false);
@@ -74,8 +80,11 @@ export function ModelSelector({
     settingsManager.initialize().then(() => {
       if (mountedRef.current) {
         setSettingsReady(true);
-        // Update defaultModelId with actual value after initialization
+        // Update settings-driven state with actual values after initialization
         setDefaultModelId(settingsManager.getSettingSafe("defaultModel"));
+        setShowNonCliProxyModels(
+          settingsManager.getSettingSafe("showNonCliProxyModels") ?? false,
+        );
       }
     });
   }, []);
@@ -172,16 +181,15 @@ export function ModelSelector({
 
   // Reset page and selection when category changes
   const cycleCategory = useCallback(() => {
+    const categories = getModelCategories(showNonCliProxyModels);
     setCategory((current) => {
-      const idx = MODEL_CATEGORIES.indexOf(current);
-      return MODEL_CATEGORIES[
-        (idx + 1) % MODEL_CATEGORIES.length
-      ] as ModelCategory;
+      const idx = categories.indexOf(current);
+      return categories[(idx + 1) % categories.length] as ModelCategory;
     });
     setCurrentPage(0);
     setSelectedIndex(0);
     setSearchQuery("");
-  }, []);
+  }, [showNonCliProxyModels]);
 
   // Set initial selection to current model on mount
   const initializedRef = useRef(false);
@@ -230,6 +238,19 @@ export function ModelSelector({
 
       if (key.tab) {
         cycleCategory();
+        return;
+      }
+
+      if (input === "t" && !searchQuery) {
+        const next = !showNonCliProxyModels;
+        settingsManager.updateSettings({ showNonCliProxyModels: next });
+        setShowNonCliProxyModels(next);
+        // When hiding, force the category back to supported.
+        if (!next) {
+          setCategory("supported");
+          setCurrentPage(0);
+          setSelectedIndex(0);
+        }
         return;
       }
 
@@ -310,12 +331,12 @@ export function ModelSelector({
       <Box flexDirection="column">
         <Text bold color={colors.selector.title}>
           Select Model (↑↓ navigate, ←→/jk page, Tab category, Enter select, 'd'
-          set default, ESC cancel)
+          set default, 't' toggle other models, ESC cancel)
         </Text>
         {!isLoading && !refreshing && (
           <Box>
             <Text dimColor>Category: </Text>
-            {MODEL_CATEGORIES.map((cat, i) => (
+            {getModelCategories(showNonCliProxyModels).map((cat, i) => (
               <Text key={cat}>
                 {i > 0 && <Text dimColor> · </Text>}
                 <Text
@@ -331,7 +352,11 @@ export function ModelSelector({
                 </Text>
               </Text>
             ))}
-            <Text dimColor> (Tab to switch)</Text>
+            <Text dimColor>
+              {showNonCliProxyModels
+                ? " (Tab to switch, 't' to hide other models)"
+                : " ('t' to show other models)"}
+            </Text>
           </Box>
         )}
         {!isLoading && !refreshing && (

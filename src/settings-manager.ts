@@ -21,6 +21,7 @@ export interface Settings {
   sessionContextEnabled: boolean; // Send device/agent context on first message of each session
   memoryReminderInterval: number | null; // null = disabled, number = prompt memory check every N turns
   defaultModel: string | null; // Default model ID for new agents (null = use server default)
+  showNonCliProxyModels?: boolean; // If false, hide non-cliproxy models in selection UIs
   globalSharedBlockIds: Record<string, string>; // DEPRECATED: kept for backwards compat
   profiles?: Record<string, string>; // DEPRECATED: old format, kept for migration
   pinnedAgents?: string[]; // Array of agent IDs pinned globally
@@ -67,6 +68,7 @@ const DEFAULT_SETTINGS: Settings = {
   sessionContextEnabled: true,
   memoryReminderInterval: 5, // number = prompt memory check every N turns
   defaultModel: null,
+  showNonCliProxyModels: false,
   globalSharedBlockIds: {},
 };
 

@@ -4,8 +4,13 @@ import type { AgentState } from "@letta-ai/letta-client/resources/agents/agents"
 import type { Message } from "@letta-ai/letta-client/resources/agents/messages";
 import { getResumeData, type ResumeData } from "./agent/check-approval";
 import { getClient } from "./agent/client";
-import { initializeLoadedSkillsFlag, setAgentContext } from "./agent/context";
+import {
+  getMemoryBlockSupport,
+  initializeLoadedSkillsFlag,
+  setAgentContext,
+} from "./agent/context";
 import type { AgentProvenance } from "./agent/create";
+import { refreshAgentSkills } from "./agent/skills";
 import { LETTA_CLOUD_API_URL } from "./auth/oauth";
 import type { ApprovalRequest } from "./cli/helpers/stream";
 import { ProfileSelectionInline } from "./cli/profile-selection";
@@ -1142,41 +1147,23 @@ async function main(): Promise<void> {
 
         // Set agent context for tools that need it (e.g., Skill tool)
         setAgentContext(agent.id, skillsDirectory);
-        await initializeLoadedSkillsFlag();
+
+        // Only touch skills-related blocks if they're actually present on the agent.
+        // Some subagents are spawned with a restricted memory block set.
+        const { supportsSkills, supportsLoadedSkills } = getMemoryBlockSupport(agent);
+
+        if (supportsLoadedSkills) {
+          await initializeLoadedSkillsFlag();
+        }
 
         // Re-discover skills and update the skills memory block
         // This ensures new skills added after agent creation are available
-        try {
-          const { discoverSkills, formatSkillsForMemory, SKILLS_DIR } =
-            await import("./agent/skills");
-          const { join } = await import("node:path");
-
-          const resolvedSkillsDirectory =
-            skillsDirectory || join(process.cwd(), SKILLS_DIR);
-          const { skills, errors } = await discoverSkills(
-            resolvedSkillsDirectory,
-          );
-
-          if (errors.length > 0) {
-            console.warn("Errors encountered during skill discovery:");
-            for (const error of errors) {
-              console.warn(`  ${error.path}: ${error.message}`);
-            }
-          }
-
-          // Update the skills memory block with freshly discovered skills
-          const formattedSkills = formatSkillsForMemory(
-            skills,
-            resolvedSkillsDirectory,
-          );
-          await client.agents.blocks.update("skills", {
-            agent_id: agent.id,
-            value: formattedSkills,
+        if (supportsSkills) {
+          await refreshAgentSkills({
+            client,
+            agentId: agent.id,
+            skillsDirectory,
           });
-        } catch (error) {
-          console.warn(
-            `Failed to update skills: ${error instanceof Error ? error.message : String(error)}`,
-          );
         }
 
         // Check if we're resuming an existing agent

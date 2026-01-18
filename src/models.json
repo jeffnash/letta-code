@@ -380,6 +380,17 @@
     }
   },
   {
+    "id": "minimax-m2.1",
+    "handle": "cliproxy/minimax-m2.1",
+    "label": "Minimax M2.1 (CLIProxy)",
+    "description": "Minimax M2.1 via CLIProxyAPI passthru",
+    "isFeatured": true,
+    "updateArgs": {
+      "context_window": 190000,
+      "max_output_tokens": 64000
+    }
+  },
+  {
     "id": "minimax-m2",
     "handle": "openrouter/minimax/minimax-m2",
     "label": "Minimax M2",

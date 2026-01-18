@@ -6761,8 +6761,10 @@ Plan file path: ${planFilePath}`;
         : false;
 
       // Build status message based on session type
+      // Check if we're resuming an existing agent (agentState is set) vs creating new
+      const isResuming = !!agentState?.id;
       const agentName = agentState?.name || "Unnamed Agent";
-      const headerMessage = continueSession
+      const headerMessage = isResuming
         ? `Connecting to **${agentName}** (last used in ${shortCwd})`
         : "Creating a new agent";
 

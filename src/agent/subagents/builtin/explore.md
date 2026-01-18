@@ -7,7 +7,7 @@ model:
   - group:strong
   - inherit
   - any
-memoryBlocks: human, persona
+memoryBlocks: human, persona, skills, loaded_skills
 mode: stateless
 ---
 
