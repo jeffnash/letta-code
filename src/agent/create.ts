@@ -101,7 +101,7 @@ async function resolveServerDefaultModel(): Promise<string> {
 export async function createAgent(
   nameOrOptions: string | CreateAgentOptions = DEFAULT_AGENT_NAME,
   model?: string,
-  embeddingModel = "openai/text-embedding-3-small",
+  embeddingModel?: string,
   updateArgs?: Record<string, unknown>,
   skillsDirectory?: string,
   parallelToolCalls = true,
@@ -130,8 +130,7 @@ export async function createAgent(
   }
 
   const name = options.name ?? DEFAULT_AGENT_NAME;
-  const embeddingModelVal =
-    options.embeddingModel ?? "openai/text-embedding-3-small";
+  const embeddingModelVal = options.embeddingModel;
   const parallelToolCallsVal = options.parallelToolCalls ?? true;
   const enableSleeptimeVal = options.enableSleeptime ?? false;
 
@@ -359,7 +358,7 @@ export async function createAgent(
     system: systemPromptContent,
     name,
     description: agentDescription,
-    embedding: embeddingModelVal,
+    embedding: embeddingModelVal || undefined,
     model: modelHandle,
     context_window_limit: contextWindow,
     tools: toolNames,
