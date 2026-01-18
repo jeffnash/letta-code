@@ -9,6 +9,8 @@ export interface ApprovalRequest {
   toolCallId: string;
   toolName: string;
   toolArgs: string;
+  /** Flag indicating the approval may be incomplete due to missing tool_call_id in stream */
+  incomplete?: boolean;
 }
 
 export interface ErrorInfo {
@@ -43,6 +45,16 @@ export class StreamProcessor {
 
   // Approval ID fallback (for backends that don't include tool_call_id in every chunk)
   private lastApprovalId: string | null = null;
+  
+  // Debug mode for logging tool_call_id issues
+  private debugMode: boolean;
+  
+  // Track chunks that were skipped due to missing tool_call_id
+  private skippedChunkCount: number = 0;
+
+  constructor(options?: { debug?: boolean }) {
+    this.debugMode = options?.debug ?? false;
+  }
 
   processChunk(chunk: LettaStreamingResponse): ChunkProcessingResult {
     let errorInfo: ErrorInfo | undefined;
@@ -138,15 +150,32 @@ export class StreamProcessor {
         // carries the tool_call_id; subsequent argument deltas omit it.
         // Fall back to the last seen id within this turn so we can
         // properly accumulate args.
-        let id: string | null = toolCall?.tool_call_id ?? this.lastApprovalId;
+        const originalId = toolCall?.tool_call_id;
+        let id: string | null = originalId ?? this.lastApprovalId;
+        let usedFallback = !originalId && !!id;
+        
         if (!id) {
           // As an additional guard, if exactly one approval is being
           // tracked already, use that id for continued argument deltas.
           if (this.pendingApprovals.size === 1) {
             id = Array.from(this.pendingApprovals.keys())[0] ?? null;
+            usedFallback = !!id;
           }
         }
-        if (!id) continue; // cannot safely attribute this chunk
+        if (!id) {
+          // Log skipped chunk for debugging tool_call_id issues
+          this.skippedChunkCount++;
+          if (this.debugMode) {
+            console.warn(
+              `[StreamProcessor] Skipping approval chunk - no tool_call_id available. ` +
+              `Chunk tool_call: ${JSON.stringify(toolCall)}, ` +
+              `lastApprovalId: ${this.lastApprovalId}, ` +
+              `pendingApprovals.size: ${this.pendingApprovals.size}, ` +
+              `skippedCount: ${this.skippedChunkCount}`
+            );
+          }
+          continue; // cannot safely attribute this chunk
+        }
 
         this.lastApprovalId = id;
 
@@ -155,7 +184,19 @@ export class StreamProcessor {
           toolCallId: id,
           toolName: "",
           toolArgs: "",
+          incomplete: false,
         };
+
+        // Mark as potentially incomplete if we used a fallback ID
+        if (usedFallback && !existing.incomplete) {
+          existing.incomplete = true;
+          if (this.debugMode) {
+            console.warn(
+              `[StreamProcessor] Using fallback ID for approval chunk. ` +
+              `tool_call_id from chunk was missing, using: ${id}`
+            );
+          }
+        }
 
         // Update name if provided
         if (toolCall.name) {
@@ -189,6 +230,37 @@ export class StreamProcessor {
       toolCallId: a.toolCallId,
       toolName: a.toolName,
       toolArgs: a.toolArgs,
+      incomplete: a.incomplete,
     }));
+  }
+
+  /**
+   * Check if there are any incomplete approvals (due to missing tool_call_id in stream).
+   * Returns a warning message if issues detected, null otherwise.
+   */
+  getIncompleteApprovalWarning(): string | null {
+    const allPending = this.getApprovals();
+    const incomplete = allPending.filter((a) => a.incomplete);
+    
+    if (incomplete.length > 0) {
+      return (
+        `Warning: ${incomplete.length} approval(s) may be incomplete due to missing tool_call_id in stream. ` +
+        `Affected tools: ${incomplete.map((a) => a.toolName || a.toolCallId).join(", ")}. ` +
+        `Total skipped chunks: ${this.skippedChunkCount}`
+      );
+    }
+    
+    if (this.skippedChunkCount > 0 && this.debugMode) {
+      return `Note: ${this.skippedChunkCount} chunk(s) were skipped due to missing tool_call_id`;
+    }
+    
+    return null;
+  }
+
+  /**
+   * Get the count of chunks that were skipped due to missing tool_call_id
+   */
+  getSkippedChunkCount(): number {
+    return this.skippedChunkCount;
   }
 }
