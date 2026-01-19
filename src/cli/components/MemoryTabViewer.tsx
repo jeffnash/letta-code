@@ -3,6 +3,7 @@ import { Box, Text, useInput } from "ink";
 import Link from "ink-link";
 import { useEffect, useState } from "react";
 import { getClient } from "../../agent/client";
+import { getConversationQueryString } from "../helpers/conversationQuery";
 import { useTerminalWidth } from "../hooks/useTerminalWidth";
 import { colors } from "./colors";
 import { MarkdownDisplay } from "./MarkdownDisplay";
@@ -37,7 +38,9 @@ export function MemoryTabViewer({
 }: MemoryTabViewerProps) {
   const terminalWidth = useTerminalWidth();
   const solidLine = SOLID_LINE.repeat(Math.max(terminalWidth, 10));
-  const adeUrl = `https://app.letta.com/agents/${agentId}?view=memory${conversationId ? `&conversation=${conversationId}` : ""}`;
+  // Build ADE URL with view=memory and optional conversation param
+  const conversationParam = getConversationQueryString(conversationId);
+  const adeUrl = `https://app.letta.com/agents/${agentId}?view=memory${conversationParam ? `&${conversationParam.slice(1)}` : ""}`;
 
   const [selectedTabIndex, setSelectedTabIndex] = useState(0);
   const [scrollOffset, setScrollOffset] = useState(0);

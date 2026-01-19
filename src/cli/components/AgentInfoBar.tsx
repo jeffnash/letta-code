@@ -4,6 +4,7 @@ import { memo, useMemo } from "react";
 import { DEFAULT_AGENT_NAME } from "../../constants";
 import { settingsManager } from "../../settings-manager";
 import { getVersion } from "../../version";
+import { getConversationQueryString } from "../helpers/conversationQuery";
 import { colors } from "./colors";
 
 interface AgentInfoBarProps {
@@ -79,7 +80,7 @@ export const AgentInfoBar = memo(function AgentInfoBar({
         <Text dimColor>{"  "}</Text>
         {isCloudUser && (
           <Link
-            url={`https://app.letta.com/agents/${agentId}${conversationId && conversationId !== "default" ? `?conversation=${conversationId}` : ""}`}
+            url={`https://app.letta.com/agents/${agentId}${getConversationQueryString(conversationId)}`}
           >
             <Text>Open in ADE ↗</Text>
           </Link>

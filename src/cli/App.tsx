@@ -148,6 +148,7 @@ import {
   clearPlaceholdersInText,
   resolvePlaceholders,
 } from "./helpers/pasteRegistry";
+import { getConversationQueryString } from "./helpers/conversationQuery";
 import { generatePlanFilePath } from "./helpers/planName";
 import { safeJsonParseOr } from "./helpers/safeJsonParse";
 import { type ApprovalRequest, drainStreamWithResume } from "./helpers/stream";
@@ -4105,7 +4106,7 @@ export default function App({
 
         // Special handling for /ade command - open agent in browser
         if (trimmed === "/ade") {
-          const adeUrl = `https://app.letta.com/agents/${agentId}?conversation=${conversationIdRef.current}`;
+          const adeUrl = `https://app.letta.com/agents/${agentId}${getConversationQueryString(conversationIdRef.current)}`;
           const cmdId = uid("cmd");
 
           // Fire-and-forget browser open
@@ -4700,8 +4701,10 @@ export default function App({
 
             // Call the repair-message-history endpoint
             // Note: Using fetch directly since SDK may not have this endpoint yet
+            const repairUrl = `${baseUrl}/v1/agents/${agentId}/repair-message-history${getConversationQueryString(conversationIdRef.current, "conversation_id")}`;
+
             const response = await fetch(
-              `${baseUrl}/v1/agents/${agentId}/repair-message-history`,
+              repairUrl,
               {
                 method: "POST",
                 headers: {
