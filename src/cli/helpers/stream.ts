@@ -60,34 +60,47 @@ export async function drainStream(
 
   // Set up abort listener to propagate our signal to SDK's stream controller
   // This immediately cancels the HTTP request instead of waiting for next chunk
+  // Store controller reference immediately (may be undefined if stream hasn't started yet)
+  let streamController = stream.controller;
+  let abortPendingController = false;
+  let abortHandlerCalled = false;
   const abortHandler = () => {
+    if (abortHandlerCalled) return; // Prevent multiple calls
+    abortHandlerCalled = true;
     abortedViaListener = true;
     // Abort the SDK's stream controller to cancel the underlying HTTP request
-    if (!stream.controller) {
-      debugWarn(
-        "drainStream",
-        "stream.controller is undefined - cannot abort HTTP request",
-      );
+    if (!streamController) {
+      abortPendingController = true;
       return;
     }
-    if (!stream.controller.signal.aborted) {
-      stream.controller.abort();
+    if (!streamController.signal.aborted) {
+      streamController.abort();
     }
   };
 
   if (abortSignal && !abortSignal.aborted) {
-    abortSignal.addEventListener("abort", abortHandler, { once: true });
+    abortSignal.addEventListener("abort", abortHandler);
   } else if (abortSignal?.aborted) {
     // Already aborted before we started
-    abortedViaListener = true;
-    if (stream.controller && !stream.controller.signal.aborted) {
-      stream.controller.abort();
-    }
+    abortHandler();
   }
 
   try {
     for await (const chunk of stream) {
       // console.log("chunk", chunk);
+
+      // Fallback: if abort fired before controller existed, abort as soon as it appears
+      if (!streamController && stream.controller) {
+        streamController = stream.controller;
+      }
+      if (
+        abortPendingController &&
+        streamController &&
+        !streamController.signal.aborted
+      ) {
+        streamController.abort();
+        abortPendingController = false;
+      }
 
       // Check if abort generation changed (handleInterrupt ran while we were waiting)
       // This catches cases where the abort signal might not propagate correctly

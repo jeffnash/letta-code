@@ -44,6 +44,7 @@ const ESC_CLEAR_WINDOW_MS = 2500;
 const InputFooter = memo(function InputFooter({
   ctrlCPressed,
   escapePressed,
+  pendingApprovalsCount,
   isBashMode,
   modeName,
   modeColor,
@@ -55,6 +56,7 @@ const InputFooter = memo(function InputFooter({
 }: {
   ctrlCPressed: boolean;
   escapePressed: boolean;
+  pendingApprovalsCount: number;
   isBashMode: boolean;
   modeName: string | null;
   modeColor: string | null;
@@ -68,6 +70,20 @@ const InputFooter = memo(function InputFooter({
   if (isAutocompleteActive) {
     return null;
   }
+
+	  if (pendingApprovalsCount && pendingApprovalsCount > 0) {
+	    return (
+	      <Box justifyContent="space-between" marginBottom={1}>
+	        <Text color="yellow">
+	          ⧗ {pendingApprovalsCount} tool(s) awaiting approval - cannot send messages
+	        </Text>
+	        <Text>
+	          <Text color={colors.footer.agentName}>{agentName || "Unnamed"}</Text>
+	          <Text dimColor>{` [${currentModel ?? "unknown"}]`}</Text>
+	        </Text>
+	      </Box>
+	    );
+	  }
 
   return (
     <Box justifyContent="space-between" marginBottom={1}>
@@ -127,6 +143,7 @@ export function Input({
   onExit,
   onInterrupt,
   interruptRequested = false,
+  pendingApprovalsCount = 0,
   agentId,
   agentName,
   currentModel,
@@ -152,6 +169,7 @@ export function Input({
   onExit?: () => void;
   onInterrupt?: () => void;
   interruptRequested?: boolean;
+  pendingApprovalsCount?: number;
   agentId?: string;
   agentName?: string | null;
   currentModel?: string | null;
@@ -847,6 +865,7 @@ export function Input({
         <InputFooter
           ctrlCPressed={ctrlCPressed}
           escapePressed={escapePressed}
+          pendingApprovalsCount={pendingApprovalsCount}
           isBashMode={isBashMode}
           modeName={modeInfo?.name ?? null}
           modeColor={modeInfo?.color ?? null}
