@@ -61,7 +61,7 @@ export const commands: Record<string, Command> = {
     },
   },
   "/search": {
-    desc: "Search messages across all agents",
+    desc: "Search messages across all agents (/search [query])",
     order: 16,
     handler: () => {
       // Handled specially in App.tsx to show message search
@@ -77,29 +77,20 @@ export const commands: Record<string, Command> = {
     },
   },
   "/clear": {
-    desc: "Start a new conversation (keep agent memory)",
+    desc: "Clear in-context messages",
     order: 18,
     handler: () => {
-      // Handled specially in App.tsx to create new conversation
-      return "Starting new conversation...";
-    },
-  },
-  "/clear-messages": {
-    desc: "Reset all agent messages (destructive)",
-    order: 19,
-    hidden: true, // Advanced command, not shown in autocomplete
-    handler: () => {
       // Handled specially in App.tsx to reset agent messages
-      return "Resetting agent messages...";
+      return "Clearing in-context messages...";
     },
   },
 
   // === Page 2: Agent management (order 20-29) ===
   "/new": {
-    desc: "Start a new conversation (same as /clear)",
+    desc: "Start a new conversation (keep agent memory)",
     order: 20,
     handler: () => {
-      // Handled specially in App.tsx - same as /clear
+      // Handled specially in App.tsx to create new conversation
       return "Starting new conversation...";
     },
   },
@@ -343,7 +334,6 @@ export const commands: Record<string, Command> = {
   },
   "/compact": {
     desc: "Summarize conversation history (compaction)",
-    hidden: true,
     handler: () => {
       // Handled specially in App.tsx to access client and agent ID
       return "Compacting conversation...";

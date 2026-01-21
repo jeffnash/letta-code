@@ -16,7 +16,6 @@ import {
 } from "./agent/approval-recovery";
 import { getClient } from "./agent/client";
 import {
-  getMemoryBlockSupport,
   initializeLoadedSkillsFlag,
   setAgentContext,
 } from "./agent/context";
@@ -35,6 +34,7 @@ import { formatErrorDetails } from "./cli/helpers/errorFormatter";
 import { safeJsonParseOr } from "./cli/helpers/safeJsonParse";
 import { drainStreamWithResume } from "./cli/helpers/stream";
 import { StreamProcessor } from "./cli/helpers/streamProcessor";
+import { getAndClearQueuedToolImages } from "./cli/helpers/toolImageRegistry";
 import { settingsManager } from "./settings-manager";
 import { checkToolPermission } from "./tools/manager";
 import type {
@@ -108,6 +108,7 @@ export async function handleHeadlessCommand(
       "init-blocks": { type: "string" },
       "base-tools": { type: "string" },
       "from-af": { type: "string" },
+      "no-skills": { type: "boolean" },
     },
     strict: false,
     allowPositionals: true,
@@ -194,14 +195,8 @@ export async function handleHeadlessCommand(
     process.exit(1);
   }
 
-  // Check for deprecated --new flag
-  if (values.new) {
-    console.error(
-      "Error: --new has been renamed to --new-agent\n" +
-        'Usage: letta -p "..." --new-agent',
-    );
-    process.exit(1);
-  }
+  // --new: Create a new conversation (for concurrent sessions)
+  const forceNewConversation = (values.new as boolean | undefined) ?? false;
 
   // Resolve agent (same logic as interactive mode)
   let agent: AgentState | null = null;
@@ -268,6 +263,18 @@ export async function handleHeadlessCommand(
     }
     if (shouldContinue) {
       console.error("Error: --conversation cannot be used with --continue");
+      process.exit(1);
+    }
+  }
+
+  // Validate --new flag (create new conversation)
+  if (forceNewConversation) {
+    if (shouldContinue) {
+      console.error("Error: --new cannot be used with --continue");
+      process.exit(1);
+    }
+    if (specifiedConversationId) {
+      console.error("Error: --new cannot be used with --conversation");
       process.exit(1);
     }
   }
@@ -564,15 +571,33 @@ export async function handleHeadlessCommand(
   // Determine which conversation to use
   let conversationId: string;
 
-  // Only isolate blocks that actually exist on this agent
-  // If initBlocks is undefined, agent has default blocks (all ISOLATED_BLOCK_LABELS exist)
-  // If initBlocks is defined, only isolate blocks that are in both lists
-  const isolatedBlockLabels: string[] =
-    initBlocks === undefined
-      ? [...ISOLATED_BLOCK_LABELS]
-      : ISOLATED_BLOCK_LABELS.filter((label) =>
-          initBlocks.includes(label as string),
-        );
+  // Check flags early
+  const noSkillsFlag = values["no-skills"] as boolean | undefined;
+  const isSubagent = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
+
+  // Ensure skills blocks exist BEFORE conversation creation (for non-subagent, non-no-skills)
+  // This prevents "block not found" errors when creating conversations with isolated_block_labels
+  // Note: ensureSkillsBlocks already calls blocks.list internally, so no extra API call
+  if (!noSkillsFlag && !isSubagent) {
+    const createdBlocks = await ensureSkillsBlocks(agent.id);
+    if (createdBlocks.length > 0) {
+      console.log("Created missing skills blocks for agent compatibility");
+    }
+  }
+
+  // Determine which blocks to isolate for the conversation
+  let isolatedBlockLabels: string[] = [];
+  if (!noSkillsFlag) {
+    // After ensureSkillsBlocks, we know all standard blocks exist
+    // Use the full list, optionally filtered by initBlocks
+    isolatedBlockLabels =
+      initBlocks === undefined
+        ? [...ISOLATED_BLOCK_LABELS]
+        : ISOLATED_BLOCK_LABELS.filter((label) =>
+            initBlocks.includes(label as string),
+          );
+  }
+  // If --no-skills is set, isolatedBlockLabels stays empty (no isolation)
 
   if (specifiedConversationId) {
     if (specifiedConversationId === "default") {
@@ -608,36 +633,39 @@ export async function handleHeadlessCommand(
           await client.conversations.retrieve(lastSession.conversationId);
           conversationId = lastSession.conversationId;
         } catch {
-          // Conversation no longer exists, create new
-          const conversation = await client.conversations.create({
-            agent_id: agent.id,
-            isolated_block_labels: isolatedBlockLabels,
-          });
-          conversationId = conversation.id;
+          // Conversation no longer exists - error with helpful message
+          console.error(
+            `Attempting to resume conversation ${lastSession.conversationId}, but conversation was not found.`,
+          );
+          console.error(
+            "Resume the default conversation with 'letta -p ...', view recent conversations with 'letta --resume', or start a new conversation with 'letta -p ... --new'.",
+          );
+          process.exit(1);
         }
       }
     } else {
-      // No matching session, create new conversation
-      const conversation = await client.conversations.create({
-        agent_id: agent.id,
-        isolated_block_labels: isolatedBlockLabels,
-      });
-      conversationId = conversation.id;
+      // No matching session - error with helpful message
+      console.error("No previous session found for this agent to resume.");
+      console.error(
+        "Resume the default conversation with 'letta -p ...', or start a new conversation with 'letta -p ... --new'.",
+      );
+      process.exit(1);
     }
-  } else {
-    // Default: create a new conversation
-    // This ensures isolated message history per CLI invocation
+  } else if (forceNewConversation) {
+    // --new flag: create a new conversation (for concurrent sessions)
     const conversation = await client.conversations.create({
       agent_id: agent.id,
       isolated_block_labels: isolatedBlockLabels,
     });
     conversationId = conversation.id;
+  } else {
+    // Default (including --new-agent, --agent): use the agent's "default" conversation
+    conversationId = "default";
   }
   markMilestone("HEADLESS_CONVERSATION_READY");
 
   // Save session (agent + conversation) to both project and global settings
   // Skip for subagents - they shouldn't pollute the LRU settings
-  const isSubagent = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
   if (!isSubagent) {
     await settingsManager.loadLocalProjectSettings();
     settingsManager.setLocalLastSession(
@@ -650,31 +678,20 @@ export async function handleHeadlessCommand(
     });
   }
 
-  // Ensure the agent has the required skills blocks (for backwards compatibility)
-  const createdBlocks = await ensureSkillsBlocks(agent.id);
-  if (createdBlocks.length > 0) {
-    console.log("Created missing skills blocks for agent compatibility");
-  }
-
   // Set agent context for tools that need it (e.g., Skill tool, Task tool)
   setAgentContext(agent.id, skillsDirectory);
 
-  // Only touch skills-related blocks if they're actually present on the agent.
-  // Some subagents are spawned with a restricted memory block set.
-  const { supportsSkills, supportsLoadedSkills } = getMemoryBlockSupport(agent);
-
-  // Fire-and-forget: Initialize loaded skills flag (LET-7101)
-  // Don't await - this is just for the skill unload reminder
-  if (supportsLoadedSkills) {
+  // Skills-related fire-and-forget operations (skip for subagents/--no-skills)
+  if (!noSkillsFlag && !isSubagent) {
+    // Fire-and-forget: Initialize loaded skills flag (LET-7101)
+    // Don't await - this is just for the skill unload reminder
     initializeLoadedSkillsFlag().catch(() => {
       // Ignore errors - not critical
     });
-  }
 
-  // Fire-and-forget: Sync skills in background (LET-7101)
-  // This ensures new skills added after agent creation are available
-  // Don't await - proceed to message sending immediately
-  if (supportsSkills) {
+    // Fire-and-forget: Sync skills in background (LET-7101)
+    // This ensures new skills added after agent creation are available
+    // Don't await - proceed to message sending immediately
     (async () => {
       try {
         const { syncSkillsToAgent, SKILLS_DIR } = await import(
@@ -763,7 +780,7 @@ export async function handleHeadlessCommand(
 
       let resume: Awaited<ReturnType<typeof getResumeData>>;
       try {
-        resume = await getResumeData(client, freshAgent);
+        resume = await getResumeData(client, freshAgent, conversationId);
       } catch (error) {
         // Treat 404/422 as "no approvals" - stale message/conversation state
         if (
@@ -927,11 +944,42 @@ export async function handleHeadlessCommand(
   // Add user prompt
   messageContent += prompt;
 
+  // Build content parts (text + any queued tool images from Read tool)
+  type ContentPart =
+    | { type: "text"; text: string }
+    | {
+        type: "image";
+        source: { type: "base64"; media_type: string; data: string };
+      };
+  const contentParts: ContentPart[] = [];
+
+  // Check for queued tool images (from Read tool reading image files)
+  const queuedToolImages = getAndClearQueuedToolImages();
+  if (queuedToolImages.length > 0) {
+    for (const img of queuedToolImages) {
+      contentParts.push({
+        type: "text",
+        text: `<system-reminder>Image read from ${img.filePath} (Read tool call: ${img.toolCallId}):</system-reminder>`,
+      });
+      contentParts.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: img.mediaType,
+          data: img.data,
+        },
+      });
+    }
+  }
+
+  // Add the text message content
+  contentParts.push({ type: "text", text: messageContent });
+
   // Start with the user message
   let currentInput: Array<MessageCreate | ApprovalCreate> = [
     {
       role: "user",
-      content: [{ type: "text", text: messageContent }],
+      content: contentParts as unknown as MessageCreate["content"],
     },
   ];
 
@@ -1234,6 +1282,9 @@ export async function handleHeadlessCommand(
         );
         const executedResults = await executeApprovalBatch(decisions);
 
+        // Check for queued tool images (from Read tool reading image files)
+        const toolImages = getAndClearQueuedToolImages();
+
         // Send all results in one batch
         currentInput = [
           {
@@ -1241,6 +1292,36 @@ export async function handleHeadlessCommand(
             approvals: executedResults as ApprovalResult[],
           },
         ];
+
+        // If there are queued images, add them as a user message
+        if (toolImages.length > 0) {
+          const imageContentParts: Array<
+            | { type: "text"; text: string }
+            | {
+                type: "image";
+                source: { type: "base64"; media_type: string; data: string };
+              }
+          > = [];
+          for (const img of toolImages) {
+            imageContentParts.push({
+              type: "text",
+              text: `<system-reminder>Image read from ${img.filePath} (Read tool call: ${img.toolCallId}):</system-reminder>`,
+            });
+            imageContentParts.push({
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: img.mediaType,
+                data: img.data,
+              },
+            });
+          }
+          currentInput.push({
+            role: "user",
+            content: imageContentParts as unknown as MessageCreate["content"],
+          });
+        }
+
         continue;
       }
 
@@ -1453,7 +1534,7 @@ export async function handleHeadlessCommand(
       }
 
       // Mark incomplete tool calls as cancelled to prevent stuck state
-      markIncompleteToolsAsCancelled(buffers);
+      markIncompleteToolsAsCancelled(buffers, true, "stream_error");
 
       // Extract error details from buffers if available
       const errorLines = toLines(buffers).filter(
@@ -1511,7 +1592,7 @@ export async function handleHeadlessCommand(
     }
   } catch (error) {
     // Mark incomplete tool calls as cancelled
-    markIncompleteToolsAsCancelled(buffers);
+    markIncompleteToolsAsCancelled(buffers, true, "stream_error");
 
     // Use comprehensive error formatting (same as TUI mode)
     const errorDetails = formatErrorDetails(error, agent.id);

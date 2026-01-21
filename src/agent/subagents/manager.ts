@@ -43,6 +43,7 @@ interface ModelSelectorResponse {
  */
 export interface SubagentResult {
   agentId: string;
+  conversationId?: string;
   report: string;
   success: boolean;
   error?: string;
@@ -54,6 +55,7 @@ export interface SubagentResult {
  */
 interface ExecutionState {
   agentId: string | null;
+  conversationId: string | null;
   finalResult: string | null;
   finalError: string | null;
   resultStats: { durationMs: number; totalTokens: number } | null;
@@ -154,7 +156,7 @@ function recordToolCall(
  * Handle an init event from the subagent stream
  */
 function handleInitEvent(
-  event: { agent_id?: string },
+  event: { agent_id?: string; conversation_id?: string },
   state: ExecutionState,
   baseURL: string,
   subagentId: string,
@@ -163,6 +165,9 @@ function handleInitEvent(
     state.agentId = event.agent_id;
     const agentURL = `${baseURL}/agents/${event.agent_id}`;
     updateSubagent(subagentId, { agentURL });
+  }
+  if (event.conversation_id) {
+    state.conversationId = event.conversation_id;
   }
 }
 
@@ -354,21 +359,41 @@ function parseResultFromStdout(
 function buildSubagentArgs(
   type: string,
   config: SubagentConfig,
-  model: string,
+  model: string | null,
   userPrompt: string,
+  existingAgentId?: string,
+  existingConversationId?: string,
   preloadedSkillsContent?: string,
 ): string[] {
-  const args: string[] = [
-    "--new-agent",
-    "--system",
-    type,
-    "--model",
-    model,
-    "-p",
-    userPrompt,
-    "--output-format",
-    "stream-json",
-  ];
+  const args: string[] = [];
+  const isDeployingExisting = Boolean(
+    existingAgentId || existingConversationId,
+  );
+
+  if (isDeployingExisting) {
+    // Deploy existing agent/conversation
+    if (existingConversationId) {
+      // conversation_id is sufficient (headless derives agent from it)
+      args.push("--conv", existingConversationId);
+    } else if (existingAgentId) {
+      // agent_id only - use --new to create a new conversation for thread safety
+      // (multiple parallel calls to the same agent need separate conversations)
+      args.push("--agent", existingAgentId, "--new");
+    }
+    // Don't pass --system (existing agent keeps its prompt)
+    // Don't pass --model (existing agent keeps its model)
+    // Skip skills block operations (existing agent may not have standard blocks)
+    args.push("--no-skills");
+  } else {
+    // Create new agent (original behavior)
+    args.push("--new-agent", "--system", type);
+    if (model) {
+      args.push("--model", model);
+    }
+  }
+
+  args.push("-p", userPrompt);
+  args.push("--output-format", "stream-json");
 
   // Use subagent's configured permission mode, or inherit from parent
   const subagentMode = config.permissionMode;
@@ -378,31 +403,40 @@ function buildSubagentArgs(
     args.push("--permission-mode", modeToUse);
   }
 
-  // Inherit permission rules from parent (CLI + session rules)
+  // Build list of auto-approved tools:
+  // 1. Inherit from parent (CLI + session rules)
+  // 2. Add subagent's allowed tools (so they don't hang on approvals)
   const parentAllowedTools = cliPermissions.getAllowedTools();
   const sessionAllowRules = sessionPermissions.getRules().allow || [];
+  const subagentTools =
+    config.allowedTools !== "all" && Array.isArray(config.allowedTools)
+      ? config.allowedTools
+      : [];
   const combinedAllowedTools = [
-    ...new Set([...parentAllowedTools, ...sessionAllowRules]),
+    ...new Set([...parentAllowedTools, ...sessionAllowRules, ...subagentTools]),
   ];
   if (combinedAllowedTools.length > 0) {
     args.push("--allowedTools", combinedAllowedTools.join(","));
   }
+
   const parentDisallowedTools = cliPermissions.getDisallowedTools();
   if (parentDisallowedTools.length > 0) {
     args.push("--disallowedTools", parentDisallowedTools.join(","));
   }
 
-  // Add memory block filtering if specified
-  if (config.memoryBlocks === "none") {
-    args.push("--init-blocks", "none");
-  } else if (
-    Array.isArray(config.memoryBlocks) &&
-    config.memoryBlocks.length > 0
-  ) {
-    args.push("--init-blocks", config.memoryBlocks.join(","));
+  // Add memory block filtering if specified (only for new agents)
+  if (!isDeployingExisting) {
+    if (config.memoryBlocks === "none") {
+      args.push("--init-blocks", "none");
+    } else if (
+      Array.isArray(config.memoryBlocks) &&
+      config.memoryBlocks.length > 0
+    ) {
+      args.push("--init-blocks", config.memoryBlocks.join(","));
+    }
   }
 
-  // Add tool filtering if specified
+  // Add tool filtering if specified (applies to both new and existing agents)
   if (
     config.allowedTools !== "all" &&
     Array.isArray(config.allowedTools) &&
@@ -411,8 +445,8 @@ function buildSubagentArgs(
     args.push("--tools", config.allowedTools.join(","));
   }
 
-  // Add pre-loaded skills content if provided
-  if (preloadedSkillsContent) {
+  // Add pre-loaded skills content if provided (only for new agents)
+  if (!isDeployingExisting && preloadedSkillsContent) {
     args.push("--block-value", `loaded_skills=${preloadedSkillsContent}`);
   }
 
@@ -435,13 +469,15 @@ function buildSubagentArgs(
 async function executeSubagent(
   type: string,
   config: SubagentConfig,
-  model: string,
+  model: string | null,
   userPrompt: string,
   baseURL: string,
   subagentId: string,
   expansionChain: string[] = [],
   chainIndex = 0,
   signal?: AbortSignal,
+  existingAgentId?: string,
+  existingConversationId?: string,
 ): Promise<SubagentResult> {
   // Check if already aborted before starting
   if (signal?.aborted) {
@@ -454,7 +490,9 @@ async function executeSubagent(
   }
 
   // Update the state with the model being used (may differ on retry/fallback)
-  updateSubagent(subagentId, { model });
+  if (model) {
+    updateSubagent(subagentId, { model });
+  }
 
   try {
     // Pre-load skills if configured
@@ -471,12 +509,23 @@ async function executeSubagent(
       config,
       model,
       userPrompt,
+      existingAgentId,
+      existingConversationId,
       preloadedSkillsContent,
     );
 
     // Spawn Letta Code in headless mode.
-    // Some environments may have a different `letta` binary earlier in PATH.
-    const lettaCmd = process.env.LETTA_CODE_BIN || "letta";
+    // Use the same binary as the current process, with fallbacks:
+    // 1. LETTA_CODE_BIN env var (explicit override)
+    // 2. Current process argv[1] if it's a .js file (built letta.js)
+    // 3. ./letta.js if running from dev (src/index.ts)
+    // 4. "letta" (global install)
+    const currentScript = process.argv[1] || "";
+    const lettaCmd =
+      process.env.LETTA_CODE_BIN ||
+      (currentScript.endsWith(".js") ? currentScript : null) ||
+      (currentScript.includes("src/index.ts") ? "./letta.js" : null) ||
+      "letta";
     // Pass parent agent ID so subagents can access parent's context (e.g., search history)
     let parentAgentId: string | undefined;
     try {
@@ -509,7 +558,8 @@ async function executeSubagent(
 
     // Initialize execution state
     const state: ExecutionState = {
-      agentId: null,
+      agentId: existingAgentId || null,
+      conversationId: existingConversationId || null,
       finalResult: null,
       finalError: null,
       resultStats: null,
@@ -545,6 +595,7 @@ async function executeSubagent(
     if (wasAborted) {
       return {
         agentId: state.agentId || "",
+        conversationId: state.conversationId || undefined,
         report: "",
         success: false,
         error: INTERRUPTED_BY_USER,
@@ -623,6 +674,7 @@ async function executeSubagent(
 
       return {
         agentId: state.agentId || "",
+        conversationId: state.conversationId || undefined,
         report: "",
         success: false,
         error: stderr || `Subagent exited with code ${exitCode}`,
@@ -633,6 +685,7 @@ async function executeSubagent(
     if (state.finalResult !== null) {
       return {
         agentId: state.agentId || "",
+        conversationId: state.conversationId || undefined,
         report: state.finalResult,
         success: !state.finalError,
         error: state.finalError || undefined,
@@ -644,6 +697,7 @@ async function executeSubagent(
     if (state.finalError) {
       return {
         agentId: state.agentId || "",
+        conversationId: state.conversationId || undefined,
         report: "",
         success: false,
         error: state.finalError,
@@ -792,6 +846,28 @@ async function resolveModelSelector(
 }
 
 /**
+ * Build a system reminder prefix for deployed agents
+ */
+function buildDeploySystemReminder(
+  senderAgentName: string,
+  senderAgentId: string,
+  subagentType: string,
+): string {
+  const toolDescription =
+    subagentType === "explore"
+      ? "read-only tools (Read, Glob, Grep)"
+      : "local tools (Bash, Read, Write, Edit, etc.)";
+
+  return `<system-reminder>
+This task is from "${senderAgentName}" (agent ID: ${senderAgentId}), which deployed you as a subagent inside the Letta Code CLI (docs.letta.com/letta-code).
+You have access to ${toolDescription} in their codebase.
+Your final message will be returned to the caller.
+</system-reminder>
+
+`;
+}
+
+/**
  * Spawn a subagent and execute it autonomously
  *
  * @param type - Subagent type (e.g., "code-reviewer", "explore")
@@ -799,6 +875,8 @@ async function resolveModelSelector(
  * @param userModel - Optional model override from the parent agent
  * @param subagentId - ID for tracking in the state store (registered by Task tool)
  * @param signal - Optional abort signal for interruption handling
+ * @param existingAgentId - Optional ID of an existing agent to deploy
+ * @param existingConversationId - Optional conversation ID to resume
  */
 export async function spawnSubagent(
   type: string,
@@ -806,6 +884,8 @@ export async function spawnSubagent(
   userModel: string | undefined,
   subagentId: string,
   signal?: AbortSignal,
+  existingAgentId?: string,
+  existingConversationId?: string,
 ): Promise<SubagentResult> {
   const allConfigs = await getAllSubagentConfigs();
   const config = allConfigs[type];
@@ -819,72 +899,97 @@ export async function spawnSubagent(
     };
   }
 
-  // Get parent agent's model for 'inherit' resolution
-  const parentModelHandle = await getPrimaryAgentModelHandle();
+  const isDeployingExisting = Boolean(
+    existingAgentId || existingConversationId,
+  );
 
-  // Resolve model using the server's selector resolver
-  // We get both the resolved model AND the expansion chain for rate limit fallback
-  let model: string;
+  // For existing agents, don't override model; for new agents, resolve using our selector logic
+  let model: string | null = null;
   let expansionChain: string[] = [];
 
-  if (userModel) {
-    // Check if userModel is a selector (group:*, inherit, any) vs a concrete model
-    const isSelector =
-      userModel.startsWith("group:") ||
-      userModel === "inherit" ||
-      userModel === "any";
+  if (!isDeployingExisting) {
+    // Get parent agent's model for 'inherit' resolution
+    const parentModelHandle = await getPrimaryAgentModelHandle();
 
-    if (isSelector) {
-      // User specified a selector - resolve it through the selector resolver
-      const resolution = await resolveModelSelectorWithChain(
-        [userModel, "any"], // Add "any" as fallback
-        parentModelHandle,
-      );
-      model = resolution.resolved_handle;
-      expansionChain = resolution.expansion_chain;
-    } else {
-      // User specified a concrete model - try to resolve it
-      const resolved = await resolveModelAsync(userModel);
-      if (resolved) {
-        model = resolved;
-        expansionChain = [resolved];
-      } else if (userModel.includes("/")) {
-        // If it looks like a full handle but couldn't be resolved,
-        // use it anyway (user might know something we don't)
-        // but log a warning
-        console.warn(
-          `[subagent] Model "${userModel}" not found in available models, using as-is`,
-        );
-        model = userModel;
-        expansionChain = [userModel];
-      } else {
-        // Not a full handle and couldn't be resolved - fall back to config's selector
-        console.warn(
-          `[subagent] Unknown model "${userModel}", falling back to config selector`,
-        );
-        const selector = config.modelSelector || [config.recommendedModel];
+    // Resolve model using the server's selector resolver
+    // We get both the resolved model AND the expansion chain for rate limit fallback
+    if (userModel) {
+      // Check if userModel is a selector (group:*, inherit, any) vs a concrete model
+      const isSelector =
+        userModel.startsWith("group:") ||
+        userModel === "inherit" ||
+        userModel === "any";
+
+      if (isSelector) {
+        // User specified a selector - resolve it through the selector resolver
         const resolution = await resolveModelSelectorWithChain(
-          selector,
-          parentModelHandle || undefined,
+          [userModel, "any"], // Add "any" as fallback
+          parentModelHandle,
         );
         model = resolution.resolved_handle;
         expansionChain = resolution.expansion_chain;
+      } else {
+        // User specified a concrete model - try to resolve it
+        const resolved = await resolveModelAsync(userModel);
+        if (resolved) {
+          model = resolved;
+          expansionChain = [resolved];
+        } else if (userModel.includes("/")) {
+          // If it looks like a full handle but couldn't be resolved,
+          // use it anyway (user might know something we don't)
+          // but log a warning
+          console.warn(
+            `[subagent] Model "${userModel}" not found in available models, using as-is`,
+          );
+          model = userModel;
+          expansionChain = [userModel];
+        } else {
+          // Not a full handle and couldn't be resolved - fall back to config's selector
+          console.warn(
+            `[subagent] Unknown model "${userModel}", falling back to config selector`,
+          );
+          const selector = config.modelSelector || [config.recommendedModel];
+          const resolution = await resolveModelSelectorWithChain(
+            selector,
+            parentModelHandle || undefined,
+          );
+          model = resolution.resolved_handle;
+          expansionChain = resolution.expansion_chain;
+        }
       }
-    }
-  } else {
-    // Use the model selector chain from config
-    const selector = config.modelSelector || [config.recommendedModel];
+    } else {
+      // Use the model selector chain from config
+      const selector = config.modelSelector || [config.recommendedModel];
 
-    // Resolve via server (with fallback) - get full chain for rate limit retry
-    const resolution = await resolveModelSelectorWithChain(
-      selector,
-      parentModelHandle || undefined,
-    );
-    model = resolution.resolved_handle;
-    expansionChain = resolution.expansion_chain;
+      // Resolve via server (with fallback) - get full chain for rate limit retry
+      const resolution = await resolveModelSelectorWithChain(
+        selector,
+        parentModelHandle || undefined,
+      );
+      model = resolution.resolved_handle;
+      expansionChain = resolution.expansion_chain;
+    }
   }
 
   const baseURL = getBaseURL();
+
+  // Build the prompt with system reminder for deployed agents
+  let finalPrompt = prompt;
+  if (isDeployingExisting) {
+    try {
+      const parentAgentId = getCurrentAgentId();
+      const client = await getClient();
+      const parentAgent = await client.agents.retrieve(parentAgentId);
+      const systemReminder = buildDeploySystemReminder(
+        parentAgent.name,
+        parentAgentId,
+        type,
+      );
+      finalPrompt = systemReminder + prompt;
+    } catch {
+      // If we can't get parent agent info, proceed without the reminder
+    }
+  }
 
   // Execute subagent - state updates are handled via the state store
   // Pass expansion chain for rate limit fallback
@@ -892,12 +997,14 @@ export async function spawnSubagent(
     type,
     config,
     model,
-    prompt,
+    finalPrompt,
     baseURL,
     subagentId,
     expansionChain,
     0, // Start at beginning of chain
     signal,
+    existingAgentId,
+    existingConversationId,
   );
 
   return result;

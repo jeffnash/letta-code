@@ -166,6 +166,10 @@ import {
 } from "./helpers/subagentState";
 import { getRandomThinkingVerb } from "./helpers/thinkingMessages";
 import {
+  clearQueuedToolImages,
+  getAndClearQueuedToolImages,
+} from "./helpers/toolImageRegistry";
+import {
   isFileEditTool,
   isFileWriteTool,
   isPatchTool,
@@ -582,6 +586,11 @@ export default function App({
   const [agentId, setAgentId] = useState(initialAgentId);
   const [agentState, setAgentState] = useState(initialAgentState);
 
+  // Helper to update agent name (updates agentState, which is the single source of truth)
+  const updateAgentName = useCallback((name: string) => {
+    setAgentState((prev) => (prev ? { ...prev, name } : prev));
+  }, []);
+
   // Track current conversation (always created fresh on startup)
   const [conversationId, setConversationId] = useState(initialConversationId);
 
@@ -716,6 +725,8 @@ export default function App({
   >([]);
   const executingToolCallIdsRef = useRef<string[]>([]);
   const interruptQueuedRef = useRef(false);
+  // Prevents interrupt handler from queueing results while approvals are in-flight.
+  const toolResultsInFlightRef = useRef(false);
   const autoAllowedExecutionRef = useRef<{
     toolCallIds: string[];
     results: ApprovalResult[] | null;
@@ -881,6 +892,7 @@ export default function App({
     | null;
   const [activeOverlay, setActiveOverlay] = useState<ActiveOverlay>(null);
   const [feedbackPrefill, setFeedbackPrefill] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
   const [modelSelectorOptions, setModelSelectorOptions] = useState<{
     filterProvider?: string;
     forceRefresh?: boolean;
@@ -888,6 +900,7 @@ export default function App({
   const closeOverlay = useCallback(() => {
     setActiveOverlay(null);
     setFeedbackPrefill("");
+    setSearchQuery("");
     setModelSelectorOptions({});
   }, []);
 
@@ -916,7 +929,8 @@ export default function App({
     llmConfigRef.current = llmConfig;
   }, [llmConfig]);
   const [currentModelId, setCurrentModelId] = useState<string | null>(null);
-  const [agentName, setAgentName] = useState<string | null>(null);
+  // Derive agentName from agentState (single source of truth)
+  const agentName = agentState?.name ?? null;
   const [agentDescription, setAgentDescription] = useState<string | null>(null);
   const [agentLastRunAt, setAgentLastRunAt] = useState<string | null>(null);
   const currentModelLabel =
@@ -1530,22 +1544,33 @@ export default function App({
         ? `Resuming conversation with **${agentName}**`
         : `Starting new conversation with **${agentName}**`;
 
-      // Command hints - for pinned agents show /memory, for unpinned show /pin
-      const commandHints = isPinned
+      // Command hints - vary based on agent state:
+      // - Resuming: show /new (they may want a fresh conversation)
+      // - New session + unpinned: show /pin (they should save their agent)
+      // - New session + pinned: show /memory (they're already saved)
+      const commandHints = isResumingConversation
         ? [
             "→ **/agents**    list all agents",
-            "→ **/resume**    resume a previous conversation",
-            "→ **/memory**    view your agent's memory blocks",
+            "→ **/resume**    browse all conversations",
+            "→ **/new**       start a new conversation",
             "→ **/init**      initialize your agent's memory",
             "→ **/remember**  teach your agent",
           ]
-        : [
-            "→ **/agents**    list all agents",
-            "→ **/resume**    resume a previous conversation",
-            "→ **/pin**       save + name your agent",
-            "→ **/init**      initialize your agent's memory",
-            "→ **/remember**  teach your agent",
-          ];
+        : isPinned
+          ? [
+              "→ **/agents**    list all agents",
+              "→ **/resume**    resume a previous conversation",
+              "→ **/memory**    view your agent's memory blocks",
+              "→ **/init**      initialize your agent's memory",
+              "→ **/remember**  teach your agent",
+            ]
+          : [
+              "→ **/agents**    list all agents",
+              "→ **/resume**    resume a previous conversation",
+              "→ **/pin**       save + name your agent",
+              "→ **/init**      initialize your agent's memory",
+              "→ **/remember**  teach your agent",
+            ];
 
       // Build status lines with optional release notes above header
       const statusLines: string[] = [];
@@ -1590,8 +1615,8 @@ export default function App({
           const { getClient } = await import("../agent/client");
           const client = await getClient();
           const agent = await client.agents.retrieve(agentId);
+          setAgentState(agent);
           setLlmConfig(agent.llm_config);
-          setAgentName(agent.name);
           setAgentDescription(agent.description ?? null);
           // Get last message timestamp from agent state if available
           const lastRunCompletion = (agent as { last_run_completion?: string })
@@ -1800,7 +1825,11 @@ export default function App({
         // If we're sending a new message, old pending state is no longer relevant
         // Pass false to avoid setting interrupted=true, which causes race conditions
         // with concurrent processConversation calls reading the flag
-        markIncompleteToolsAsCancelled(buffersRef.current, false);
+        markIncompleteToolsAsCancelled(
+          buffersRef.current,
+          false,
+          "internal_cancel",
+        );
         // Reset interrupted flag since we're starting a fresh stream
         buffersRef.current.interrupted = false;
 
@@ -1985,7 +2014,7 @@ export default function App({
                 }
 
                 // Also update agent state if other fields changed
-                setAgentName(agent.name);
+                setAgentState(agent);
                 setAgentDescription(agent.description ?? null);
                 const lastRunCompletion = (
                   agent as { last_run_completion?: string }
@@ -2234,7 +2263,11 @@ export default function App({
               abortControllerRef.current?.signal.aborted
             ) {
               setStreaming(false);
-              markIncompleteToolsAsCancelled(buffersRef.current);
+              markIncompleteToolsAsCancelled(
+                buffersRef.current,
+                true,
+                "user_interrupt",
+              );
               refreshDerived();
               return;
             }
@@ -2487,7 +2520,11 @@ export default function App({
                     queueApprovalResults(allResults, autoAllowedMetadata);
                   }
                   setStreaming(false);
-                  markIncompleteToolsAsCancelled(buffersRef.current);
+                  markIncompleteToolsAsCancelled(
+                    buffersRef.current,
+                    true,
+                    "user_interrupt",
+                  );
                   refreshDerived();
                   return;
                 }
@@ -2525,6 +2562,7 @@ export default function App({
                 setThinkingMessage(getRandomThinkingVerb());
                 refreshDerived();
 
+                toolResultsInFlightRef.current = true;
                 await processConversation(
                   [
                     {
@@ -2534,6 +2572,7 @@ export default function App({
                   ],
                   { allowReentry: true },
                 );
+                toolResultsInFlightRef.current = false;
                 return;
               }
 
@@ -2593,6 +2632,7 @@ export default function App({
                 toolAbortControllerRef.current = null;
                 executingToolCallIdsRef.current = [];
                 autoAllowedExecutionRef.current = null;
+                toolResultsInFlightRef.current = false;
               }
             }
 
@@ -2602,7 +2642,11 @@ export default function App({
               abortControllerRef.current?.signal.aborted
             ) {
               setStreaming(false);
-              markIncompleteToolsAsCancelled(buffersRef.current);
+              markIncompleteToolsAsCancelled(
+                buffersRef.current,
+                true,
+                "user_interrupt",
+              );
               refreshDerived();
               return;
             }
@@ -2824,7 +2868,11 @@ export default function App({
           llmApiErrorRetriesRef.current = 0;
 
           // Mark incomplete tool calls as finished to prevent stuck blinking UI
-          markIncompleteToolsAsCancelled(buffersRef.current);
+          markIncompleteToolsAsCancelled(
+            buffersRef.current,
+            true,
+            "stream_error",
+          );
 
           // Track the error in telemetry
           telemetry.trackError(
@@ -2909,7 +2957,11 @@ export default function App({
         }
       } catch (e) {
         // Mark incomplete tool calls as cancelled to prevent stuck blinking UI
-        markIncompleteToolsAsCancelled(buffersRef.current);
+        markIncompleteToolsAsCancelled(
+          buffersRef.current,
+          true,
+          e instanceof APIUserAbortError ? "user_interrupt" : "stream_error",
+        );
 
         // If using eager cancel and this is an abort error, silently ignore it
         // The user already got "Stream interrupted by user" feedback from handleInterrupt
@@ -3132,9 +3184,32 @@ export default function App({
     setMessageQueue([]);
   }, []);
 
+  // Handle paste errors (e.g., image too large)
+  const handlePasteError = useCallback(
+    (message: string) => {
+      const statusId = uid("status");
+      buffersRef.current.byId.set(statusId, {
+        kind: "status",
+        id: statusId,
+        lines: [`⚠️ ${message}`],
+      });
+      buffersRef.current.order.push(statusId);
+      refreshDerived();
+    },
+    [refreshDerived],
+  );
+
   const handleInterrupt = useCallback(async () => {
     // If we're executing client-side tools, abort them AND the main stream
-    if (isExecutingTool && toolAbortControllerRef.current) {
+    const hasTrackedTools =
+      executingToolCallIdsRef.current.length > 0 ||
+      autoAllowedExecutionRef.current?.results;
+    if (
+      isExecutingTool &&
+      toolAbortControllerRef.current &&
+      hasTrackedTools &&
+      !toolResultsInFlightRef.current
+    ) {
       toolAbortControllerRef.current.abort();
 
       // Mark any in-flight conversation as stale, consistent with EAGER_CANCEL.
@@ -3170,7 +3245,11 @@ export default function App({
       // ALSO abort the main stream - don't leave it running
       buffersRef.current.abortGeneration =
         (buffersRef.current.abortGeneration || 0) + 1;
-      const toolsCancelled = markIncompleteToolsAsCancelled(buffersRef.current);
+      const toolsCancelled = markIncompleteToolsAsCancelled(
+        buffersRef.current,
+        true,
+        "user_interrupt",
+      );
 
       // Mark any running subagents as interrupted
       interruptActiveSubagents(INTERRUPTED_BY_USER);
@@ -3196,6 +3275,7 @@ export default function App({
       setAutoHandledResults([]);
       setAutoDeniedApprovals([]);
 
+      toolResultsInFlightRef.current = false;
       refreshDerived();
 
       // If the backend has already created an approval_request_message, it will refuse
@@ -3283,7 +3363,11 @@ export default function App({
       // This ensures onChunk and other guards see interrupted=true immediately.
       buffersRef.current.abortGeneration =
         (buffersRef.current.abortGeneration || 0) + 1;
-      const toolsCancelled = markIncompleteToolsAsCancelled(buffersRef.current);
+      const toolsCancelled = markIncompleteToolsAsCancelled(
+        buffersRef.current,
+        true,
+        "user_interrupt",
+      );
 
       // Mark any running subagents as interrupted
       interruptActiveSubagents(INTERRUPTED_BY_USER);
@@ -3308,6 +3392,7 @@ export default function App({
       // Stop streaming and show error message (unless tool calls were cancelled,
       // since the tool result will show "Interrupted by user")
       setStreaming(false);
+      toolResultsInFlightRef.current = false;
       if (!toolsCancelled) {
         appendError(INTERRUPT_MESSAGE, true);
       }
@@ -3358,9 +3443,13 @@ export default function App({
       // if the user switches agents while the promise is pending.
       const capturedAgentIdEager = agentIdRef.current;
       getClient()
-        .then((client) =>
-          client.conversations.cancel(conversationIdRef.current),
-        )
+        .then((client) => {
+          // Use agents API for "default" conversation (primary message history)
+          if (conversationIdRef.current === "default") {
+            return client.agents.messages.cancel(agentIdRef.current);
+          }
+          return client.conversations.cancel(conversationIdRef.current);
+        })
         .catch(() => {
           // Silently ignore - cancellation already happened client-side
         });
@@ -3379,7 +3468,12 @@ export default function App({
       setInterruptRequested(true);
       try {
         const client = await getClient();
-        await client.conversations.cancel(conversationIdRef.current);
+        // Use agents API for "default" conversation (primary message history)
+        if (conversationIdRef.current === "default") {
+          await client.agents.messages.cancel(agentIdRef.current);
+        } else {
+          await client.conversations.cancel(conversationIdRef.current);
+        }
 
         if (abortControllerRef.current) {
           abortControllerRef.current.abort();
@@ -3436,6 +3530,9 @@ export default function App({
       // Lock input for async operation (set before any await to prevent queue processing)
       setCommandRunning(true);
 
+      // Clear any queued tool images from the previous agent context
+      clearQueuedToolImages();
+
       const inputCmd = "/agents";
       const cmdId = uid("cmd");
 
@@ -3455,13 +3552,9 @@ export default function App({
         // Fetch new agent
         const agent = await client.agents.retrieve(targetAgentId);
 
-        // Always create a new conversation when switching agents
-        // User can /resume to get back to a previous conversation if needed
-        const newConversation = await client.conversations.create({
-          agent_id: targetAgentId,
-          isolated_block_labels: [...ISOLATED_BLOCK_LABELS],
-        });
-        const targetConversationId = newConversation.id;
+        // Use the agent's default conversation when switching agents
+        // User can /new to start a fresh conversation if needed
+        const targetConversationId = "default";
 
         // Update project settings with new agent
         await updateProjectSettings({ lastAgent: targetAgentId });
@@ -3491,15 +3584,15 @@ export default function App({
         agentIdRef.current = targetAgentId;
         setAgentId(targetAgentId);
         setAgentState(agent);
-        setAgentName(agent.name);
         setLlmConfig(agent.llm_config);
         setConversationId(targetConversationId);
 
-        // Build success message - always a new conversation
+        // Build success message - resumed default conversation
         const agentLabel = agent.name || targetAgentId;
         const successOutput = [
-          `Started a new conversation with **${agentLabel}**.`,
-          `⎿  Type /resume to resume a previous conversation`,
+          `Resumed the default conversation with **${agentLabel}**.`,
+          `⎿  Type /resume to browse all conversations`,
+          `⎿  Type /new to start a new conversation`,
         ].join("\n");
         const successItem: StaticItem = {
           kind: "command",
@@ -3582,7 +3675,6 @@ export default function App({
         agentIdRef.current = agent.id;
         setAgentId(agent.id);
         setAgentState(agent);
-        setAgentName(agent.name);
         setLlmConfig(agent.llm_config);
 
         // Build success message with hints
@@ -3628,7 +3720,7 @@ export default function App({
   );
 
   // Handle bash mode command submission
-  // Uses the same shell runner as the Bash tool for consistency
+  // Expands aliases from shell config files, then runs with spawnCommand
   const handleBashSubmit = useCallback(
     async (command: string) => {
       const cmdId = uid("bash");
@@ -3653,11 +3745,20 @@ export default function App({
       refreshDerived();
 
       try {
-        // Use the same spawnCommand as the Bash tool for consistent behavior
+        // Expand aliases before running
+        const { expandAliases } = await import("./helpers/shellAliases");
+        const expanded = expandAliases(command);
+
+        // If command uses a shell function, prepend the function definition
+        const finalCommand = expanded.functionDef
+          ? `${expanded.functionDef}\n${expanded.command}`
+          : expanded.command;
+
+        // Use spawnCommand for actual execution
         const { spawnCommand } = await import("../tools/impl/Bash.js");
         const { getShellEnv } = await import("../tools/impl/shellEnv.js");
 
-        const result = await spawnCommand(command, {
+        const result = await spawnCommand(finalCommand, {
           cwd: process.cwd(),
           env: getShellEnv(),
           timeout: 30000, // 30 second timeout
@@ -3918,9 +4019,46 @@ export default function App({
 
         // Send all results to server if any
         if (allResults.length > 0) {
-          await processConversation([
+          toolResultsInFlightRef.current = true;
+
+          // Check for queued tool images (from Read tool reading image files)
+          const toolImages = getAndClearQueuedToolImages();
+          const input: Array<MessageCreate | ApprovalCreate> = [
             { type: "approval", approvals: allResults },
-          ]);
+          ];
+
+          // If there are queued images, add them as a user message
+          if (toolImages.length > 0) {
+            const imageContentParts: Array<
+              | { type: "text"; text: string }
+              | {
+                  type: "image";
+                  source: { type: "base64"; media_type: string; data: string };
+                }
+            > = [];
+            for (const img of toolImages) {
+              imageContentParts.push({
+                type: "text",
+                text: `<system-reminder>Image read from ${img.filePath} (Read tool call: ${img.toolCallId}):</system-reminder>`,
+              });
+              imageContentParts.push({
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: img.mediaType,
+                  data: img.data,
+                },
+              });
+            }
+            input.push({
+              type: "message",
+              role: "user",
+              content: imageContentParts as unknown as MessageCreate["content"],
+            });
+          }
+
+          await processConversation(input);
+          toolResultsInFlightRef.current = false;
         }
       } finally {
         if (shouldTrackAutoAllowed) {
@@ -3928,6 +4066,7 @@ export default function App({
           toolAbortControllerRef.current = null;
           executingToolCallIdsRef.current = [];
           autoAllowedExecutionRef.current = null;
+          toolResultsInFlightRef.current = false;
         }
       }
 
@@ -4026,9 +4165,13 @@ export default function App({
 
             // Send cancel request to backend (fire-and-forget)
             getClient()
-              .then((client) =>
-                client.conversations.cancel(conversationIdRef.current),
-              )
+              .then((client) => {
+                // Use agents API for "default" conversation (primary message history)
+                if (conversationIdRef.current === "default") {
+                  return client.agents.messages.cancel(agentIdRef.current);
+                }
+                return client.conversations.cancel(conversationIdRef.current);
+              })
               .then(() => {})
               .catch(() => {
                 // Reset flag if cancel fails
@@ -4537,9 +4680,8 @@ export default function App({
           return { submitted: true };
         }
 
-        // Special handling for /clear and /new commands - start new conversation
-        // (/new used to create a new agent, now it's just an alias for /clear)
-        if (msg.trim() === "/clear" || msg.trim() === "/new") {
+        // Special handling for /new command - start new conversation
+        if (msg.trim() === "/new") {
           const cmdId = uid("cmd");
           buffersRef.current.byId.set(cmdId, {
             kind: "command",
@@ -4552,6 +4694,9 @@ export default function App({
           refreshDerived();
 
           setCommandRunning(true);
+
+          // Clear any queued tool images from the previous conversation
+          clearQueuedToolImages();
 
           try {
             const client = await getClient();
@@ -4606,14 +4751,14 @@ export default function App({
           return { submitted: true };
         }
 
-        // Special handling for /clear-messages command - reset all agent messages (destructive)
-        if (msg.trim() === "/clear-messages") {
+        // Special handling for /clear command - reset all agent messages (destructive)
+        if (msg.trim() === "/clear") {
           const cmdId = uid("cmd");
           buffersRef.current.byId.set(cmdId, {
             kind: "command",
             id: cmdId,
             input: msg,
-            output: "Resetting agent messages...",
+            output: "Clearing in-context messages...",
             phase: "running",
           });
           buffersRef.current.order.push(cmdId);
@@ -4912,7 +5057,7 @@ export default function App({
           try {
             const client = await getClient();
             await client.agents.update(agentId, { name: newName });
-            setAgentName(newName);
+            updateAgentName(newName);
 
             buffersRef.current.byId.set(cmdId, {
               kind: "command",
@@ -5198,7 +5343,11 @@ export default function App({
         }
 
         // Special handling for /search command - show message search
-        if (msg.trim() === "/search") {
+        if (trimmed.startsWith("/search")) {
+          // Extract optional query after /search
+          const [, ...rest] = trimmed.split(/\s+/);
+          const query = rest.join(" ").trim();
+          setSearchQuery(query);
           setActiveOverlay("search");
           return { submitted: true };
         }
@@ -5215,7 +5364,7 @@ export default function App({
             agentId,
             agentName: agentName || "",
             setCommandRunning,
-            setAgentName,
+            updateAgentName,
           };
 
           // /profile - open agent browser (now points to /agents)
@@ -5311,7 +5460,7 @@ export default function App({
             agentId,
             agentName: agentName || "",
             setCommandRunning,
-            setAgentName,
+            updateAgentName,
           };
           await handlePin(profileCtx, msg, argsStr);
           return { submitted: true };
@@ -5325,7 +5474,7 @@ export default function App({
             agentId,
             agentName: agentName || "",
             setCommandRunning,
-            setAgentName,
+            updateAgentName,
           };
           const argsStr = msg.trim().slice(6).trim();
           handleUnpin(profileCtx, msg, argsStr);
@@ -5872,7 +6021,37 @@ ${gitContext}
       }
 
       // Build message content from display value (handles placeholders for text/images)
-      const contentParts = buildMessageContentFromDisplay(msg);
+      let contentParts = buildMessageContentFromDisplay(msg);
+
+      // Prepend any queued tool images (from Read tool reading image files)
+      const queuedToolImages = getAndClearQueuedToolImages();
+      if (queuedToolImages.length > 0) {
+        const imageParts: Array<
+          | { type: "text"; text: string }
+          | {
+              type: "image";
+              source: { type: "base64"; media_type: string; data: string };
+            }
+        > = [];
+        for (const img of queuedToolImages) {
+          // Add system reminder text
+          imageParts.push({
+            type: "text",
+            text: `<system-reminder>Image read from ${img.filePath} (Read tool call: ${img.toolCallId}):</system-reminder>`,
+          });
+          // Add image content
+          imageParts.push({
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: img.mediaType,
+              data: img.data,
+            },
+          });
+        }
+        // Prepend to contentParts
+        contentParts = [...imageParts, ...contentParts];
+      }
 
       // Prepend plan mode reminder if in plan mode
       const planModeReminder = getPlanModeReminder();
@@ -6290,7 +6469,11 @@ DO NOT respond to these messages or otherwise consider them in your response unl
                     queueApprovalResults(queuedResults, autoAllowedMetadata);
                   }
                   setStreaming(false);
-                  markIncompleteToolsAsCancelled(buffersRef.current);
+                  markIncompleteToolsAsCancelled(
+                    buffersRef.current,
+                    true,
+                    "user_interrupt",
+                  );
                   refreshDerived();
                   return { submitted: false };
                 }
@@ -6323,7 +6506,9 @@ DO NOT respond to these messages or otherwise consider them in your response unl
                   },
                 ];
 
+                toolResultsInFlightRef.current = true;
                 await processConversation(initialInput);
+                toolResultsInFlightRef.current = false;
                 clearPlaceholdersInText(msg);
                 return { submitted: true };
               } finally {
@@ -6332,6 +6517,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
                   toolAbortControllerRef.current = null;
                   executingToolCallIdsRef.current = [];
                   autoAllowedExecutionRef.current = null;
+                  toolResultsInFlightRef.current = false;
                 }
               }
             } else {
@@ -6530,7 +6716,11 @@ DO NOT respond to these messages or otherwise consider them in your response unl
                     queueApprovalResults(queuedResults, autoAllowedMetadata);
                   }
                   setStreaming(false);
-                  markIncompleteToolsAsCancelled(buffersRef.current);
+                  markIncompleteToolsAsCancelled(
+                    buffersRef.current,
+                    true,
+                    "user_interrupt",
+                  );
                   refreshDerived();
                   return { submitted: false };
                 }
@@ -6811,12 +7001,14 @@ DO NOT respond to these messages or otherwise consider them in your response unl
           queueSnapshotRef.current = [];
         } else {
           // Continue conversation with all results
+          toolResultsInFlightRef.current = true;
           await processConversation([
             {
               type: "approval",
               approvals: allResults as ApprovalResult[],
             },
           ]);
+          toolResultsInFlightRef.current = false;
         }
       } finally {
         // Always release the execution guard, even if an error occurred
@@ -6824,6 +7016,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         toolAbortControllerRef.current = null;
         executingToolCallIdsRef.current = [];
         interruptQueuedRef.current = false;
+        toolResultsInFlightRef.current = false;
       }
     },
     [
@@ -7140,7 +7333,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
     queueApprovalResults(denialResults);
 
     // Mark the pending approval tool calls as cancelled in the buffers
-    markIncompleteToolsAsCancelled(buffersRef.current);
+    markIncompleteToolsAsCancelled(buffersRef.current, true, "approval_cancel");
     refreshDerived();
 
     // Clear all approval state
@@ -7698,7 +7891,11 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         queueApprovalResults(denialResults);
 
         // Mark tool as cancelled in buffers
-        markIncompleteToolsAsCancelled(buffersRef.current);
+        markIncompleteToolsAsCancelled(
+          buffersRef.current,
+          true,
+          "internal_cancel",
+        );
         refreshDerived();
 
         // Clear all approval state (same as handleCancelApprovals)
@@ -8300,11 +8497,16 @@ Plan file path: ${planFilePath}`;
                     ? `letta -n "${agentName}"`
                     : `letta --agent ${agentId}`}
                 </Text>
-                <Text> </Text>
-                <Text dimColor>Resume this conversation with:</Text>
-                <Text color={colors.link.url}>
-                  {`letta --conv ${conversationId}`}
-                </Text>
+                {/* Only show conversation hint if not on default (default is resumed automatically) */}
+                {conversationId !== "default" && (
+                  <>
+                    <Text> </Text>
+                    <Text dimColor>Resume this conversation with:</Text>
+                    <Text color={colors.link.url}>
+                      {`letta --conv ${conversationId}`}
+                    </Text>
+                  </>
+                )}
               </Box>
             )}
 
@@ -8342,6 +8544,7 @@ Plan file path: ${planFilePath}`;
                 ralphPendingYolo={pendingRalphConfig?.isYolo ?? false}
                 onRalphExit={handleRalphExit}
                 conversationId={conversationId}
+                onPasteError={handlePasteError}
               />
             </Box>
 
@@ -8672,7 +8875,10 @@ Plan file path: ${planFilePath}`;
 
             {/* Message Search - conditionally mounted as overlay */}
             {activeOverlay === "search" && (
-              <MessageSearch onClose={closeOverlay} />
+              <MessageSearch
+                onClose={closeOverlay}
+                initialQuery={searchQuery || undefined}
+              />
             )}
 
             {/* Feedback Dialog - conditionally mounted as overlay */}
@@ -8774,7 +8980,7 @@ Plan file path: ${planFilePath}`;
                     // Rename if new name provided
                     if (newName && newName !== agentName) {
                       await client.agents.update(agentId, { name: newName });
-                      setAgentName(newName);
+                      updateAgentName(newName);
                     }
 
                     // Pin the agent
