@@ -2,10 +2,11 @@
 // Follows Codex CLI's approach (codex-rs/utils/image/src/lib.rs)
 import sharp from "sharp";
 
-// Conservative limits that work with Anthropic's API (max 8000x8000)
-// Codex uses 2048x768, we use 2048x2048 for more flexibility with tall screenshots
-export const MAX_IMAGE_WIDTH = 2048;
-export const MAX_IMAGE_HEIGHT = 2048;
+// Anthropic's API supports up to 8000x8000 per image, but we use a conservative
+// 2000x2000 limit to reduce token usage when conversation history accumulates multiple images.
+// This prevents hitting total pixel limits across all images in the context.
+export const MAX_IMAGE_WIDTH = 2000;
+export const MAX_IMAGE_HEIGHT = 2000;
 
 export interface ResizeResult {
   data: string; // base64 encoded

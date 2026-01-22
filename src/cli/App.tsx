@@ -67,6 +67,7 @@ import {
   savePermissionRule,
   type ToolExecutionResult,
 } from "../tools/manager";
+import { clearSkillBlockCache } from "../tools/impl/Skill";
 import { debugWarn } from "../utils/debug";
 import {
   handleMcpAdd,
@@ -166,10 +167,6 @@ import {
 } from "./helpers/subagentState";
 import { getRandomThinkingVerb } from "./helpers/thinkingMessages";
 import {
-  clearQueuedToolImages,
-  getAndClearQueuedToolImages,
-} from "./helpers/toolImageRegistry";
-import {
   isFileEditTool,
   isFileWriteTool,
   isPatchTool,
@@ -199,7 +196,7 @@ const MIN_RESIZE_DELTA = 2;
 const EAGER_CANCEL = true;
 
 // Maximum retries for transient LLM API errors (matches headless.ts)
-const LLM_API_ERROR_MAX_RETRIES = 1;
+const LLM_API_ERROR_MAX_RETRIES = 3;
 
 // Message shown when user interrupts the stream
 const INTERRUPT_MESSAGE =
@@ -586,11 +583,6 @@ export default function App({
   const [agentId, setAgentId] = useState(initialAgentId);
   const [agentState, setAgentState] = useState(initialAgentState);
 
-  // Helper to update agent name (updates agentState, which is the single source of truth)
-  const updateAgentName = useCallback((name: string) => {
-    setAgentState((prev) => (prev ? { ...prev, name } : prev));
-  }, []);
-
   // Track current conversation (always created fresh on startup)
   const [conversationId, setConversationId] = useState(initialConversationId);
 
@@ -636,6 +628,7 @@ export default function App({
       prevInitialConversationIdRef.current = initialConversationId;
       conversationIdRef.current = initialConversationId;
       setConversationId(initialConversationId);
+      clearSkillBlockCache();
     }
   }, [initialConversationId]);
 
@@ -725,8 +718,6 @@ export default function App({
   >([]);
   const executingToolCallIdsRef = useRef<string[]>([]);
   const interruptQueuedRef = useRef(false);
-  // Prevents interrupt handler from queueing results while approvals are in-flight.
-  const toolResultsInFlightRef = useRef(false);
   const autoAllowedExecutionRef = useRef<{
     toolCallIds: string[];
     results: ApprovalResult[] | null;
@@ -892,7 +883,6 @@ export default function App({
     | null;
   const [activeOverlay, setActiveOverlay] = useState<ActiveOverlay>(null);
   const [feedbackPrefill, setFeedbackPrefill] = useState("");
-  const [searchQuery, setSearchQuery] = useState("");
   const [modelSelectorOptions, setModelSelectorOptions] = useState<{
     filterProvider?: string;
     forceRefresh?: boolean;
@@ -900,7 +890,6 @@ export default function App({
   const closeOverlay = useCallback(() => {
     setActiveOverlay(null);
     setFeedbackPrefill("");
-    setSearchQuery("");
     setModelSelectorOptions({});
   }, []);
 
@@ -929,8 +918,7 @@ export default function App({
     llmConfigRef.current = llmConfig;
   }, [llmConfig]);
   const [currentModelId, setCurrentModelId] = useState<string | null>(null);
-  // Derive agentName from agentState (single source of truth)
-  const agentName = agentState?.name ?? null;
+  const [agentName, setAgentName] = useState<string | null>(null);
   const [agentDescription, setAgentDescription] = useState<string | null>(null);
   const [agentLastRunAt, setAgentLastRunAt] = useState<string | null>(null);
   const currentModelLabel =
@@ -995,10 +983,16 @@ export default function App({
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // Track if user wants to cancel (persists across state updates)
+  // TODO(LET-XXXX): Convert userCancelledRef to state for proper React dependency tracking
+  // Current workaround: refs aren't in dependency arrays, causing potential stuck queues
+  // Recommended fix:
+  //   1. Replace `const userCancelledRef = useRef(false)` with `const [userCancelled, setUserCancelled] = useState(false)`
+  //   2. Update all reads from `userCancelledRef.current` to `userCancelled`
+  //   3. Update all writes from `userCancelledRef.current = X` to `setUserCancelled(X)`
+  //   4. Add `userCancelled` to dequeue effect's dependency array
+  //   5. Remove any dequeueEpoch workarounds if present
+  // This ensures the dequeue effect triggers when cancellation state changes
   const userCancelledRef = useRef(false);
-
-  // Track whether we're in the interrupt cleanup window (prevents racey submits)
-  const cleanupInProgressRef = useRef(false);
 
   // Retry counter for transient LLM API errors (ref for synchronous access in loop)
   const llmApiErrorRetriesRef = useRef(0);
@@ -1023,8 +1017,7 @@ export default function App({
       streamingRef.current ||
       isExecutingToolRef.current ||
       commandRunningRef.current ||
-      abortControllerRef.current !== null ||
-      cleanupInProgressRef.current
+      abortControllerRef.current !== null
     );
   }, []);
 
@@ -1548,33 +1541,22 @@ export default function App({
         ? `Resuming conversation with **${agentName}**`
         : `Starting new conversation with **${agentName}**`;
 
-      // Command hints - vary based on agent state:
-      // - Resuming: show /new (they may want a fresh conversation)
-      // - New session + unpinned: show /pin (they should save their agent)
-      // - New session + pinned: show /memory (they're already saved)
-      const commandHints = isResumingConversation
+      // Command hints - for pinned agents show /memory, for unpinned show /pin
+      const commandHints = isPinned
         ? [
             "→ **/agents**    list all agents",
-            "→ **/resume**    browse all conversations",
-            "→ **/new**       start a new conversation",
+            "→ **/resume**    resume a previous conversation",
+            "→ **/memory**    view your agent's memory blocks",
             "→ **/init**      initialize your agent's memory",
             "→ **/remember**  teach your agent",
           ]
-        : isPinned
-          ? [
-              "→ **/agents**    list all agents",
-              "→ **/resume**    resume a previous conversation",
-              "→ **/memory**    view your agent's memory blocks",
-              "→ **/init**      initialize your agent's memory",
-              "→ **/remember**  teach your agent",
-            ]
-          : [
-              "→ **/agents**    list all agents",
-              "→ **/resume**    resume a previous conversation",
-              "→ **/pin**       save + name your agent",
-              "→ **/init**      initialize your agent's memory",
-              "→ **/remember**  teach your agent",
-            ];
+        : [
+            "→ **/agents**    list all agents",
+            "→ **/resume**    resume a previous conversation",
+            "→ **/pin**       save + name your agent",
+            "→ **/init**      initialize your agent's memory",
+            "→ **/remember**  teach your agent",
+          ];
 
       // Build status lines with optional release notes above header
       const statusLines: string[] = [];
@@ -1619,8 +1601,8 @@ export default function App({
           const { getClient } = await import("../agent/client");
           const client = await getClient();
           const agent = await client.agents.retrieve(agentId);
-          setAgentState(agent);
           setLlmConfig(agent.llm_config);
+          setAgentName(agent.name);
           setAgentDescription(agent.description ?? null);
           // Get last message timestamp from agent state if available
           const lastRunCompletion = (agent as { last_run_completion?: string })
@@ -1822,37 +1804,38 @@ export default function App({
           return;
         }
 
-	        setStreaming(true);
-	        abortControllerRef.current = new AbortController();
+        setStreaming(true);
+        abortControllerRef.current = new AbortController();
 
         // Clear any stale pending tool calls from previous turns
         // If we're sending a new message, old pending state is no longer relevant
         // Pass false to avoid setting interrupted=true, which causes race conditions
         // with concurrent processConversation calls reading the flag
-        markIncompleteToolsAsCancelled(
-          buffersRef.current,
-          false,
-          "internal_cancel",
-        );
+        //
+        // TODO(LET-XXXX): Make tool cancellation selective for server-side vs client-side tools
+        // - Server-side tools (memory operations, etc.) should NOT be cancelled on reentry
+        // - Client-side tools should still be cancelled
+        // - Add timeout mechanism: mark tools as timed out if "running" for >30s without result
+        // Implementation: Add isServerSideTool(toolName) helper that returns true for memory tools
+        markIncompleteToolsAsCancelled(buffersRef.current, false);
         // Reset interrupted flag since we're starting a fresh stream
         buffersRef.current.interrupted = false;
 
         // Clear completed subagents from the UI when starting a new turn
         clearCompletedSubagents();
 
-		        while (true) {
-		          // Capture the signal BEFORE any async operations
-		          const controller = abortControllerRef.current;
-		          const signal = controller?.signal;
-		          const aborted = Boolean(signal?.aborted);
+        while (true) {
+          // Capture the signal BEFORE any async operations
+          // This prevents a race where handleInterrupt nulls the ref during await
+          const signal = abortControllerRef.current?.signal;
 
-	          // Check if cancelled before starting new stream
-	          if (aborted) {
-	            const isStaleAtAbort =
-	              myGeneration !== conversationGenerationRef.current;
-	            // Only set streaming=false if this is the current generation.
-	            // If stale, a newer processConversation might be running and we shouldn't affect its UI.
-	            if (!isStaleAtAbort) {
+          // Check if cancelled before starting new stream
+          if (signal?.aborted) {
+            const isStaleAtAbort =
+              myGeneration !== conversationGenerationRef.current;
+            // Only set streaming=false if this is the current generation.
+            // If stale, a newer processConversation might be running and we shouldn't affect its UI.
+            if (!isStaleAtAbort) {
               setStreaming(false);
             }
             return;
@@ -1905,85 +1888,45 @@ export default function App({
                 errorDetail = preStreamError.message;
               }
 
-              const desyncDetected = isApprovalStateDesyncError(errorDetail);
-
+              // If desync detected and retries available, recover with keep-alive prompt
               if (
-                desyncDetected &&
+                isApprovalStateDesyncError(errorDetail) &&
                 llmApiErrorRetriesRef.current < LLM_API_ERROR_MAX_RETRIES
               ) {
                 llmApiErrorRetriesRef.current += 1;
 
-                telemetry.trackError(
-                  "ApprovalStateDesync",
-                  `Desync detected: ${desyncDetected ? "yes" : "no"}, retries: ${llmApiErrorRetriesRef.current}`,
-                  "approval_recovery",
-                );
-
-                const warningStatusId = uid("status");
-                buffersRef.current.byId.set(warningStatusId, {
-                  kind: "status",
-                  id: warningStatusId,
-                  lines: [
-                    "⚠️ Approval state mismatch detected - this shouldn't happen often",
-                    "If you see this frequently, please report it as a bug",
-                  ],
-                });
-                buffersRef.current.order.push(warningStatusId);
-
+                // Show transient status (matches post-stream desync handler UX)
                 const statusId = uid("status");
                 buffersRef.current.byId.set(statusId, {
                   kind: "status",
                   id: statusId,
-                  lines: ["Clearing stale approvals from interrupted session..."],
+                  lines: [
+                    "Approval state desynced; resending keep-alive recovery prompt...",
+                  ],
                 });
                 buffersRef.current.order.push(statusId);
                 refreshDerived();
 
-                try {
-                  const client = await getClient();
-                  const agent = await client.agents.retrieve(agentIdRef.current);
-                  const { pendingApprovals: existingApprovals } =
-                    await getResumeData(
-                      client,
-                      agent,
-                      conversationIdRef.current,
-                    );
-
-                  const messageItems = currentInput.filter(
-                    (item) => item?.type !== "approval",
+                // Swap payload to recovery message (or strip stale approvals)
+                const isApprovalOnlyPayload =
+                  hasApprovalInPayload && currentInput.length === 1;
+                if (isApprovalOnlyPayload) {
+                  currentInput.splice(
+                    0,
+                    currentInput.length,
+                    buildApprovalRecoveryMessage(),
                   );
-
-                  if (existingApprovals.length > 0) {
-                    const denialResults = existingApprovals.map((approval) => ({
-                      type: "approval" as const,
-                      tool_call_id: approval.toolCallId,
-                      approve: false,
-                      reason:
-                        "Auto-denied: stale approval from interrupted session",
-                    }));
-                    currentInput.splice(0, currentInput.length, {
-                      type: "approval",
-                      approvals: denialResults,
-                    });
-                    if (messageItems.length > 0) {
-                      currentInput.push(...messageItems);
-                    }
-                  } else if (messageItems.length > 0) {
-                    currentInput.splice(0, currentInput.length, ...messageItems);
-                  } else {
-                    currentInput.splice(
-                      0,
-                      currentInput.length,
-                      buildApprovalRecoveryMessage(),
-                    );
-                  }
-                } catch {
-                  // Fallback: strip stale approvals, keep user message; otherwise send recovery prompt
+                } else {
+                  // Mixed payload: strip stale approvals, keep user message
                   const messageItems = currentInput.filter(
                     (item) => item?.type !== "approval",
                   );
                   if (messageItems.length > 0) {
-                    currentInput.splice(0, currentInput.length, ...messageItems);
+                    currentInput.splice(
+                      0,
+                      currentInput.length,
+                      ...messageItems,
+                    );
                   } else {
                     currentInput.splice(
                       0,
@@ -1991,13 +1934,14 @@ export default function App({
                       buildApprovalRecoveryMessage(),
                     );
                   }
-                } finally {
-                  buffersRef.current.byId.delete(statusId);
-                  buffersRef.current.order = buffersRef.current.order.filter(
-                    (id) => id !== statusId,
-                  );
-                  refreshDerived();
                 }
+
+                // Remove transient status before retry
+                buffersRef.current.byId.delete(statusId);
+                buffersRef.current.order = buffersRef.current.order.filter(
+                  (id) => id !== statusId,
+                );
+                refreshDerived();
 
                 // Reset interrupted flag so retry stream chunks are processed
                 buffersRef.current.interrupted = false;
@@ -2009,17 +1953,17 @@ export default function App({
             throw preStreamError;
           }
 
-		          // Check again after network call - user may have pressed Escape during sendMessageStream
-		          if (signal?.aborted) {
-		            const isStaleAtAbort =
-		              myGeneration !== conversationGenerationRef.current;
-		            // Only set streaming=false if this is the current generation.
-		            // If stale, a newer processConversation might be running and we shouldn't affect its UI.
-		            if (!isStaleAtAbort) {
-	              setStreaming(false);
-	            }
-	            return;
-	          }
+          // Check again after network call - user may have pressed Escape during sendMessageStream
+          if (signal?.aborted) {
+            const isStaleAtAbort =
+              myGeneration !== conversationGenerationRef.current;
+            // Only set streaming=false if this is the current generation.
+            // If stale, a newer processConversation might be running and we shouldn't affect its UI.
+            if (!isStaleAtAbort) {
+              setStreaming(false);
+            }
+            return;
+          }
 
           // Define callback to sync agent state on first message chunk
           // This ensures the UI shows the correct model as early as possible
@@ -2058,7 +2002,7 @@ export default function App({
                 }
 
                 // Also update agent state if other fields changed
-                setAgentState(agent);
+                setAgentName(agent.name);
                 setAgentDescription(agent.description ?? null);
                 const lastRunCompletion = (
                   agent as { last_run_completion?: string }
@@ -2307,11 +2251,7 @@ export default function App({
               abortControllerRef.current?.signal.aborted
             ) {
               setStreaming(false);
-              markIncompleteToolsAsCancelled(
-                buffersRef.current,
-                true,
-                "user_interrupt",
-              );
+              markIncompleteToolsAsCancelled(buffersRef.current);
               refreshDerived();
               return;
             }
@@ -2564,11 +2504,7 @@ export default function App({
                     queueApprovalResults(allResults, autoAllowedMetadata);
                   }
                   setStreaming(false);
-                  markIncompleteToolsAsCancelled(
-                    buffersRef.current,
-                    true,
-                    "user_interrupt",
-                  );
+                  markIncompleteToolsAsCancelled(buffersRef.current);
                   refreshDerived();
                   return;
                 }
@@ -2606,7 +2542,6 @@ export default function App({
                 setThinkingMessage(getRandomThinkingVerb());
                 refreshDerived();
 
-                toolResultsInFlightRef.current = true;
                 await processConversation(
                   [
                     {
@@ -2616,7 +2551,6 @@ export default function App({
                   ],
                   { allowReentry: true },
                 );
-                toolResultsInFlightRef.current = false;
                 return;
               }
 
@@ -2676,7 +2610,6 @@ export default function App({
                 toolAbortControllerRef.current = null;
                 executingToolCallIdsRef.current = [];
                 autoAllowedExecutionRef.current = null;
-                toolResultsInFlightRef.current = false;
               }
             }
 
@@ -2686,11 +2619,7 @@ export default function App({
               abortControllerRef.current?.signal.aborted
             ) {
               setStreaming(false);
-              markIncompleteToolsAsCancelled(
-                buffersRef.current,
-                true,
-                "user_interrupt",
-              );
+              markIncompleteToolsAsCancelled(buffersRef.current);
               refreshDerived();
               return;
             }
@@ -2716,6 +2645,8 @@ export default function App({
           const hasApprovalInPayload = currentInput.some(
             (item) => item?.type === "approval",
           );
+          const isApprovalOnlyPayload =
+            hasApprovalInPayload && currentInput.length === 1;
 
           // Capture the most recent error text in this turn (if any)
           let latestErrorText: string | null = null;
@@ -2743,78 +2674,33 @@ export default function App({
           if (hasApprovalInPayload && desyncDetected) {
             if (llmApiErrorRetriesRef.current < LLM_API_ERROR_MAX_RETRIES) {
               llmApiErrorRetriesRef.current += 1;
-
-	              telemetry.trackError(
-	                "ApprovalStateDesync",
-	                `Desync detected: ${desyncDetected ? "yes" : "no"}, retries: ${llmApiErrorRetriesRef.current}`,
-	                "approval_recovery",
-	              );
-
-	              const warningStatusId = uid("status");
-	              buffersRef.current.byId.set(warningStatusId, {
-	                kind: "status",
-	                id: warningStatusId,
-	                lines: [
-	                  "⚠️ Approval state mismatch detected - this shouldn't happen often",
-	                  "If you see this frequently, please report it as a bug",
-	                ],
-	              });
-	              buffersRef.current.order.push(warningStatusId);
-
-	              const statusId = uid("status");
-	              buffersRef.current.byId.set(statusId, {
-	                kind: "status",
-	                id: statusId,
-                lines: ["Clearing stale approvals from interrupted session..."],
+              const statusId = uid("status");
+              buffersRef.current.byId.set(statusId, {
+                kind: "status",
+                id: statusId,
+                lines: [
+                  "Approval state desynced; resending keep-alive recovery prompt...",
+                ],
               });
               buffersRef.current.order.push(statusId);
               refreshDerived();
 
-              try {
-                const client = await getClient();
-                const agent = await client.agents.retrieve(agentIdRef.current);
-                const { pendingApprovals: existingApprovals } = await getResumeData(
-                  client,
-                  agent,
-                  conversationIdRef.current,
+              if (isApprovalOnlyPayload) {
+                // Approval-only payload: send recovery prompt
+                currentInput.splice(
+                  0,
+                  currentInput.length,
+                  buildApprovalRecoveryMessage(),
                 );
-
-                const messageItems = currentInput.filter(
-                  (item) => item?.type !== "approval",
-                );
-
-                if (existingApprovals.length > 0) {
-                  const denialResults = existingApprovals.map((approval) => ({
-                    type: "approval" as const,
-                    tool_call_id: approval.toolCallId,
-                    approve: false,
-                    reason:
-                      "Auto-denied: stale approval from interrupted session",
-                  }));
-                  currentInput.splice(0, currentInput.length, {
-                    type: "approval",
-                    approvals: denialResults,
-                  });
-                  if (messageItems.length > 0) {
-                    currentInput.push(...messageItems);
-                  }
-                } else if (messageItems.length > 0) {
-                  currentInput.splice(0, currentInput.length, ...messageItems);
-                } else {
-                  currentInput.splice(
-                    0,
-                    currentInput.length,
-                    buildApprovalRecoveryMessage(),
-                  );
-                }
-              } catch {
-                // If we can't fetch approvals, fall back to stripping stale approvals (or sending recovery prompt)
+              } else {
+                // Mixed payload [approval, message]: strip stale approval, keep user message
                 const messageItems = currentInput.filter(
                   (item) => item?.type !== "approval",
                 );
                 if (messageItems.length > 0) {
                   currentInput.splice(0, currentInput.length, ...messageItems);
                 } else {
+                  // Fallback if somehow no message items remain
                   currentInput.splice(
                     0,
                     currentInput.length,
@@ -2921,12 +2807,15 @@ export default function App({
             buffersRef.current.order.push(statusId);
             refreshDerived();
 
+            // Capture current abort controller for stable reference during retry wait
+            const retryAbortController = abortControllerRef.current;
+
             // Wait before retry (check abort signal periodically for ESC cancellation)
             let cancelled = false;
             const startTime = Date.now();
             while (Date.now() - startTime < delayMs) {
               if (
-                abortControllerRef.current?.signal.aborted ||
+                retryAbortController?.signal.aborted ||
                 userCancelledRef.current
               ) {
                 cancelled = true;
@@ -2942,6 +2831,12 @@ export default function App({
             );
             refreshDerived();
 
+            // Verify abort controller hasn't been replaced during wait
+            if (abortControllerRef.current !== retryAbortController) {
+              // New processConversation started - treat as cancelled
+              cancelled = true;
+            }
+
             if (!cancelled) {
               // Reset interrupted flag so retry stream chunks are processed
               buffersRef.current.interrupted = false;
@@ -2955,11 +2850,7 @@ export default function App({
           llmApiErrorRetriesRef.current = 0;
 
           // Mark incomplete tool calls as finished to prevent stuck blinking UI
-          markIncompleteToolsAsCancelled(
-            buffersRef.current,
-            true,
-            "stream_error",
-          );
+          markIncompleteToolsAsCancelled(buffersRef.current);
 
           // Track the error in telemetry
           telemetry.trackError(
@@ -3044,11 +2935,7 @@ export default function App({
         }
       } catch (e) {
         // Mark incomplete tool calls as cancelled to prevent stuck blinking UI
-        markIncompleteToolsAsCancelled(
-          buffersRef.current,
-          true,
-          e instanceof APIUserAbortError ? "user_interrupt" : "stream_error",
-        );
+        markIncompleteToolsAsCancelled(buffersRef.current);
 
         // If using eager cancel and this is an abort error, silently ignore it
         // The user already got "Stream interrupted by user" feedback from handleInterrupt
@@ -3271,33 +3158,9 @@ export default function App({
     setMessageQueue([]);
   }, []);
 
-  // Handle paste errors (e.g., image too large)
-  const handlePasteError = useCallback(
-    (message: string) => {
-      const statusId = uid("status");
-      buffersRef.current.byId.set(statusId, {
-        kind: "status",
-        id: statusId,
-        lines: [`⚠️ ${message}`],
-      });
-      buffersRef.current.order.push(statusId);
-      refreshDerived();
-    },
-    [refreshDerived],
-  );
-
   const handleInterrupt = useCallback(async () => {
     // If we're executing client-side tools, abort them AND the main stream
-    const hasTrackedTools =
-      executingToolCallIdsRef.current.length > 0 ||
-      autoAllowedExecutionRef.current?.results;
-    if (
-      isExecutingTool &&
-      toolAbortControllerRef.current &&
-      hasTrackedTools &&
-      !toolResultsInFlightRef.current
-    ) {
-      cleanupInProgressRef.current = true;
+    if (isExecutingTool && toolAbortControllerRef.current) {
       toolAbortControllerRef.current.abort();
 
       // Mark any in-flight conversation as stale, consistent with EAGER_CANCEL.
@@ -3333,12 +3196,7 @@ export default function App({
       // ALSO abort the main stream - don't leave it running
       buffersRef.current.abortGeneration =
         (buffersRef.current.abortGeneration || 0) + 1;
-      buffersRef.current.interrupted = true;
-      const toolsCancelled = markIncompleteToolsAsCancelled(
-        buffersRef.current,
-        false,
-        "user_interrupt",
-      );
+      const toolsCancelled = markIncompleteToolsAsCancelled(buffersRef.current);
 
       // Mark any running subagents as interrupted
       interruptActiveSubagents(INTERRUPTED_BY_USER);
@@ -3348,10 +3206,10 @@ export default function App({
         appendError(INTERRUPT_MESSAGE, true);
       }
 
-	      const mainAbortController = abortControllerRef.current;
-	      if (mainAbortController) {
-	        mainAbortController.abort();
-	      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
 
       userCancelledRef.current = true; // Prevent dequeue
       setStreaming(false);
@@ -3364,7 +3222,6 @@ export default function App({
       setAutoHandledResults([]);
       setAutoDeniedApprovals([]);
 
-      toolResultsInFlightRef.current = false;
       refreshDerived();
 
       // If the backend has already created an approval_request_message, it will refuse
@@ -3428,7 +3285,6 @@ export default function App({
       // batched state updates have been fully processed before we allow the dequeue effect.
       setTimeout(() => {
         userCancelledRef.current = false;
-        cleanupInProgressRef.current = false;
       }, 50);
 
       return;
@@ -3437,8 +3293,6 @@ export default function App({
     if (!streaming || interruptRequested) {
       return;
     }
-
-    cleanupInProgressRef.current = true;
 
     // If we're in the middle of queue cancel, set flag to restore instead of auto-send
     if (waitingForQueueCancelRef.current) {
@@ -3451,26 +3305,20 @@ export default function App({
       // Prevent multiple handleInterrupt calls while state updates are pending
       setInterruptRequested(true);
 
-      // Capture the current agent id before any async work to avoid stale state.
-      const capturedAgentIdEager = agentIdRef.current;
-
+      // Set interrupted flag FIRST, before abort() triggers any async work.
+      // This ensures onChunk and other guards see interrupted=true immediately.
       buffersRef.current.abortGeneration =
         (buffersRef.current.abortGeneration || 0) + 1;
-      buffersRef.current.interrupted = true;
-      const toolsCancelled = markIncompleteToolsAsCancelled(
-        buffersRef.current,
-        false, // Don't set interrupted again
-        "user_interrupt",
-      );
+      const toolsCancelled = markIncompleteToolsAsCancelled(buffersRef.current);
 
       // Mark any running subagents as interrupted
       interruptActiveSubagents(INTERRUPTED_BY_USER);
 
       // NOW abort the stream - interrupted flag is already set
-	      const eagerAbortController = abortControllerRef.current;
-	      if (eagerAbortController) {
-	        eagerAbortController.abort();
-	      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null; // Clear ref so isAgentBusy() returns false
+      }
 
       // Set cancellation flag to prevent processConversation from starting
       userCancelledRef.current = true;
@@ -3486,18 +3334,17 @@ export default function App({
       // Stop streaming and show error message (unless tool calls were cancelled,
       // since the tool result will show "Interrupted by user")
       setStreaming(false);
-      toolResultsInFlightRef.current = false;
       if (!toolsCancelled) {
         appendError(INTERRUPT_MESSAGE, true);
       }
       refreshDerived();
 
-	      // Cache pending approvals, plus any auto-handled results, as a fallback; denials are also sent immediately below.
-	      const denialResults = pendingApprovals.map((approval) => ({
-	        type: "approval" as const,
-	        tool_call_id: approval.toolCallId,
-	        approve: false,
-	        reason: "User interrupted the stream",
+      // Cache pending approvals, plus any auto-handled results, for the next message.
+      const denialResults = pendingApprovals.map((approval) => ({
+        type: "approval" as const,
+        tool_call_id: approval.toolCallId,
+        approve: false,
+        reason: "User interrupted the stream",
       }));
       const autoHandledSnapshot = [...autoHandledResults];
       const autoDeniedSnapshot = [...autoDeniedApprovals];
@@ -3522,39 +3369,6 @@ export default function App({
         queueApprovalResults(queuedResults);
       }
 
-	      // Send denials immediately (best-effort, with retries) to clear server-side approval state
-	      if (queuedResults.length > 0) {
-	        getClient()
-	          .then(async (client) => {
-	            const sendDenialsWithRetry = async (
-	              attempt = 0,
-	            ): Promise<void> => {
-	              try {
-	                await client.agents.messages.create(capturedAgentIdEager, {
-	                  messages: [{ type: "approval", approvals: queuedResults }],
-	                  streaming: false,
-	                });
-	                queueApprovalResults(null);
-	              } catch (error) {
-	                if (attempt < 2) {
-	                  await new Promise((resolve) =>
-	                    setTimeout(resolve, 1000 * (attempt + 1)),
-	                  );
-	                  return sendDenialsWithRetry(attempt + 1);
-	                }
-	                telemetry.trackError(
-	                  "ImmediateDenialSendFailed",
-	                  `Failed after ${attempt + 1} attempts`,
-	                  "interrupt_cleanup",
-	                );
-	                // Keep queued results for next message after max retries
-	              }
-	            };
-	            await sendDenialsWithRetry();
-	          })
-	          .catch(() => {});
-	      }
-
       // Clear local approval state
       setPendingApprovals([]);
       setApprovalContexts([]);
@@ -3564,15 +3378,15 @@ export default function App({
 
       // If the backend has already created an approval_request_message, it will refuse
       // new user messages until it receives an approval/denial. Best-effort: detect
-      // any server-side pending approvals and clear them via immediate denials.
+      // any server-side pending approvals and queue denials to be sent with the next
+      // user message (see queuedApprovalResults flow below).
+      // Capture the current agent id before the async call to avoid stale state
+      // if the user switches agents while the promise is pending.
+      const capturedAgentIdEager = agentIdRef.current;
       getClient()
-        .then((client) => {
-          // Use agents API for "default" conversation (primary message history)
-          if (conversationIdRef.current === "default") {
-            return client.agents.messages.cancel(capturedAgentIdEager);
-          }
-          return client.conversations.cancel(conversationIdRef.current);
-        })
+        .then((client) =>
+          client.conversations.cancel(conversationIdRef.current),
+        )
         .catch(() => {
           // Silently ignore - cancellation already happened client-side
         });
@@ -3583,33 +3397,25 @@ export default function App({
       // This prevents the "Maximum update depth exceeded" infinite render loop.
       setTimeout(() => {
         userCancelledRef.current = false;
-        cleanupInProgressRef.current = false;
         setInterruptRequested(false);
       }, 50);
 
       return;
-	    } else {
-	      setInterruptRequested(true);
-	      try {
-	        const client = await getClient();
-        // Use agents API for "default" conversation (primary message history)
-        if (conversationIdRef.current === "default") {
-          await client.agents.messages.cancel(agentIdRef.current);
-        } else {
-          await client.conversations.cancel(conversationIdRef.current);
+    } else {
+      setInterruptRequested(true);
+      try {
+        const client = await getClient();
+        await client.conversations.cancel(conversationIdRef.current);
+
+        if (abortControllerRef.current) {
+          abortControllerRef.current.abort();
         }
-	
-		        if (abortControllerRef.current) {
-		          abortControllerRef.current.abort();
-		        }
-	      } catch (e) {
-	        const errorDetails = formatErrorDetails(e, agentId);
-	        appendError(`Failed to interrupt stream: ${errorDetails}`);
-	        setInterruptRequested(false);
-	      } finally {
-	        cleanupInProgressRef.current = false;
-	      }
-	    }
+      } catch (e) {
+        const errorDetails = formatErrorDetails(e, agentId);
+        appendError(`Failed to interrupt stream: ${errorDetails}`);
+        setInterruptRequested(false);
+      }
+    }
   }, [
     agentId,
     streaming,
@@ -3656,9 +3462,6 @@ export default function App({
       // Lock input for async operation (set before any await to prevent queue processing)
       setCommandRunning(true);
 
-      // Clear any queued tool images from the previous agent context
-      clearQueuedToolImages();
-
       const inputCmd = "/agents";
       const cmdId = uid("cmd");
 
@@ -3678,9 +3481,13 @@ export default function App({
         // Fetch new agent
         const agent = await client.agents.retrieve(targetAgentId);
 
-        // Use the agent's default conversation when switching agents
-        // User can /new to start a fresh conversation if needed
-        const targetConversationId = "default";
+        // Always create a new conversation when switching agents
+        // User can /resume to get back to a previous conversation if needed
+        const newConversation = await client.conversations.create({
+          agent_id: targetAgentId,
+          isolated_block_labels: [...ISOLATED_BLOCK_LABELS],
+        });
+        const targetConversationId = newConversation.id;
 
         // Update project settings with new agent
         await updateProjectSettings({ lastAgent: targetAgentId });
@@ -3710,15 +3517,16 @@ export default function App({
         agentIdRef.current = targetAgentId;
         setAgentId(targetAgentId);
         setAgentState(agent);
+        setAgentName(agent.name);
         setLlmConfig(agent.llm_config);
         setConversationId(targetConversationId);
+        clearSkillBlockCache();
 
-        // Build success message - resumed default conversation
+        // Build success message - always a new conversation
         const agentLabel = agent.name || targetAgentId;
         const successOutput = [
-          `Resumed the default conversation with **${agentLabel}**.`,
-          `⎿  Type /resume to browse all conversations`,
-          `⎿  Type /new to start a new conversation`,
+          `Started a new conversation with **${agentLabel}**.`,
+          `⎿  Type /resume to resume a previous conversation`,
         ].join("\n");
         const successItem: StaticItem = {
           kind: "command",
@@ -3801,6 +3609,7 @@ export default function App({
         agentIdRef.current = agent.id;
         setAgentId(agent.id);
         setAgentState(agent);
+        setAgentName(agent.name);
         setLlmConfig(agent.llm_config);
 
         // Build success message with hints
@@ -3846,7 +3655,7 @@ export default function App({
   );
 
   // Handle bash mode command submission
-  // Expands aliases from shell config files, then runs with spawnCommand
+  // Uses the same shell runner as the Bash tool for consistency
   const handleBashSubmit = useCallback(
     async (command: string) => {
       const cmdId = uid("bash");
@@ -3871,20 +3680,11 @@ export default function App({
       refreshDerived();
 
       try {
-        // Expand aliases before running
-        const { expandAliases } = await import("./helpers/shellAliases");
-        const expanded = expandAliases(command);
-
-        // If command uses a shell function, prepend the function definition
-        const finalCommand = expanded.functionDef
-          ? `${expanded.functionDef}\n${expanded.command}`
-          : expanded.command;
-
-        // Use spawnCommand for actual execution
+        // Use the same spawnCommand as the Bash tool for consistent behavior
         const { spawnCommand } = await import("../tools/impl/Bash.js");
         const { getShellEnv } = await import("../tools/impl/shellEnv.js");
 
-        const result = await spawnCommand(finalCommand, {
+        const result = await spawnCommand(command, {
           cwd: process.cwd(),
           env: getShellEnv(),
           timeout: 30000, // 30 second timeout
@@ -4145,46 +3945,9 @@ export default function App({
 
         // Send all results to server if any
         if (allResults.length > 0) {
-          toolResultsInFlightRef.current = true;
-
-          // Check for queued tool images (from Read tool reading image files)
-          const toolImages = getAndClearQueuedToolImages();
-          const input: Array<MessageCreate | ApprovalCreate> = [
+          await processConversation([
             { type: "approval", approvals: allResults },
-          ];
-
-          // If there are queued images, add them as a user message
-          if (toolImages.length > 0) {
-            const imageContentParts: Array<
-              | { type: "text"; text: string }
-              | {
-                  type: "image";
-                  source: { type: "base64"; media_type: string; data: string };
-                }
-            > = [];
-            for (const img of toolImages) {
-              imageContentParts.push({
-                type: "text",
-                text: `<system-reminder>Image read from ${img.filePath} (Read tool call: ${img.toolCallId}):</system-reminder>`,
-              });
-              imageContentParts.push({
-                type: "image",
-                source: {
-                  type: "base64",
-                  media_type: img.mediaType,
-                  data: img.data,
-                },
-              });
-            }
-            input.push({
-              type: "message",
-              role: "user",
-              content: imageContentParts as unknown as MessageCreate["content"],
-            });
-          }
-
-          await processConversation(input);
-          toolResultsInFlightRef.current = false;
+          ]);
         }
       } finally {
         if (shouldTrackAutoAllowed) {
@@ -4192,7 +3955,6 @@ export default function App({
           toolAbortControllerRef.current = null;
           executingToolCallIdsRef.current = [];
           autoAllowedExecutionRef.current = null;
-          toolResultsInFlightRef.current = false;
         }
       }
 
@@ -4255,20 +4017,9 @@ export default function App({
 
       // Block submission if waiting for explicit user action (approvals)
       // In this case, input is hidden anyway, so this shouldn't happen
-	      if (pendingApprovals.length > 0) {
-	        const statusId = uid("status");
-	        buffersRef.current.byId.set(statusId, {
-	          kind: "status",
-	          id: statusId,
-	          lines: [
-	            `⚠️ Cannot send message: ${pendingApprovals.length} tool(s) awaiting approval`,
-	            `Please approve or deny the pending tool call(s) first`,
-	          ],
-	        });
-	        buffersRef.current.order.push(statusId);
-	        refreshDerived();
-	        return { submitted: false };
-	      }
+      if (pendingApprovals.length > 0) {
+        return { submitted: false };
+      }
 
       // Queue message if agent is busy (streaming, executing tool, or running command)
       // This allows messages to queue up while agent is working
@@ -4302,13 +4053,9 @@ export default function App({
 
             // Send cancel request to backend (fire-and-forget)
             getClient()
-              .then((client) => {
-                // Use agents API for "default" conversation (primary message history)
-                if (conversationIdRef.current === "default") {
-                  return client.agents.messages.cancel(agentIdRef.current);
-                }
-                return client.conversations.cancel(conversationIdRef.current);
-              })
+              .then((client) =>
+                client.conversations.cancel(conversationIdRef.current),
+              )
               .then(() => {})
               .catch(() => {
                 // Reset flag if cancel fails
@@ -4817,8 +4564,9 @@ export default function App({
           return { submitted: true };
         }
 
-        // Special handling for /new command - start new conversation
-        if (msg.trim() === "/new") {
+        // Special handling for /clear and /new commands - start new conversation
+        // (/new used to create a new agent, now it's just an alias for /clear)
+        if (msg.trim() === "/clear" || msg.trim() === "/new") {
           const cmdId = uid("cmd");
           buffersRef.current.byId.set(cmdId, {
             kind: "command",
@@ -4832,9 +4580,6 @@ export default function App({
 
           setCommandRunning(true);
 
-          // Clear any queued tool images from the previous conversation
-          clearQueuedToolImages();
-
           try {
             const client = await getClient();
 
@@ -4846,6 +4591,7 @@ export default function App({
 
             // Update conversationId state
             setConversationId(conversation.id);
+            clearSkillBlockCache();
 
             // Save the new session to settings
             settingsManager.setLocalLastSession(
@@ -4888,14 +4634,14 @@ export default function App({
           return { submitted: true };
         }
 
-        // Special handling for /clear command - reset all agent messages (destructive)
-        if (msg.trim() === "/clear") {
+        // Special handling for /clear-messages command - reset all agent messages (destructive)
+        if (msg.trim() === "/clear-messages") {
           const cmdId = uid("cmd");
           buffersRef.current.byId.set(cmdId, {
             kind: "command",
             id: cmdId,
             input: msg,
-            output: "Clearing in-context messages...",
+            output: "Resetting agent messages...",
             phase: "running",
           });
           buffersRef.current.order.push(cmdId);
@@ -4917,6 +4663,7 @@ export default function App({
               isolated_block_labels: [...ISOLATED_BLOCK_LABELS],
             });
             setConversationId(conversation.id);
+            clearSkillBlockCache();
             settingsManager.setLocalLastSession(
               { agentId, conversationId: conversation.id },
               process.cwd(),
@@ -5194,7 +4941,7 @@ export default function App({
           try {
             const client = await getClient();
             await client.agents.update(agentId, { name: newName });
-            updateAgentName(newName);
+            setAgentName(newName);
 
             buffersRef.current.byId.set(cmdId, {
               kind: "command",
@@ -5346,6 +5093,7 @@ export default function App({
 
                 // Only update state after validation succeeds
                 setConversationId(targetConvId);
+                clearSkillBlockCache();
                 settingsManager.setLocalLastSession(
                   { agentId, conversationId: targetConvId },
                   process.cwd(),
@@ -5480,11 +5228,7 @@ export default function App({
         }
 
         // Special handling for /search command - show message search
-        if (trimmed.startsWith("/search")) {
-          // Extract optional query after /search
-          const [, ...rest] = trimmed.split(/\s+/);
-          const query = rest.join(" ").trim();
-          setSearchQuery(query);
+        if (msg.trim() === "/search") {
           setActiveOverlay("search");
           return { submitted: true };
         }
@@ -5501,7 +5245,7 @@ export default function App({
             agentId,
             agentName: agentName || "",
             setCommandRunning,
-            updateAgentName,
+            setAgentName,
           };
 
           // /profile - open agent browser (now points to /agents)
@@ -5597,7 +5341,7 @@ export default function App({
             agentId,
             agentName: agentName || "",
             setCommandRunning,
-            updateAgentName,
+            setAgentName,
           };
           await handlePin(profileCtx, msg, argsStr);
           return { submitted: true };
@@ -5611,7 +5355,7 @@ export default function App({
             agentId,
             agentName: agentName || "",
             setCommandRunning,
-            updateAgentName,
+            setAgentName,
           };
           const argsStr = msg.trim().slice(6).trim();
           handleUnpin(profileCtx, msg, argsStr);
@@ -6158,37 +5902,7 @@ ${gitContext}
       }
 
       // Build message content from display value (handles placeholders for text/images)
-      let contentParts = buildMessageContentFromDisplay(msg);
-
-      // Prepend any queued tool images (from Read tool reading image files)
-      const queuedToolImages = getAndClearQueuedToolImages();
-      if (queuedToolImages.length > 0) {
-        const imageParts: Array<
-          | { type: "text"; text: string }
-          | {
-              type: "image";
-              source: { type: "base64"; media_type: string; data: string };
-            }
-        > = [];
-        for (const img of queuedToolImages) {
-          // Add system reminder text
-          imageParts.push({
-            type: "text",
-            text: `<system-reminder>Image read from ${img.filePath} (Read tool call: ${img.toolCallId}):</system-reminder>`,
-          });
-          // Add image content
-          imageParts.push({
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: img.mediaType,
-              data: img.data,
-            },
-          });
-        }
-        // Prepend to contentParts
-        contentParts = [...imageParts, ...contentParts];
-      }
+      const contentParts = buildMessageContentFromDisplay(msg);
 
       // Prepend plan mode reminder if in plan mode
       const planModeReminder = getPlanModeReminder();
@@ -6606,11 +6320,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
                     queueApprovalResults(queuedResults, autoAllowedMetadata);
                   }
                   setStreaming(false);
-                  markIncompleteToolsAsCancelled(
-                    buffersRef.current,
-                    true,
-                    "user_interrupt",
-                  );
+                  markIncompleteToolsAsCancelled(buffersRef.current);
                   refreshDerived();
                   return { submitted: false };
                 }
@@ -6643,9 +6353,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
                   },
                 ];
 
-                toolResultsInFlightRef.current = true;
                 await processConversation(initialInput);
-                toolResultsInFlightRef.current = false;
                 clearPlaceholdersInText(msg);
                 return { submitted: true };
               } finally {
@@ -6654,7 +6362,6 @@ DO NOT respond to these messages or otherwise consider them in your response unl
                   toolAbortControllerRef.current = null;
                   executingToolCallIdsRef.current = [];
                   autoAllowedExecutionRef.current = null;
-                  toolResultsInFlightRef.current = false;
                 }
               }
             } else {
@@ -6853,11 +6560,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
                     queueApprovalResults(queuedResults, autoAllowedMetadata);
                   }
                   setStreaming(false);
-                  markIncompleteToolsAsCancelled(
-                    buffersRef.current,
-                    true,
-                    "user_interrupt",
-                  );
+                  markIncompleteToolsAsCancelled(buffersRef.current);
                   refreshDerived();
                   return { submitted: false };
                 }
@@ -7138,14 +6841,12 @@ DO NOT respond to these messages or otherwise consider them in your response unl
           queueSnapshotRef.current = [];
         } else {
           // Continue conversation with all results
-          toolResultsInFlightRef.current = true;
           await processConversation([
             {
               type: "approval",
               approvals: allResults as ApprovalResult[],
             },
           ]);
-          toolResultsInFlightRef.current = false;
         }
       } finally {
         // Always release the execution guard, even if an error occurred
@@ -7153,7 +6854,6 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         toolAbortControllerRef.current = null;
         executingToolCallIdsRef.current = [];
         interruptQueuedRef.current = false;
-        toolResultsInFlightRef.current = false;
       }
     },
     [
@@ -7460,11 +7160,6 @@ DO NOT respond to these messages or otherwise consider them in your response unl
   const handleCancelApprovals = useCallback(async () => {
     if (pendingApprovals.length === 0) return;
 
-    // Set cancellation flag to prevent dequeue effect from immediately firing
-    // when pendingApprovals is cleared. This prevents "Maximum update depth exceeded"
-    // infinite render loops (same pattern as handleInterrupt).
-    userCancelledRef.current = true;
-
     // Create denial results for all pending approvals (fallback if cancel call fails).
     const denialResults = pendingApprovals.map((approval) => ({
       type: "approval" as const,
@@ -7475,7 +7170,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
     queueApprovalResults(denialResults);
 
     // Mark the pending approval tool calls as cancelled in the buffers
-    markIncompleteToolsAsCancelled(buffersRef.current, true, "approval_cancel");
+    markIncompleteToolsAsCancelled(buffersRef.current);
     refreshDerived();
 
     // Clear all approval state
@@ -7484,14 +7179,6 @@ DO NOT respond to these messages or otherwise consider them in your response unl
     setApprovalResults([]);
     setAutoHandledResults([]);
     setAutoDeniedApprovals([]);
-
-    // Reset cancellation flag after a delay to ensure React has fully processed
-    // the state updates. Use setTimeout(50) instead of setTimeout(0) to ensure
-    // React's batched state updates have been fully processed before we allow
-    // the dequeue effect to start a new conversation.
-    setTimeout(() => {
-      userCancelledRef.current = false;
-    }, 50);
   }, [pendingApprovals, refreshDerived, queueApprovalResults]);
 
   const handleModelSelect = useCallback(
@@ -8041,17 +7728,8 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         queueApprovalResults(denialResults);
 
         // Mark tool as cancelled in buffers
-        markIncompleteToolsAsCancelled(
-          buffersRef.current,
-          true,
-          "internal_cancel",
-        );
+        markIncompleteToolsAsCancelled(buffersRef.current);
         refreshDerived();
-
-        // Set cancellation flag to prevent dequeue effect from immediately firing
-        // when pendingApprovals is cleared. This prevents "Maximum update depth exceeded"
-        // infinite render loops (same pattern as handleCancelApprovals).
-        userCancelledRef.current = true;
 
         // Clear all approval state (same as handleCancelApprovals)
         setPendingApprovals([]);
@@ -8059,13 +7737,6 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         setApprovalResults([]);
         setAutoHandledResults([]);
         setAutoDeniedApprovals([]);
-
-        // Reset cancellation flag after a delay to ensure React has fully processed
-        // the state updates before we allow the dequeue effect to start a new conversation.
-        setTimeout(() => {
-          userCancelledRef.current = false;
-        }, 50);
-
         return;
       }
       // Then check if plan file exists (keep existing behavior - immediate rejection)
@@ -8659,16 +8330,11 @@ Plan file path: ${planFilePath}`;
                     ? `letta -n "${agentName}"`
                     : `letta --agent ${agentId}`}
                 </Text>
-                {/* Only show conversation hint if not on default (default is resumed automatically) */}
-                {conversationId !== "default" && (
-                  <>
-                    <Text> </Text>
-                    <Text dimColor>Resume this conversation with:</Text>
-                    <Text color={colors.link.url}>
-                      {`letta --conv ${conversationId}`}
-                    </Text>
-                  </>
-                )}
+                <Text> </Text>
+                <Text dimColor>Resume this conversation with:</Text>
+                <Text color={colors.link.url}>
+                  {`letta --conv ${conversationId}`}
+                </Text>
               </Box>
             )}
 
@@ -8683,7 +8349,6 @@ Plan file path: ${planFilePath}`;
                 streaming={
                   streaming && !abortControllerRef.current?.signal.aborted
                 }
-                pendingApprovalsCount={pendingApprovals.length}
                 tokenCount={tokenCount}
                 thinkingMessage={thinkingMessage}
                 onSubmit={onSubmit}
@@ -8707,7 +8372,6 @@ Plan file path: ${planFilePath}`;
                 ralphPendingYolo={pendingRalphConfig?.isYolo ?? false}
                 onRalphExit={handleRalphExit}
                 conversationId={conversationId}
-                onPasteError={handlePasteError}
               />
             </Box>
 
@@ -8816,6 +8480,7 @@ Plan file path: ${planFilePath}`;
 
                       // Only update state after validation succeeds
                       setConversationId(convId);
+                      clearSkillBlockCache();
                       settingsManager.setLocalLastSession(
                         { agentId, conversationId: convId },
                         process.cwd(),
@@ -8980,6 +8645,7 @@ Plan file path: ${planFilePath}`;
                       isolated_block_labels: [...ISOLATED_BLOCK_LABELS],
                     });
                     setConversationId(conversation.id);
+                    clearSkillBlockCache();
                     settingsManager.setLocalLastSession(
                       { agentId, conversationId: conversation.id },
                       process.cwd(),
@@ -9038,10 +8704,7 @@ Plan file path: ${planFilePath}`;
 
             {/* Message Search - conditionally mounted as overlay */}
             {activeOverlay === "search" && (
-              <MessageSearch
-                onClose={closeOverlay}
-                initialQuery={searchQuery || undefined}
-              />
+              <MessageSearch onClose={closeOverlay} />
             )}
 
             {/* Feedback Dialog - conditionally mounted as overlay */}
@@ -9143,7 +8806,7 @@ Plan file path: ${planFilePath}`;
                     // Rename if new name provided
                     if (newName && newName !== agentName) {
                       await client.agents.update(agentId, { name: newName });
-                      updateAgentName(newName);
+                      setAgentName(newName);
                     }
 
                     // Pin the agent

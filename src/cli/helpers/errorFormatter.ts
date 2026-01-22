@@ -88,7 +88,17 @@ export function formatErrorDetails(
         runId = e.error.run_id;
       }
 
-      const baseError = detail ? `${e.message}\nDetail: ${detail}` : e.message;
+      // Prefer detail over message when:
+      // 1. detail exists and is a string
+      // 2. e.message looks like verbose JSON (starts with HTTP code + '{')
+      // Otherwise combine both for maximum context
+      const looksLikeJson = e.message.trim().match(/^\d{3}\s+\{/);
+      const baseError =
+        detail && typeof detail === "string" && looksLikeJson
+          ? detail
+          : detail && typeof detail === "string"
+            ? `${e.message}\nDetail: ${detail}`
+            : e.message;
       return runId && agentId
         ? `${baseError}\n${createAgentLink(runId, agentId, conversationId)}`
         : baseError;

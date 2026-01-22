@@ -16,6 +16,10 @@ type AssistantLine = {
   id: string;
   text: string;
   phase: "streaming" | "finished";
+  // isContinuation is true for split continuation lines (aggressive static promotion)
+  // These are created by accumulator's trySplitContent() when streaming content
+  // is split at paragraph boundaries. First line shows bullet, continuations don't.
+  isContinuation?: boolean;
 };
 
 /**
@@ -23,7 +27,7 @@ type AssistantLine = {
  * This is a direct port from the old letta-code codebase to preserve the exact styling
  *
  * Features:
- * - Left column (2 chars wide) with bullet point marker
+ * - Left column (2 chars wide) with bullet point marker (unless continuation)
  * - Right column with wrapped text content
  * - Proper text normalization
  * - Support for markdown rendering (when MarkdownDisplay is available)
@@ -37,7 +41,7 @@ export const AssistantMessage = memo(({ line }: { line: AssistantLine }) => {
   return (
     <Box flexDirection="row">
       <Box width={2} flexShrink={0}>
-        <Text>●</Text>
+        <Text>{line.isContinuation ? " " : "●"}</Text>
       </Box>
       <Box flexGrow={1} width={contentWidth}>
         <MarkdownDisplay text={normalizedText} hangingIndent={0} />

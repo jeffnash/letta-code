@@ -275,8 +275,23 @@ export function ModelSelector({
         return;
       }
 
-      if (key.tab) {
+      // Tab or left/right arrows to switch categories
+      if (key.tab || key.rightArrow) {
         cycleCategory();
+        return;
+      }
+
+      if (key.leftArrow) {
+        // Cycle backwards through categories
+        const categories = getModelCategories(showNonCliProxyModels);
+        setCategory((current) => {
+          const idx = categories.indexOf(current);
+          return categories[
+            idx === 0 ? categories.length - 1 : idx - 1
+          ] as ModelCategory;
+        });
+        setSelectedIndex(0);
+        setSearchQuery("");
         return;
       }
 
@@ -480,7 +495,8 @@ export function ModelSelector({
             refresh
           </Text>
           <Text dimColor>
-            {"  "}Enter select · ↑↓ navigate · Tab switch · Esc cancel
+            {"  "}Enter select · ↑↓ navigate · ←→ switch tabs · Tab next tab ·
+            Esc cancel
           </Text>
         </Box>
       )}

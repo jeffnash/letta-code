@@ -9,6 +9,7 @@ import {
   getMemoryBlockSupport,
   initializeLoadedSkillsFlag,
   setAgentContext,
+  setConversationId as setContextConversationId,
 } from "./agent/context";
 import type { AgentProvenance } from "./agent/create";
 import { INCOGNITO_TAG, MEMO_TAG } from "./agent/defaults";
@@ -22,6 +23,7 @@ import { permissionMode } from "./permissions/mode";
 import { settingsManager } from "./settings-manager";
 import { telemetry } from "./telemetry";
 import { loadTools, upsertToolsIfNeeded } from "./tools/manager";
+import { clearSkillBlockCache } from "./tools/impl/Skill";
 import { markMilestone } from "./utils/timing";
 
 // Validate bundled prompt assets early - throws if build is corrupted
@@ -1805,6 +1807,9 @@ async function main(): Promise<void> {
         setAgentId(agent.id);
         setAgentState(agent);
         setConversationId(conversationIdToUse);
+        // Also set in global context for tools (e.g., Skill tool) to access
+        setContextConversationId(conversationIdToUse);
+        clearSkillBlockCache();
         setLoadingState("ready");
       }
 
