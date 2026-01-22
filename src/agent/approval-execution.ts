@@ -393,19 +393,62 @@ export async function executeApprovalBatch(
   // 1. Parallel-safe tools (all in parallel)
   // 2. Write tools grouped by resource (sequential within each group, parallel across groups)
   // 3. Denials (no actual execution needed, but process for UI updates)
-  await Promise.all([
-    // Parallel-safe tools + denials: all run in parallel
-    ...parallelIndices.map(execute),
-    ...denyIndices.map(execute),
-    // Write tools: sequential within each resource group, parallel across groups
-    ...Array.from(writeToolsByResource.values()).map(async (indices) => {
-      for (const i of indices) {
-        await execute(i);
-      }
-    }),
-  ]);
+  try {
+    await Promise.all([
+      // Parallel-safe tools + denials: all run in parallel
+      ...parallelIndices.map(execute),
+      ...denyIndices.map(execute),
+      // Write tools: sequential within each resource group, parallel across groups
+      ...Array.from(writeToolsByResource.values()).map(async (indices) => {
+        for (const i of indices) {
+          await execute(i);
+        }
+      }),
+    ]);
+  } catch (e) {
+    // If an unhandled error occurred during execution, log it but continue
+    // to fill in missing results to avoid tool_call_id mismatch errors on the server
+    console.error(
+      "[executeApprovalBatch] Unhandled error during execution:",
+      e,
+    );
+  }
 
-  // Filter out nulls (shouldn't happen, but TypeScript needs this)
+  // IMPORTANT: Ensure ALL decisions have a result to avoid tool_call_id mismatch errors.
+  // If any result is still null (due to errors or race conditions), fill it with an
+  // interrupted status. The server requires responses for ALL tool_call_ids from the
+  // approval_request_message.
+  for (let i = 0; i < decisions.length; i++) {
+    if (results[i] === null) {
+      const decision = decisions[i];
+      if (decision) {
+        const wasAborted = options?.abortSignal?.aborted;
+        const errorMessage = wasAborted
+          ? INTERRUPTED_BY_USER
+          : "Tool execution failed unexpectedly";
+
+        if (onChunk) {
+          onChunk({
+            message_type: "tool_return_message",
+            id: "dummy",
+            date: new Date().toISOString(),
+            tool_call_id: decision.approval.toolCallId,
+            tool_return: errorMessage,
+            status: "error",
+          });
+        }
+
+        results[i] = {
+          type: "tool",
+          tool_call_id: decision.approval.toolCallId,
+          tool_return: errorMessage,
+          status: "error",
+        };
+      }
+    }
+  }
+
+  // Filter out nulls (shouldn't happen after the above loop, but TypeScript needs this)
   return results.filter((r): r is ApprovalResult => r !== null);
 }
 

@@ -7460,6 +7460,11 @@ DO NOT respond to these messages or otherwise consider them in your response unl
   const handleCancelApprovals = useCallback(async () => {
     if (pendingApprovals.length === 0) return;
 
+    // Set cancellation flag to prevent dequeue effect from immediately firing
+    // when pendingApprovals is cleared. This prevents "Maximum update depth exceeded"
+    // infinite render loops (same pattern as handleInterrupt).
+    userCancelledRef.current = true;
+
     // Create denial results for all pending approvals (fallback if cancel call fails).
     const denialResults = pendingApprovals.map((approval) => ({
       type: "approval" as const,
@@ -7479,6 +7484,14 @@ DO NOT respond to these messages or otherwise consider them in your response unl
     setApprovalResults([]);
     setAutoHandledResults([]);
     setAutoDeniedApprovals([]);
+
+    // Reset cancellation flag after a delay to ensure React has fully processed
+    // the state updates. Use setTimeout(50) instead of setTimeout(0) to ensure
+    // React's batched state updates have been fully processed before we allow
+    // the dequeue effect to start a new conversation.
+    setTimeout(() => {
+      userCancelledRef.current = false;
+    }, 50);
   }, [pendingApprovals, refreshDerived, queueApprovalResults]);
 
   const handleModelSelect = useCallback(
@@ -8035,12 +8048,24 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         );
         refreshDerived();
 
+        // Set cancellation flag to prevent dequeue effect from immediately firing
+        // when pendingApprovals is cleared. This prevents "Maximum update depth exceeded"
+        // infinite render loops (same pattern as handleCancelApprovals).
+        userCancelledRef.current = true;
+
         // Clear all approval state (same as handleCancelApprovals)
         setPendingApprovals([]);
         setApprovalContexts([]);
         setApprovalResults([]);
         setAutoHandledResults([]);
         setAutoDeniedApprovals([]);
+
+        // Reset cancellation flag after a delay to ensure React has fully processed
+        // the state updates before we allow the dequeue effect to start a new conversation.
+        setTimeout(() => {
+          userCancelledRef.current = false;
+        }, 50);
+
         return;
       }
       // Then check if plan file exists (keep existing behavior - immediate rejection)
