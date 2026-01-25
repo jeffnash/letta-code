@@ -6,6 +6,10 @@ import { getClient } from "../../agent/client";
 import { getModelDisplayName } from "../../agent/model";
 import { settingsManager } from "../../settings-manager";
 import { useTerminalWidth } from "../hooks/useTerminalWidth";
+import {
+  determineKeyboardAction,
+  type TabId,
+} from "./agentSelectorKeyboard";
 import { colors } from "./colors";
 import { MarkdownDisplay } from "./MarkdownDisplay";
 
@@ -21,8 +25,6 @@ interface AgentSelectorProps {
   /** The command that triggered this selector (e.g., "/agents" or "/resume") */
   command?: string;
 }
-
-type TabId = "pinned" | "letta-code" | "all";
 
 interface PinnedAgentData {
   agentId: string;
@@ -109,6 +111,21 @@ function formatModel(agent: AgentState): string {
   return "unknown";
 }
 
+export function getFooterHints(
+  isSearchMode: boolean,
+  activeTab: TabId,
+  activeQuery: string,
+  hasCreateNewAgent: boolean,
+): string {
+  if (isSearchMode) {
+    return "Enter search · ↑↓ navigate · Esc cancel";
+  }
+  const searchHint = activeTab === "pinned" ? " · P unpin" : " · / search";
+  const newHint = hasCreateNewAgent ? " · N new" : "";
+  const escHint = activeQuery && activeTab !== "pinned" ? "clear" : "cancel";
+  return `Enter select · ↑↓ navigate · ←→ page · Tab switch${searchHint}${newHint} · Esc ${escHint}`;
+}
+
 export function AgentSelector({
   currentAgentId,
   onSelect,
@@ -153,6 +170,7 @@ export function AgentSelector({
   const [allQuery, setAllQuery] = useState<string>(""); // Query used to load current data
 
   // Search state (shared across list tabs)
+  const [isSearchMode, setIsSearchMode] = useState(false);
   const [searchInput, setSearchInput] = useState("");
   const [activeQuery, setActiveQuery] = useState("");
 
@@ -416,8 +434,13 @@ export function AgentSelector({
     }
   }, [searchInput, activeQuery]);
 
-  // Clear search (effect will handle reload when query changes)
+  const exitSearchMode = useCallback(() => {
+    setIsSearchMode(false);
+    setSearchInput("");
+  }, []);
+
   const clearSearch = useCallback(() => {
+    setIsSearchMode(false);
     setSearchInput("");
     if (activeQuery) {
       setActiveQuery("");
@@ -435,7 +458,13 @@ export function AgentSelector({
     if (key.tab) {
       const currentIndex = TABS.findIndex((t) => t.id === activeTab);
       const nextIndex = (currentIndex + 1) % TABS.length;
-      setActiveTab(TABS[nextIndex]?.id ?? "pinned");
+      const nextTab = TABS[nextIndex]?.id ?? "pinned";
+      setActiveTab(nextTab);
+      // Exit search mode when switching to pinned (doesn't support search)
+      if (nextTab === "pinned" && isSearchMode) {
+        setIsSearchMode(false);
+        setSearchInput("");
+      }
       return;
     }
 
@@ -481,14 +510,18 @@ export function AgentSelector({
         }
       }
     } else if (key.escape) {
-      // If typing search (list tabs), clear it first
-      if (activeTab !== "pinned" && searchInput) {
+      if (isSearchMode) {
+        exitSearchMode();
+        return;
+      }
+      // Only clear search on tabs that support it - pinned tab can't see/use the query
+      if (activeQuery && activeTab !== "pinned") {
         clearSearch();
         return;
       }
       onCancel();
     } else if (key.backspace || key.delete) {
-      if (activeTab !== "pinned") {
+      if (isSearchMode) {
         setSearchInput((prev) => prev.slice(0, -1));
       }
     } else if (key.leftArrow) {
@@ -560,12 +593,26 @@ export function AgentSelector({
         }
         loadPinnedAgents();
       }
-    } else if (input === "n" || input === "N") {
-      // Create new agent
-      onCreateNewAgent?.();
-    } else if (activeTab !== "pinned" && input && !key.ctrl && !key.meta) {
-      // Type to search (list tabs only)
-      setSearchInput((prev) => prev + input);
+    } else {
+      // Handle '/' to enter search, 'n'/'N' for new agent, and search input
+      const action = determineKeyboardAction(input, { ctrl: key.ctrl, meta: key.meta }, {
+        activeTab,
+        isSearchMode,
+      });
+      switch (action.type) {
+        case "enter_search_mode":
+          setIsSearchMode(true);
+          if (activeQuery && !searchInput) {
+            setSearchInput(activeQuery);
+          }
+          break;
+        case "create_new_agent":
+          onCreateNewAgent?.();
+          break;
+        case "add_to_search":
+          setSearchInput((prev) => prev + action.char);
+          break;
+      }
     }
   });
 
@@ -710,17 +757,27 @@ export function AgentSelector({
         </Box>
       </Box>
 
-      {/* Search input - list tabs only */}
-      {activeTab !== "pinned" && (searchInput || activeQuery) && (
+      {isSearchMode && activeTab !== "pinned" && (
         <Box marginBottom={1}>
           <Text dimColor>Search: </Text>
           <Text>{searchInput}</Text>
           {searchInput && searchInput !== activeQuery && (
-            <Text dimColor> (press Enter to search)</Text>
+            <Text dimColor> (Enter to search, Esc to cancel)</Text>
           )}
           {activeQuery && searchInput === activeQuery && (
-            <Text dimColor> (Esc to clear)</Text>
+            <Text dimColor> (Esc to exit)</Text>
           )}
+          {!searchInput && !activeQuery && (
+            <Text dimColor> (Esc to cancel)</Text>
+          )}
+        </Box>
+      )}
+
+      {!isSearchMode && activeQuery && activeTab !== "pinned" && (
+        <Box marginBottom={1}>
+          <Text dimColor>Filtered by: </Text>
+          <Text>{activeQuery}</Text>
+          <Text dimColor> (/ to edit, Esc to clear)</Text>
         </Box>
       )}
 
@@ -800,7 +857,7 @@ export function AgentSelector({
               : activeTab === "letta-code"
                 ? `Page ${lettaCodePage + 1}${lettaCodeHasMore ? "+" : `/${lettaCodeTotalPages || 1}`}${lettaCodeLoadingMore ? " (loading...)" : ""}`
                 : `Page ${allPage + 1}${allHasMore ? "+" : `/${allTotalPages || 1}`}${allLoadingMore ? " (loading...)" : ""}`;
-          const hintsText = `Enter select · ↑↓ navigate · ←→ page · Tab switch${activeTab === "pinned" ? " · P unpin" : " · Type to search"}${onCreateNewAgent ? " · N new" : ""} · Esc cancel`;
+          const hintsText = getFooterHints(isSearchMode, activeTab, activeQuery, !!onCreateNewAgent);
 
           return (
             <Box flexDirection="column">
