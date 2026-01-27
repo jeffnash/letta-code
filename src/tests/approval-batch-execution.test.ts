@@ -49,14 +49,23 @@ describe("executeApprovalBatch", () => {
     toolName: string,
     type: "approve" | "deny" = "approve",
   ): ApprovalDecision {
+    if (type === "deny") {
+      return {
+        type: "deny",
+        approval: {
+          toolCallId,
+          toolName,
+          toolArgs: "{}",
+        },
+        reason: "Test denial reason",
+      };
+    }
     return {
-      type,
+      type: "approve",
       approval: {
         toolCallId,
         toolName,
         toolArgs: "{}",
-        toolCallMessageId: "test-msg-id",
-        parsedArgs: {},
       },
     };
   }
@@ -140,9 +149,10 @@ describe("executeApprovalBatch", () => {
     // Should have results for all denials
     expect(results).toHaveLength(2);
     expect(results[0]?.tool_call_id).toBe("call-1");
-    expect(results[0]?.status).toBe("error"); // Denials are marked as errors
+    // Denials return ApprovalReturn with approve: false
+    expect((results[0] as { approve?: boolean })?.approve).toBe(false);
     expect(results[1]?.tool_call_id).toBe("call-2");
-    expect(results[1]?.status).toBe("error");
+    expect((results[1] as { approve?: boolean })?.approve).toBe(false);
   });
 
   test("handles mixed approved and denied decisions", async () => {
@@ -235,25 +245,33 @@ describe("executeApprovalBatch result completeness", () => {
     for (const scenario of scenarios) {
       const decisions: ApprovalDecision[] = [];
       for (let i = 0; i < scenario.numDecisions; i++) {
-        decisions.push({
-          type: i % 2 === 0 ? "approve" : "deny",
-          approval: {
-            toolCallId: `call-${i}`,
-            toolName: i % 2 === 0 ? "Read" : "Bash",
-            toolArgs: "{}",
-            toolCallMessageId: "msg-id",
-            parsedArgs: {},
-          },
-        });
+        const isApprove = i % 2 === 0;
+        if (isApprove) {
+          decisions.push({
+            type: "approve",
+            approval: {
+              toolCallId: `call-${i}`,
+              toolName: "Read",
+              toolArgs: "{}",
+            },
+          });
+        } else {
+          decisions.push({
+            type: "deny",
+            approval: {
+              toolCallId: `call-${i}`,
+              toolName: "Bash",
+              toolArgs: "{}",
+            },
+            reason: "Test denial",
+          });
+        }
       }
 
       const results = await executeApprovalBatch(decisions, () => {});
 
       // This is the critical assertion: result count must match decision count
-      expect(results.length).toBe(
-        scenario.numDecisions,
-        `Failed for scenario: ${scenario.name}`,
-      );
+      expect(results.length).toBe(scenario.numDecisions);
 
       // All results should have valid tool_call_ids
       for (let i = 0; i < scenario.numDecisions; i++) {

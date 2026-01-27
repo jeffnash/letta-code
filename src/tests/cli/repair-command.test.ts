@@ -5,6 +5,7 @@
  * behavior for repairing corrupted agent message history.
  */
 
+import { describe, expect, test } from "bun:test";
 import { commands } from "../../cli/commands/registry";
 
 describe("/repair command", () => {
@@ -15,24 +16,28 @@ describe("/repair command", () => {
 
     test("command has correct description", () => {
       const cmd = commands["/repair"];
-      expect(cmd.desc).toContain("repair");
-      expect(cmd.desc.toLowerCase()).toContain("message");
+      expect(cmd).toBeDefined();
+      expect(cmd!.desc.toLowerCase()).toContain("repair");
+      expect(cmd!.desc.toLowerCase()).toContain("message");
     });
 
     test("command is not hidden", () => {
       const cmd = commands["/repair"];
-      expect(cmd.hidden).not.toBe(true);
+      expect(cmd).toBeDefined();
+      expect(cmd!.hidden).not.toBe(true);
     });
 
     test("command has an order for autocomplete", () => {
       const cmd = commands["/repair"];
-      expect(cmd.order).toBeDefined();
-      expect(typeof cmd.order).toBe("number");
+      expect(cmd).toBeDefined();
+      expect(cmd!.order).toBeDefined();
+      expect(typeof cmd!.order).toBe("number");
     });
 
     test("command handler returns expected message", () => {
       const cmd = commands["/repair"];
-      const result = cmd.handler([]);
+      expect(cmd).toBeDefined();
+      const result = cmd!.handler([]);
       expect(result).toContain("Repairing");
     });
   });
@@ -40,16 +45,17 @@ describe("/repair command", () => {
   describe("autocomplete behavior", () => {
     test("/repair appears in autocomplete when typing /rep", () => {
       const matchingCommands = Object.keys(commands).filter(
-        (cmd) => cmd.startsWith("/rep") && !commands[cmd].hidden,
+        (cmd) => cmd.startsWith("/rep") && !commands[cmd]?.hidden,
       );
       expect(matchingCommands).toContain("/repair");
     });
 
     test("/repair is sorted appropriately with other commands", () => {
       const cmd = commands["/repair"];
+      expect(cmd).toBeDefined();
       // Should be in a reasonable range (not first, not last)
-      expect(cmd.order).toBeGreaterThan(0);
-      expect(cmd.order).toBeLessThan(100);
+      expect(cmd!.order).toBeGreaterThan(0);
+      expect(cmd!.order).toBeLessThan(100);
     });
   });
 });
