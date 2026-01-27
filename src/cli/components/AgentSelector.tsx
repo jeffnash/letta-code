@@ -26,7 +26,7 @@ interface AgentSelectorProps {
   command?: string;
 }
 
-type TabId = "pinned" | "letta-code" | "all";
+// TabId is imported from agentSelectorKeyboard
 
 type ViewState =
   | { type: "list" }
