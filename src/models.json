@@ -1171,10 +1171,20 @@
     }
   },
   {
+    "id": "cliproxy-kimi-k2.5",
+    "handle": "cliproxy/moonshotai/Kimi-K2.5",
+    "label": "Kimi K2.5 (CLIProxy)",
+    "description": "Kimi K2.5 via CLIProxyAPI",
+    "updateArgs": {
+      "context_window": 262144,
+      "max_output_tokens": 65535
+    }
+  },
+  {
     "id": "chutes-kimi-k2.5",
-    "handle": "cliproxy/chutes-moonshotai/Kimi-K2.5-TEE",
-    "label": "Kimi K2.5 (Chutes TEE)",
-    "description": "Kimi K2.5 via Chutes confidential compute (TEE)",
+    "handle": "cliproxy/chutes-moonshotai/Kimi-K2.5",
+    "label": "Kimi K2.5 (Chutes)",
+    "description": "Kimi K2.5 via Chutes confidential compute",
     "updateArgs": {
       "context_window": 262144,
       "max_output_tokens": 65535
