@@ -1123,6 +1123,8 @@ export default function App({
 
   // Session stats tracking
   const sessionStatsRef = useRef(new SessionStats());
+  const sessionStartTimeRef = useRef(Date.now());
+  const sessionHooksRanRef = useRef(false);
 
   // Wire up session stats to telemetry for safety net handlers
   useEffect(() => {
