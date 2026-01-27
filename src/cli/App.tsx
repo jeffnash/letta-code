@@ -30,6 +30,7 @@ import {
 import {
   type ApprovalResult,
   executeAutoAllowedTools,
+  getDisplayableToolReturn,
 } from "../agent/approval-execution";
 import {
   buildApprovalRecoveryMessage,
@@ -1019,6 +1020,7 @@ export default function App({
   const memorySyncInFlightRef = useRef(false);
   const memoryFilesystemInitializedRef = useRef(false);
   const [feedbackPrefill, setFeedbackPrefill] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
   const [modelSelectorOptions, setModelSelectorOptions] = useState<{
     filterProvider?: string;
     forceRefresh?: boolean;
@@ -1026,6 +1028,7 @@ export default function App({
   const closeOverlay = useCallback(() => {
     setActiveOverlay(null);
     setFeedbackPrefill("");
+    setSearchQuery("");
     setModelSelectorOptions({});
   }, []);
 
@@ -2367,13 +2370,16 @@ export default function App({
         // If we're sending a new message, old pending state is no longer relevant
         // Pass false to avoid setting interrupted=true, which causes race conditions
         // with concurrent processConversation calls reading the flag
-        //
-        // TODO(LET-XXXX): Make tool cancellation selective for server-side vs client-side tools
-        // - Server-side tools (memory operations, etc.) should NOT be cancelled on reentry
-        // - Client-side tools should still be cancelled
-        // - Add timeout mechanism: mark tools as timed out if "running" for >30s without result
-        // Implementation: Add isServerSideTool(toolName) helper that returns true for memory tools
-        markIncompleteToolsAsCancelled(buffersRef.current, false);
+        // IMPORTANT: Skip this when allowReentry=true (continuing after tool execution)
+        // because server-side tools (like memory) may still be pending and their results
+        // will arrive in this stream. Cancelling them prematurely shows "Cancelled" in UI.
+        if (!allowReentry) {
+          markIncompleteToolsAsCancelled(
+            buffersRef.current,
+            false,
+            "internal_cancel",
+          );
+        }
         // Reset interrupted flag since we're starting a fresh stream
         buffersRef.current.interrupted = false;
 
@@ -2993,7 +2999,11 @@ export default function App({
               abortControllerRef.current?.signal.aborted
             ) {
               setStreaming(false);
-              markIncompleteToolsAsCancelled(buffersRef.current);
+              markIncompleteToolsAsCancelled(
+                buffersRef.current,
+                true,
+                "user_interrupt",
+              );
               refreshDerived();
               return;
             }
@@ -3246,7 +3256,11 @@ export default function App({
                     queueApprovalResults(allResults, autoAllowedMetadata);
                   }
                   setStreaming(false);
-                  markIncompleteToolsAsCancelled(buffersRef.current);
+                  markIncompleteToolsAsCancelled(
+                    buffersRef.current,
+                    true,
+                    "user_interrupt",
+                  );
                   refreshDerived();
                   return;
                 }
@@ -3393,7 +3407,11 @@ export default function App({
               abortControllerRef.current?.signal.aborted
             ) {
               setStreaming(false);
-              markIncompleteToolsAsCancelled(buffersRef.current);
+              markIncompleteToolsAsCancelled(
+                buffersRef.current,
+                true,
+                "user_interrupt",
+              );
               refreshDerived();
               return;
             }
@@ -3665,15 +3683,12 @@ export default function App({
             buffersRef.current.order.push(statusId);
             refreshDerived();
 
-            // Capture current abort controller for stable reference during retry wait
-            const retryAbortController = abortControllerRef.current;
-
             // Wait before retry (check abort signal periodically for ESC cancellation)
             let cancelled = false;
             const startTime = Date.now();
             while (Date.now() - startTime < delayMs) {
               if (
-                retryAbortController?.signal.aborted ||
+                abortControllerRef.current?.signal.aborted ||
                 userCancelledRef.current
               ) {
                 cancelled = true;
@@ -3689,12 +3704,6 @@ export default function App({
             );
             refreshDerived();
 
-            // Verify abort controller hasn't been replaced during wait
-            if (abortControllerRef.current !== retryAbortController) {
-              // New processConversation started - treat as cancelled
-              cancelled = true;
-            }
-
             if (!cancelled) {
               // Reset interrupted flag so retry stream chunks are processed
               buffersRef.current.interrupted = false;
@@ -3709,7 +3718,11 @@ export default function App({
           conversationBusyRetriesRef.current = 0;
 
           // Mark incomplete tool calls as finished to prevent stuck blinking UI
-          markIncompleteToolsAsCancelled(buffersRef.current);
+          markIncompleteToolsAsCancelled(
+            buffersRef.current,
+            true,
+            "stream_error",
+          );
 
           // Track the error in telemetry
           telemetry.trackError(
@@ -3799,7 +3812,11 @@ export default function App({
         }
       } catch (e) {
         // Mark incomplete tool calls as cancelled to prevent stuck blinking UI
-        markIncompleteToolsAsCancelled(buffersRef.current);
+        markIncompleteToolsAsCancelled(
+          buffersRef.current,
+          true,
+          e instanceof APIUserAbortError ? "user_interrupt" : "stream_error",
+        );
 
         // If using eager cancel and this is an abort error, silently ignore it
         // The user already got "Stream interrupted by user" feedback from handleInterrupt
@@ -4085,7 +4102,11 @@ export default function App({
       // ALSO abort the main stream - don't leave it running
       buffersRef.current.abortGeneration =
         (buffersRef.current.abortGeneration || 0) + 1;
-      const toolsCancelled = markIncompleteToolsAsCancelled(buffersRef.current);
+      const toolsCancelled = markIncompleteToolsAsCancelled(
+        buffersRef.current,
+        true,
+        "user_interrupt",
+      );
 
       // Mark any running subagents as interrupted
       interruptActiveSubagents(INTERRUPTED_BY_USER);
@@ -4132,6 +4153,12 @@ export default function App({
       // batched state updates have been fully processed before we allow the dequeue effect.
       setTimeout(() => {
         userCancelledRef.current = false;
+        // Bump dequeueEpoch to trigger dequeue effect now that cancellation flag is cleared.
+        // Without this, queued messages would be stuck because the effect already ran
+        // (when streaming=false was set) but saw userCancelledRef.current=true and bailed.
+        if (messageQueueRef.current.length > 0) {
+          setDequeueEpoch((e) => e + 1);
+        }
       }, 50);
 
       return;
@@ -4156,7 +4183,11 @@ export default function App({
       // This ensures onChunk and other guards see interrupted=true immediately.
       buffersRef.current.abortGeneration =
         (buffersRef.current.abortGeneration || 0) + 1;
-      const toolsCancelled = markIncompleteToolsAsCancelled(buffersRef.current);
+      const toolsCancelled = markIncompleteToolsAsCancelled(
+        buffersRef.current,
+        true,
+        "user_interrupt",
+      );
 
       // Mark any running subagents as interrupted
       interruptActiveSubagents(INTERRUPTED_BY_USER);
@@ -4231,6 +4262,12 @@ export default function App({
       setTimeout(() => {
         userCancelledRef.current = false;
         setInterruptRequested(false);
+        // Bump dequeueEpoch to trigger dequeue effect now that cancellation flag is cleared.
+        // Without this, queued messages would be stuck because the effect already ran
+        // (when streaming=false was set) but saw userCancelledRef.current=true and bailed.
+        if (messageQueueRef.current.length > 0) {
+          setDequeueEpoch((e) => e + 1);
+        }
       }, 50);
 
       return;
@@ -7484,7 +7521,11 @@ ${SYSTEM_REMINDER_CLOSE}
                     queueApprovalResults(queuedResults, autoAllowedMetadata);
                   }
                   setStreaming(false);
-                  markIncompleteToolsAsCancelled(buffersRef.current);
+                  markIncompleteToolsAsCancelled(
+                    buffersRef.current,
+                    true,
+                    "user_interrupt",
+                  );
                   refreshDerived();
                   return { submitted: false };
                 }
@@ -7727,7 +7768,11 @@ ${SYSTEM_REMINDER_CLOSE}
                     queueApprovalResults(queuedResults, autoAllowedMetadata);
                   }
                   setStreaming(false);
-                  markIncompleteToolsAsCancelled(buffersRef.current);
+                  markIncompleteToolsAsCancelled(
+                    buffersRef.current,
+                    true,
+                    "user_interrupt",
+                  );
                   refreshDerived();
                   return { submitted: false };
                 }
@@ -7847,6 +7892,7 @@ ${SYSTEM_REMINDER_CLOSE}
     commandRunning,
     isExecutingTool,
     anySelectorOpen,
+    dequeueEpoch, // Allows re-triggering when userCancelledRef is reset after cancel
   ]);
 
   // Helper to send all approval results when done
@@ -8008,6 +8054,13 @@ ${SYSTEM_REMINDER_CLOSE}
           waitingForQueueCancelRef.current = false;
           queueSnapshotRef.current = [];
         } else {
+          // Clear any stale queued results BEFORE sending new approvals.
+          // This prevents old tool_call_ids from leaking if processConversation throws.
+          // We clear here rather than after processConversation because:
+          // 1. We're about to send fresh results - old queued results are superseded
+          // 2. If processConversation throws, we don't want stale results sent on retry
+          queueApprovalResults(null);
+
           const queuedMessagesToAppend = consumeQueuedMessages();
           const input: Array<MessageCreate | ApprovalCreate> = [
             { type: "approval", approvals: allResults as ApprovalResult[] },
@@ -8032,12 +8085,7 @@ ${SYSTEM_REMINDER_CLOSE}
           toolResultsInFlightRef.current = true;
           await processConversation(input);
           toolResultsInFlightRef.current = false;
-
-          // Clear any stale queued results from previous interrupts.
-          // This approval flow supersedes any previously queued results - if we don't
-          // clear them here, they persist with matching generation and get sent on the
-          // next onSubmit, causing "Invalid tool call IDs" errors.
-          queueApprovalResults(null);
+          // Note: queueApprovalResults already cleared at line 8012 before sending
         }
       } finally {
         // Always release the execution guard, even if an error occurred
@@ -8363,7 +8411,7 @@ ${SYSTEM_REMINDER_CLOSE}
     queueApprovalResults(denialResults);
 
     // Mark the pending approval tool calls as cancelled in the buffers
-    markIncompleteToolsAsCancelled(buffersRef.current);
+    markIncompleteToolsAsCancelled(buffersRef.current, true, "approval_cancel");
     refreshDerived();
 
     // Clear all approval state
@@ -9140,7 +9188,7 @@ ${SYSTEM_REMINDER_CLOSE}
           id: "dummy",
           date: new Date().toISOString(),
           tool_call_id: approval.toolCallId,
-          tool_return: toolResult.toolReturn,
+          tool_return: getDisplayableToolReturn(toolResult.toolReturn),
           status: toolResult.status,
           stdout: toolResult.stdout,
           stderr: toolResult.stderr,
@@ -9241,7 +9289,11 @@ ${SYSTEM_REMINDER_CLOSE}
         queueApprovalResults(denialResults);
 
         // Mark tool as cancelled in buffers
-        markIncompleteToolsAsCancelled(buffersRef.current);
+        markIncompleteToolsAsCancelled(
+          buffersRef.current,
+          true,
+          "internal_cancel",
+        );
         refreshDerived();
 
         // Clear all approval state (same as handleCancelApprovals)
