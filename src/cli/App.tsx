@@ -2409,6 +2409,87 @@ export default function App({
               { agentId: agentIdRef.current },
             );
           } catch (preStreamError) {
+            // Extract error detail from APIError (handles both direct and nested structures)
+            // Direct: e.error.detail | Nested: e.error.error.detail (matches formatErrorDetails)
+            let errorDetail = "";
+            if (
+              preStreamError instanceof APIError &&
+              preStreamError.error &&
+              typeof preStreamError.error === "object"
+            ) {
+              const errObj = preStreamError.error as Record<string, unknown>;
+              // Check nested structure first: e.error.error.detail
+              if (
+                errObj.error &&
+                typeof errObj.error === "object" &&
+                "detail" in errObj.error
+              ) {
+                const nested = errObj.error as Record<string, unknown>;
+                errorDetail =
+                  typeof nested.detail === "string" ? nested.detail : "";
+              }
+              // Fallback to direct structure: e.error.detail
+              if (!errorDetail && typeof errObj.detail === "string") {
+                errorDetail = errObj.detail;
+              }
+            }
+            // Final fallback: use Error.message
+            if (!errorDetail && preStreamError instanceof Error) {
+              errorDetail = preStreamError.message;
+            }
+
+            // Check for 409 "conversation busy" error - retry once with delay
+            if (
+              isConversationBusyError(errorDetail) &&
+              conversationBusyRetriesRef.current < CONVERSATION_BUSY_MAX_RETRIES
+            ) {
+              conversationBusyRetriesRef.current += 1;
+
+              // Show status message
+              const statusId = uid("status");
+              buffersRef.current.byId.set(statusId, {
+                kind: "status",
+                id: statusId,
+                lines: ["Conversation is busy, waiting and retrying…"],
+              });
+              buffersRef.current.order.push(statusId);
+              refreshDerived();
+
+              // Wait with abort checking (same pattern as LLM API error retry)
+              let cancelled = false;
+              const startTime = Date.now();
+              while (
+                Date.now() - startTime <
+                CONVERSATION_BUSY_RETRY_DELAY_MS
+              ) {
+                if (
+                  abortControllerRef.current?.signal.aborted ||
+                  userCancelledRef.current
+                ) {
+                  cancelled = true;
+                  break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 100));
+              }
+
+              // Remove status message
+              buffersRef.current.byId.delete(statusId);
+              buffersRef.current.order = buffersRef.current.order.filter(
+                (id) => id !== statusId,
+              );
+              refreshDerived();
+
+              if (!cancelled) {
+                // Reset interrupted flag so retry stream chunks are processed
+                buffersRef.current.interrupted = false;
+                continue;
+              }
+              // User pressed ESC - fall through to error handling
+            }
+
+            // Reset conversation busy retry counter on non-busy error
+            conversationBusyRetriesRef.current = 0;
+
             // Check if this is a pre-stream approval desync error
             const hasApprovalInPayload = currentInput.some(
               (item) => item?.type === "approval",
@@ -2504,87 +2585,6 @@ export default function App({
 
               // General desync: "no tool call awaiting" or fetch failed above
               // Recover with keep-alive prompt or strip stale approvals
-              if (
-                preStreamError instanceof APIError &&
-                preStreamError.error &&
-                typeof preStreamError.error === "object"
-              ) {
-                const errObj = preStreamError.error as Record<string, unknown>;
-                // Check nested structure first: e.error.error.detail
-                if (
-                  errObj.error &&
-                  typeof errObj.error === "object" &&
-                  "detail" in errObj.error
-                ) {
-                  const nested = errObj.error as Record<string, unknown>;
-                  errorDetail =
-                    typeof nested.detail === "string" ? nested.detail : "";
-                }
-                // Fallback to direct structure: e.error.detail
-                if (!errorDetail && typeof errObj.detail === "string") {
-                  errorDetail = errObj.detail;
-                }
-              }
-              // Final fallback: use Error.message
-              if (!errorDetail && preStreamError instanceof Error) {
-                errorDetail = preStreamError.message;
-              }
-
-              // Check for 409 "conversation busy" error - retry once with delay
-              if (
-                isConversationBusyError(errorDetail) &&
-                conversationBusyRetriesRef.current < CONVERSATION_BUSY_MAX_RETRIES
-              ) {
-                conversationBusyRetriesRef.current += 1;
-
-                // Show status message
-                const statusId = uid("status");
-                buffersRef.current.byId.set(statusId, {
-                  kind: "status",
-                  id: statusId,
-                  lines: ["Conversation is busy, waiting and retrying…"],
-                });
-                buffersRef.current.order.push(statusId);
-                refreshDerived();
-
-                // Wait with abort checking (same pattern as LLM API error retry)
-                let cancelled = false;
-                const startTime = Date.now();
-                while (
-                  Date.now() - startTime <
-                  CONVERSATION_BUSY_RETRY_DELAY_MS
-                ) {
-                  if (
-                    abortControllerRef.current?.signal.aborted ||
-                    userCancelledRef.current
-                  ) {
-                    cancelled = true;
-                    break;
-                  }
-                  await new Promise((resolve) => setTimeout(resolve, 100));
-                }
-
-                // Remove status message
-                buffersRef.current.byId.delete(statusId);
-                buffersRef.current.order = buffersRef.current.order.filter(
-                  (id) => id !== statusId,
-                );
-                refreshDerived();
-
-                if (!cancelled) {
-                  // Reset interrupted flag so retry stream chunks are processed
-                  buffersRef.current.interrupted = false;
-                  continue;
-                }
-                // User pressed ESC - fall through to error handling
-              }
-
-              // Reset conversation busy retry counter on non-busy error
-              conversationBusyRetriesRef.current = 0;
-
-              // If desync detected, handle based on payload type.
-              // Mixed payloads: strip stale approvals but preserve user message.
-              // Approval-only payloads: send recovery prompt to unblock the agent.
               if (isApprovalStateDesyncError(errorDetail)) {
                 // Check if there's a user message we need to preserve
                 const messageItems = currentInput.filter(
