@@ -228,6 +228,10 @@ const EAGER_CANCEL = true;
 // Maximum retries for transient LLM API errors (matches headless.ts)
 const LLM_API_ERROR_MAX_RETRIES = 3;
 
+// Retry config for 409 "conversation busy" errors
+const CONVERSATION_BUSY_MAX_RETRIES = 1; // Only retry once, fail on 2nd 409
+const CONVERSATION_BUSY_RETRY_DELAY_MS = 2500; // 2.5 seconds
+
 // Message shown when user interrupts the stream
 const INTERRUPT_MESSAGE =
   "Interrupted – tell the agent what to do differently. Something went wrong? Use /feedback to report the issue.";
@@ -298,8 +302,16 @@ function uid(prefix: string) {
 // Send desktop notification via terminal bell
 // Modern terminals (iTerm2, Ghostty, WezTerm, Kitty) convert this to a desktop
 // notification when the terminal is not focused
-function sendDesktopNotification() {
+function sendDesktopNotification(
+  message = "Awaiting your input",
+  level: "info" | "warning" | "error" = "info",
+) {
+  // Send terminal bell for native notification
   process.stdout.write("\x07");
+  // Run Notification hooks (fire-and-forget, don't block)
+  runNotificationHooks(message, level).catch(() => {
+    // Silently ignore hook errors
+  });
 }
 
 // Check if error is retriable based on stop reason and run metadata
@@ -822,6 +834,8 @@ export default function App({
   >([]);
   const executingToolCallIdsRef = useRef<string[]>([]);
   const interruptQueuedRef = useRef(false);
+  // Prevents interrupt handler from queueing results while approvals are in-flight.
+  const toolResultsInFlightRef = useRef(false);
   const autoAllowedExecutionRef = useRef<{
     toolCallIds: string[];
     results: ApprovalResult[] | null;
@@ -1217,6 +1231,9 @@ export default function App({
 
   // Retry counter for transient LLM API errors (ref for synchronous access in loop)
   const llmApiErrorRetriesRef = useRef(0);
+
+  // Retry counter for 409 "conversation busy" errors
+  const conversationBusyRetriesRef = useRef(0);
 
   // Message queue state for queueing messages during streaming
   const [messageQueue, setMessageQueue] = useState<string[]>([]);
@@ -2282,9 +2299,10 @@ export default function App({
       }
       processingConversationRef.current += 1;
 
-      // Reset retry counter for new conversation turns (fresh budget per user message)
+      // Reset retry counters for new conversation turns (fresh budget per user message)
       if (!allowReentry) {
         llmApiErrorRetriesRef.current = 0;
+        conversationBusyRetriesRef.current = 0;
       }
 
       // Track last run ID for error reporting (accessible in catch block)
@@ -2503,6 +2521,58 @@ export default function App({
               if (!errorDetail && preStreamError instanceof Error) {
                 errorDetail = preStreamError.message;
               }
+
+              // Check for 409 "conversation busy" error - retry once with delay
+              if (
+                isConversationBusyError(errorDetail) &&
+                conversationBusyRetriesRef.current < CONVERSATION_BUSY_MAX_RETRIES
+              ) {
+                conversationBusyRetriesRef.current += 1;
+
+                // Show status message
+                const statusId = uid("status");
+                buffersRef.current.byId.set(statusId, {
+                  kind: "status",
+                  id: statusId,
+                  lines: ["Conversation is busy, waiting and retrying…"],
+                });
+                buffersRef.current.order.push(statusId);
+                refreshDerived();
+
+                // Wait with abort checking (same pattern as LLM API error retry)
+                let cancelled = false;
+                const startTime = Date.now();
+                while (
+                  Date.now() - startTime <
+                  CONVERSATION_BUSY_RETRY_DELAY_MS
+                ) {
+                  if (
+                    abortControllerRef.current?.signal.aborted ||
+                    userCancelledRef.current
+                  ) {
+                    cancelled = true;
+                    break;
+                  }
+                  await new Promise((resolve) => setTimeout(resolve, 100));
+                }
+
+                // Remove status message
+                buffersRef.current.byId.delete(statusId);
+                buffersRef.current.order = buffersRef.current.order.filter(
+                  (id) => id !== statusId,
+                );
+                refreshDerived();
+
+                if (!cancelled) {
+                  // Reset interrupted flag so retry stream chunks are processed
+                  buffersRef.current.interrupted = false;
+                  continue;
+                }
+                // User pressed ESC - fall through to error handling
+              }
+
+              // Reset conversation busy retry counter on non-busy error
+              conversationBusyRetriesRef.current = 0;
 
               // If desync detected, handle based on payload type.
               // Mixed payloads: strip stale approvals but preserve user message.
@@ -3624,6 +3694,7 @@ export default function App({
 
           // Reset retry counter on non-retriable error (or max retries exceeded)
           llmApiErrorRetriesRef.current = 0;
+          conversationBusyRetriesRef.current = 0;
 
           // Mark incomplete tool calls as finished to prevent stuck blinking UI
           markIncompleteToolsAsCancelled(buffersRef.current);
@@ -3938,7 +4009,15 @@ export default function App({
 
   const handleInterrupt = useCallback(async () => {
     // If we're executing client-side tools, abort them AND the main stream
-    if (isExecutingTool && toolAbortControllerRef.current) {
+    const hasTrackedTools =
+      executingToolCallIdsRef.current.length > 0 ||
+      autoAllowedExecutionRef.current?.results;
+    if (
+      isExecutingTool &&
+      toolAbortControllerRef.current &&
+      hasTrackedTools &&
+      !toolResultsInFlightRef.current
+    ) {
       toolAbortControllerRef.current.abort();
 
       // Mark any in-flight conversation as stale, consistent with EAGER_CANCEL.
