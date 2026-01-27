@@ -7217,20 +7217,42 @@ DO NOT respond to these messages or otherwise consider them in your response unl
             setCurrentToolset(toolsetName);
           }
 
-          // Update the same command with final result (include toolset info only if changed)
-          const autoToolsetLine = toolsetName
-            ? `Automatically switched toolset to ${toolsetName}. Use /toolset to change back if desired.\nConsider switching to a different system prompt using /system to match.`
-            : null;
-          const outputLines = [
-            `Switched to ${selectedModel.label}`,
-            ...(autoToolsetLine ? [autoToolsetLine] : []),
-          ].join("\n");
+          // Determine the recommended system prompt for this model
+          // NOTE: We only show a hint rather than auto-switching because:
+          // 1. currentSystemPromptId may not reflect the actual server state
+          // 2. Auto-switching could silently overwrite custom/project-specific prompts
+          const targetSystemPrompt = isOpenAIModel(selectedModel.handle ?? "")
+            ? "letta-codex"
+            : isGeminiModel(selectedModel.handle ?? "")
+              ? "letta-gemini"
+              : "letta-claude";
+
+          // Update the same command with final result
+          const outputLines = [`Switched to ${selectedModel.label}`];
+          if (toolsetName) {
+            outputLines.push(
+              `Automatically switched toolset to ${toolsetName}.`,
+            );
+          }
+          // Only suggest switching system prompt if current prompt is known and different,
+          // or if current prompt is null (unknown state). Skip hint if already matching
+          // or if user has a custom prompt set (indicated by currentSystemPromptId not
+          // being one of the standard presets).
+          const standardPrompts = ["default", "letta-claude", "letta-codex", "letta-gemini"];
+          const isStandardPrompt = currentSystemPromptId && standardPrompts.includes(currentSystemPromptId);
+          const needsPromptSwitch = currentSystemPromptId === null || 
+            (isStandardPrompt && currentSystemPromptId !== targetSystemPrompt);
+          if (needsPromptSwitch) {
+            outputLines.push(
+              `Consider switching system prompt to ${targetSystemPrompt} using /system to match.`,
+            );
+          }
 
           buffersRef.current.byId.set(cmdId, {
             kind: "command",
             id: cmdId,
             input: `/model ${modelId}`,
-            output: outputLines,
+            output: outputLines.join("\n"),
             phase: "finished",
             success: true,
           });
@@ -7252,7 +7274,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         }
       });
     },
-    [agentId, refreshDerived, currentToolset, withCommandLock],
+    [agentId, refreshDerived, currentToolset, currentSystemPromptId, withCommandLock],
   );
 
   const handleSystemPromptSelect = useCallback(

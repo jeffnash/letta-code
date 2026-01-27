@@ -1147,6 +1147,16 @@
     }
   },
   {
+    "id": "chutes-kimi-k2.5",
+    "handle": "cliproxy/chutes-moonshotai/Kimi-K2.5-TEE",
+    "label": "Kimi K2.5 (Chutes TEE)",
+    "description": "Kimi K2.5 via Chutes confidential compute (TEE)",
+    "updateArgs": {
+      "context_window": 262144,
+      "max_output_tokens": 65535
+    }
+  },
+  {
     "id": "chutes-kimi-k2-instruct",
     "handle": "cliproxy/chutes-moonshotai/Kimi-K2-Instruct-0905",
     "label": "Kimi K2 Instruct (Chutes)",

@@ -170,7 +170,20 @@ export async function createAgent(
   // Only attach server-side tools to the agent.
   // Client-side tools (Read, Write, Bash, etc.) are passed via client_tools at runtime,
   // NOT attached to the agent. This is the new pattern - no more stub tool registration.
-  const { isOpenAIModel } = await import("../tools/manager");
+  const { isOpenAIModel, isGeminiModel } = await import("../tools/manager");
+
+  // Auto-select system prompt based on model if no preset was explicitly provided.
+  // This ensures the correct prompt is used for each model family.
+  let effectiveSystemPromptPreset = options.systemPromptPreset;
+  if (!effectiveSystemPromptPreset) {
+    if (isOpenAIModel(modelHandle)) {
+      effectiveSystemPromptPreset = "letta-codex";
+    } else if (isGeminiModel(modelHandle)) {
+      effectiveSystemPromptPreset = "letta-gemini";
+    }
+    // Otherwise use default (letta-claude) via resolveSystemPrompt
+  }
+
   const baseMemoryTool = isOpenAIModel(modelHandle)
     ? "memory_apply_patch"
     : "memory";
@@ -328,13 +341,13 @@ export async function createAgent(
 
   // Resolve system prompt content:
   // 1. If systemPromptCustom is provided, use it as-is
-  // 2. Otherwise, resolve systemPromptPreset to content
+  // 2. Otherwise, resolve effectiveSystemPromptPreset to content (may be auto-selected based on model)
   // 3. If systemPromptAppend is provided, append it to the result
   let systemPromptContent: string;
   if (options.systemPromptCustom) {
     systemPromptContent = options.systemPromptCustom;
   } else {
-    systemPromptContent = await resolveSystemPrompt(options.systemPromptPreset);
+    systemPromptContent = await resolveSystemPrompt(effectiveSystemPromptPreset);
   }
 
   // Append additional instructions if provided

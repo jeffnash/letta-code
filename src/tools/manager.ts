@@ -287,16 +287,19 @@ export interface ClientTool {
 /**
  * Get all loaded tools in the format expected by the Letta API's client_tools field.
  * Maps internal tool names to server-facing names for proper tool invocation.
+ * Tools are sorted alphabetically by server name for deterministic ordering (required for prompt caching).
  */
 export function getClientToolsFromRegistry(): ClientTool[] {
-  return Array.from(toolRegistry.entries()).map(([name, tool]) => {
-    const serverName = getServerToolName(name);
-    return {
-      name: serverName,
-      description: tool.schema.description,
-      parameters: tool.schema.input_schema,
-    };
-  });
+  return Array.from(toolRegistry.entries())
+    .map(([name, tool]) => {
+      const serverName = getServerToolName(name);
+      return {
+        name: serverName,
+        description: tool.schema.description,
+        parameters: tool.schema.input_schema,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /**
