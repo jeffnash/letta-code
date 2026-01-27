@@ -232,6 +232,9 @@ const LLM_API_ERROR_MAX_RETRIES = 3;
 const CONVERSATION_BUSY_MAX_RETRIES = 1; // Only retry once, fail on 2nd 409
 const CONVERSATION_BUSY_RETRY_DELAY_MS = 2500; // 2.5 seconds
 
+const ERROR_FEEDBACK_HINT =
+  "Something went wrong? Use /feedback to report issues.";
+
 // Message shown when user interrupts the stream
 const INTERRUPT_MESSAGE =
   "Interrupted – tell the agent what to do differently. Something went wrong? Use /feedback to report the issue.";
@@ -695,6 +698,10 @@ export default function App({
   const [agentId, setAgentId] = useState(initialAgentId);
   const [agentState, setAgentState] = useState(initialAgentState);
 
+  const updateAgentName = useCallback((name: string) => {
+    setAgentState((prev) => (prev ? { ...prev, name } : prev));
+  }, []);
+
   // Track current conversation (always created fresh on startup)
   const [conversationId, setConversationId] = useState(initialConversationId);
 
@@ -1068,7 +1075,8 @@ export default function App({
     llmConfigRef.current = llmConfig;
   }, [llmConfig]);
   const [currentModelId, setCurrentModelId] = useState<string | null>(null);
-  const [agentName, setAgentName] = useState<string | null>(null);
+  // Derive agentName from agentState (single source of truth)
+  const agentName = agentState?.name ?? null;
   const [agentDescription, setAgentDescription] = useState<string | null>(null);
   const [agentLastRunAt, setAgentLastRunAt] = useState<string | null>(null);
   const currentModelLabel =
@@ -1884,7 +1892,7 @@ export default function App({
           const client = await getClient();
           const agent = await client.agents.retrieve(agentId);
           setLlmConfig(agent.llm_config);
-          setAgentName(agent.name);
+          updateAgentName(agent.name);
           setAgentDescription(agent.description ?? null);
           // Get last message timestamp from agent state if available
           const lastRunCompletion = (agent as { last_run_completion?: string })
@@ -2684,7 +2692,7 @@ export default function App({
                 }
 
                 // Also update agent state if other fields changed
-                setAgentName(agent.name);
+                updateAgentName(agent.name);
                 setAgentDescription(agent.description ?? null);
                 const lastRunCompletion = (
                   agent as { last_run_completion?: string }
@@ -3305,6 +3313,7 @@ export default function App({
                 setThinkingMessage(getRandomThinkingVerb());
                 refreshDerived();
 
+                toolResultsInFlightRef.current = true;
                 await processConversation(
                   [
                     {
@@ -3314,6 +3323,7 @@ export default function App({
                   ],
                   { allowReentry: true },
                 );
+                toolResultsInFlightRef.current = false;
                 return;
               }
 
@@ -3373,6 +3383,7 @@ export default function App({
                 toolAbortControllerRef.current = null;
                 executingToolCallIdsRef.current = [];
                 autoAllowedExecutionRef.current = null;
+                toolResultsInFlightRef.current = false;
               }
             }
 
@@ -3572,6 +3583,7 @@ export default function App({
               lastFailureMessage ||
               `An error occurred during agent execution\n(run_id: ${lastRunId ?? "unknown"}, stop_reason: ${stopReasonToHandle})`;
             appendError(errorToShow, true);
+            appendError(ERROR_FEEDBACK_HINT, true);
             setStreaming(false);
             sendDesktopNotification();
             refreshDerived();
@@ -3720,6 +3732,7 @@ export default function App({
               ? `Stream error: ${fallbackError}\n(run_id: ${lastRunId})`
               : `Stream error: ${fallbackError}`;
             appendError(errorMsg, true); // Skip telemetry - already tracked above
+            appendError(ERROR_FEEDBACK_HINT, true);
             setStreaming(false);
             sendDesktopNotification(); // Notify user of error
             refreshDerived();
@@ -3752,12 +3765,14 @@ export default function App({
                   agentIdRef.current,
                 );
                 appendError(errorDetails, true); // Skip telemetry - already tracked above
+                appendError(ERROR_FEEDBACK_HINT, true);
               } else {
                 // No error metadata, show generic error with run info
                 appendError(
                   `An error occurred during agent execution\n(run_id: ${lastRunId}, stop_reason: ${stopReason})`,
                   true, // Skip telemetry - already tracked above
                 );
+                appendError(ERROR_FEEDBACK_HINT, true);
               }
             } catch (_e) {
               // If we can't fetch error details, show generic error
@@ -3765,6 +3780,7 @@ export default function App({
                 `An error occurred during agent execution\n(run_id: ${lastRunId}, stop_reason: ${stopReason})\n(Unable to fetch additional error details from server)`,
                 true, // Skip telemetry - already tracked above
               );
+              appendError(ERROR_FEEDBACK_HINT, true);
               return;
             }
           } else {
@@ -3773,6 +3789,7 @@ export default function App({
               `An error occurred during agent execution\n(stop_reason: ${stopReason})`,
               true, // Skip telemetry - already tracked above
             );
+            appendError(ERROR_FEEDBACK_HINT, true);
           }
 
           setStreaming(false);
@@ -3952,6 +3969,7 @@ export default function App({
         // Use comprehensive error formatting
         const errorDetails = formatErrorDetails(e, agentIdRef.current);
         appendError(errorDetails, true); // Skip telemetry - already tracked above with more context
+        appendError(ERROR_FEEDBACK_HINT, true);
         setStreaming(false);
         sendDesktopNotification(); // Notify user of error
         refreshDerived();
@@ -4006,6 +4024,20 @@ export default function App({
   const handleEnterQueueEditMode = useCallback(() => {
     setMessageQueue([]);
   }, []);
+
+  const handlePasteError = useCallback(
+    (message: string) => {
+      const statusId = uid("status");
+      buffersRef.current.byId.set(statusId, {
+        kind: "status",
+        id: statusId,
+        lines: [`⚠️ ${message}`],
+      });
+      buffersRef.current.order.push(statusId);
+      refreshDerived();
+    },
+    [refreshDerived],
+  );
 
   const handleInterrupt = useCallback(async () => {
     // If we're executing client-side tools, abort them AND the main stream
@@ -4071,6 +4103,7 @@ export default function App({
       userCancelledRef.current = true; // Prevent dequeue
       setStreaming(false);
       setIsExecutingTool(false);
+      toolResultsInFlightRef.current = false;
 
       // Capture pending approvals BEFORE clearing - needed for fallback if cancel fails
       const pendingApprovalsSnapshot = [...pendingApprovals];
@@ -4148,6 +4181,7 @@ export default function App({
       // Stop streaming and show error message (unless tool calls were cancelled,
       // since the tool result will show "Interrupted by user")
       setStreaming(false);
+      toolResultsInFlightRef.current = false;
       if (!toolsCancelled) {
         appendError(INTERRUPT_MESSAGE, true);
       }
@@ -4333,7 +4367,7 @@ export default function App({
         agentIdRef.current = targetAgentId;
         setAgentId(targetAgentId);
         setAgentState(agent);
-        setAgentName(agent.name);
+        updateAgentName(agent.name);
         setLlmConfig(agent.llm_config);
         setConversationId(targetConversationId);
         clearSkillBlockCache();
@@ -4433,7 +4467,7 @@ export default function App({
         agentIdRef.current = agent.id;
         setAgentId(agent.id);
         setAgentState(agent);
-        setAgentName(agent.name);
+        updateAgentName(agent.name);
         setLlmConfig(agent.llm_config);
 
         // Build success message with hints
@@ -4807,9 +4841,14 @@ export default function App({
 
         // Send all results to server if any
         if (allResults.length > 0) {
+          toolResultsInFlightRef.current = true;
           await processConversation([
             { type: "approval", approvals: allResults },
           ]);
+          toolResultsInFlightRef.current = false;
+
+          // Clear any stale queued results from previous interrupts.
+          queueApprovalResults(null);
         }
       } finally {
         if (shouldTrackAutoAllowed) {
@@ -4817,6 +4856,7 @@ export default function App({
           toolAbortControllerRef.current = null;
           executingToolCallIdsRef.current = [];
           autoAllowedExecutionRef.current = null;
+          toolResultsInFlightRef.current = false;
         }
       }
 
@@ -5863,7 +5903,7 @@ export default function App({
           try {
             const client = await getClient();
             await client.agents.update(agentId, { name: newName });
-            setAgentName(newName);
+            updateAgentName(newName);
 
             buffersRef.current.byId.set(cmdId, {
               kind: "command",
@@ -6167,7 +6207,7 @@ export default function App({
             agentId,
             agentName: agentName || "",
             setCommandRunning,
-            setAgentName,
+            updateAgentName,
           };
 
           // /profile - open agent browser (now points to /agents)
@@ -6263,7 +6303,7 @@ export default function App({
             agentId,
             agentName: agentName || "",
             setCommandRunning,
-            setAgentName,
+            updateAgentName,
           };
           await handlePin(profileCtx, msg, argsStr);
           return { submitted: true };
@@ -6277,7 +6317,7 @@ export default function App({
             agentId,
             agentName: agentName || "",
             setCommandRunning,
-            setAgentName,
+            updateAgentName,
           };
           const argsStr = msg.trim().slice(6).trim();
           handleUnpin(profileCtx, msg, argsStr);
@@ -7477,7 +7517,9 @@ ${SYSTEM_REMINDER_CLOSE}
                   },
                 ];
 
+                toolResultsInFlightRef.current = true;
                 await processConversation(initialInput);
+                toolResultsInFlightRef.current = false;
                 clearPlaceholdersInText(msg);
                 return { submitted: true };
               } finally {
@@ -7486,6 +7528,7 @@ ${SYSTEM_REMINDER_CLOSE}
                   toolAbortControllerRef.current = null;
                   executingToolCallIdsRef.current = [];
                   autoAllowedExecutionRef.current = null;
+                  toolResultsInFlightRef.current = false;
                 }
               }
             } else {
@@ -7701,6 +7744,7 @@ ${SYSTEM_REMINDER_CLOSE}
                   toolAbortControllerRef.current = null;
                   executingToolCallIdsRef.current = [];
                   autoAllowedExecutionRef.current = null;
+                  toolResultsInFlightRef.current = false;
                 }
               }
             }
@@ -8002,6 +8046,7 @@ ${SYSTEM_REMINDER_CLOSE}
         toolAbortControllerRef.current = null;
         executingToolCallIdsRef.current = [];
         interruptQueuedRef.current = false;
+        toolResultsInFlightRef.current = false;
       }
     },
     [
@@ -9845,6 +9890,7 @@ Plan file path: ${planFilePath}`;
                 ralphPendingYolo={pendingRalphConfig?.isYolo ?? false}
                 onRalphExit={handleRalphExit}
                 conversationId={conversationId}
+                onPasteError={handlePasteError}
               />
             </Box>
 
@@ -10546,7 +10592,7 @@ Plan file path: ${planFilePath}`;
                     // Rename if new name provided
                     if (newName && newName !== agentName) {
                       await client.agents.update(agentId, { name: newName });
-                      setAgentName(newName);
+                      updateAgentName(newName);
                     }
 
                     // Pin the agent
