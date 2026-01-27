@@ -60,6 +60,23 @@ export const commands: Record<string, Command> = {
       return "Opening memory viewer...";
     },
   },
+  "/memory-sync": {
+    desc: "Sync memory blocks with filesystem (requires memfs enabled)",
+    order: 15.5,
+    handler: () => {
+      // Handled specially in App.tsx to run filesystem sync
+      return "Syncing memory filesystem...";
+    },
+  },
+  "/memfs": {
+    desc: "Enable/disable filesystem-backed memory (/memfs [enable|disable])",
+    args: "[enable|disable]",
+    order: 15.6,
+    handler: () => {
+      // Handled specially in App.tsx
+      return "Managing memory filesystem...";
+    },
+  },
   "/search": {
     desc: "Search messages across all agents (/search [query])",
     order: 16,
@@ -68,12 +85,12 @@ export const commands: Record<string, Command> = {
       return "Opening message search...";
     },
   },
-  "/plan": {
-    desc: "Enter plan mode",
+  "/connect": {
+    desc: "Connect your LLM API keys (OpenAI, Anthropic, etc.)",
     order: 17,
     handler: () => {
-      // Handled specially in App.tsx
-      return "Entering plan mode...";
+      // Handled specially in App.tsx - opens ProviderSelector
+      return "Opening provider connection...";
     },
   },
   "/clear": {
@@ -263,12 +280,12 @@ export const commands: Record<string, Command> = {
   },
 
   // === Session management (order 40-49) ===
-  "/connect": {
-    desc: "Connect an existing account (/connect codex or /connect zai <api-key>)",
+  "/plan": {
+    desc: "Enter plan mode",
     order: 40,
     handler: () => {
       // Handled specially in App.tsx
-      return "Initiating account connection...";
+      return "Entering plan mode...";
     },
   },
   "/disconnect": {
@@ -393,7 +410,7 @@ export const commands: Record<string, Command> = {
  */
 export async function executeCommand(
   input: string,
-): Promise<{ success: boolean; output: string }> {
+): Promise<{ success: boolean; output: string; notFound?: boolean }> {
   const [command, ...args] = input.trim().split(/\s+/);
 
   if (!command) {
@@ -408,6 +425,7 @@ export async function executeCommand(
     return {
       success: false,
       output: `Unknown command: ${command}`,
+      notFound: true,
     };
   }
 

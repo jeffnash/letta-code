@@ -37,6 +37,8 @@ import {
   fetchRunErrorDetail,
   isApprovalPendingError,
   isApprovalStateDesyncError,
+  isConversationBusyError,
+  isInvalidToolCallIdsError,
 } from "../agent/approval-recovery";
 import { prefetchAvailableModelHandles } from "../agent/available-models";
 import { getResumeData } from "../agent/check-approval";
@@ -45,10 +47,33 @@ import packageJson from "../../package.json";
 import { getCurrentAgentId, setCurrentAgentId } from "../agent/context";
 import { type AgentProvenance, createAgent } from "../agent/create";
 import { ISOLATED_BLOCK_LABELS } from "../agent/memory";
+import {
+  detachMemoryFilesystemBlock,
+  ensureMemoryFilesystemBlock,
+  formatMemorySyncSummary,
+  getMemoryFilesystemRoot,
+  type MemorySyncConflict,
+  type MemorySyncResolution,
+  syncMemoryFilesystem,
+  updateMemoryFilesystemBlock,
+} from "../agent/memoryFilesystem";
 import { sendMessageStream } from "../agent/message";
-import { getModelDisplayName, getModelInfo } from "../agent/model";
+import { getModelInfo, getModelShortName } from "../agent/model";
+import { INTERRUPT_RECOVERY_ALERT } from "../agent/promptAssets";
 import { SessionStats } from "../agent/stats";
-import { INTERRUPTED_BY_USER } from "../constants";
+import {
+  INTERRUPTED_BY_USER,
+  SYSTEM_REMINDER_CLOSE,
+  SYSTEM_REMINDER_OPEN,
+} from "../constants";
+import {
+  runNotificationHooks,
+  runPreCompactHooks,
+  runSessionEndHooks,
+  runSessionStartHooks,
+  runStopHooks,
+  runUserPromptSubmitHooks,
+} from "../hooks";
 import type { ApprovalContext } from "../permissions/analyzer";
 import { type PermissionMode, permissionMode } from "../permissions/mode";
 import {
@@ -69,7 +94,7 @@ import {
   type ToolExecutionResult,
 } from "../tools/manager";
 import { clearSkillBlockCache } from "../tools/impl/Skill";
-import { debugWarn } from "../utils/debug";
+import { debugLog, debugWarn } from "../utils/debug";
 import {
   handleMcpAdd,
   handleMcpUsage,
@@ -98,6 +123,8 @@ import { colors } from "./components/colors";
 import { ErrorMessage } from "./components/ErrorMessageRich";
 import { FeedbackDialog } from "./components/FeedbackDialog";
 import { HelpDialog } from "./components/HelpDialog";
+import { HooksManager } from "./components/HooksManager";
+import { InlineQuestionApproval } from "./components/InlineQuestionApproval";
 import { Input } from "./components/InputRich";
 import { McpConnectFlow } from "./components/McpConnectFlow";
 import { McpSelector } from "./components/McpSelector";
@@ -107,7 +134,7 @@ import { ModelSelector } from "./components/ModelSelector";
 import { NewAgentDialog } from "./components/NewAgentDialog";
 import { PendingApprovalStub } from "./components/PendingApprovalStub";
 import { PinDialog, validateAgentName } from "./components/PinDialog";
-// QuestionDialog removed - now using InlineQuestionApproval
+import { ProviderSelector } from "./components/ProviderSelector";
 import { ReasoningMessage } from "./components/ReasoningMessageRich";
 
 import { formatUsageStats } from "./components/SessionStats";
@@ -139,6 +166,7 @@ import {
   computeAdvancedDiff,
   parsePatchToAdvancedDiff,
 } from "./helpers/diff";
+import { setErrorContext } from "./helpers/errorContext";
 import { formatErrorDetails } from "./helpers/errorFormatter";
 import { parsePatchOperations } from "./helpers/formatArgsDisplay";
 import {
@@ -153,6 +181,7 @@ import {
 import { getConversationQueryString } from "./helpers/conversationQuery";
 import { generatePlanFilePath } from "./helpers/planName";
 import { safeJsonParseOr } from "./helpers/safeJsonParse";
+import { getDeviceType, getLocalTime } from "./helpers/sessionContext";
 import { type ApprovalRequest, drainStreamWithResume } from "./helpers/stream";
 import {
   collectFinishedTaskToolCalls,
@@ -202,6 +231,64 @@ const LLM_API_ERROR_MAX_RETRIES = 3;
 // Message shown when user interrupts the stream
 const INTERRUPT_MESSAGE =
   "Interrupted – tell the agent what to do differently. Something went wrong? Use /feedback to report the issue.";
+
+// Interactive slash commands that open overlays immediately (bypass queueing)
+// These commands let users browse/view while the agent is working
+// Any changes made in the overlay will be queued until end_turn
+const INTERACTIVE_SLASH_COMMANDS = new Set([
+  "/model",
+  "/toolset",
+  "/system",
+  "/subagents",
+  "/memory",
+  "/mcp",
+  "/help",
+  "/agents",
+  "/resume",
+  "/pinned",
+  "/profiles",
+  "/search",
+  "/feedback",
+  "/pin",
+  "/pin-local",
+  "/conversations",
+  "/profile",
+]);
+
+// Non-state commands that should run immediately while the agent is busy
+// These don't modify agent state, so they should bypass queueing
+const NON_STATE_COMMANDS = new Set([
+  "/ade",
+  "/bg",
+  "/usage",
+  "/help",
+  "/hooks",
+  "/search",
+  "/memory",
+  "/feedback",
+  "/download",
+]);
+
+// Check if a command is interactive (opens overlay, should not be queued)
+function isInteractiveCommand(msg: string): boolean {
+  const trimmed = msg.trim().toLowerCase();
+  // Check exact matches first
+  if (INTERACTIVE_SLASH_COMMANDS.has(trimmed)) return true;
+  // Check prefix matches for commands with arguments
+  for (const cmd of INTERACTIVE_SLASH_COMMANDS) {
+    if (trimmed.startsWith(`${cmd} `)) return true;
+  }
+  return false;
+}
+
+function isNonStateCommand(msg: string): boolean {
+  const trimmed = msg.trim().toLowerCase();
+  if (NON_STATE_COMMANDS.has(trimmed)) return true;
+  for (const cmd of NON_STATE_COMMANDS) {
+    if (trimmed.startsWith(`${cmd} `)) return true;
+  }
+  return false;
+}
 
 // tiny helper for unique ids (avoid overwriting prior user lines)
 function uid(prefix: string) {
@@ -305,7 +392,7 @@ function getPlanModeReminder(): string {
   const planFilePath = permissionMode.getPlanFilePath();
 
   // Generate dynamic reminder with plan file path
-  return `<system-reminder>
+  return `${SYSTEM_REMINDER_OPEN}
       Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits (with the exception of the plan file mentioned below), run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supersedes any other instructions you have received.
 
 ## Plan File Info:
@@ -350,7 +437,7 @@ At the very end of your turn, once you have asked the user questions and are hap
 This is critical - your turn should only end with either asking the user a question or calling ExitPlanMode. Do not stop unless it's for these 2 reasons.
 
 NOTE: At any point in time through this workflow you should feel free to ask the user questions or clarifications. Don't make large assumptions about user intent. The goal is to present a well researched plan to the user, and tie any loose ends before implementation begins.
-</system-reminder>
+${SYSTEM_REMINDER_CLOSE}
 `;
 }
 
@@ -438,7 +525,7 @@ function buildRalphFirstTurnReminder(state: RalphState): string {
       ? `${state.currentIteration}/${state.maxIterations}`
       : `${state.currentIteration}`;
 
-  let reminder = `<system-reminder>
+  let reminder = `${SYSTEM_REMINDER_OPEN}
 🔄 Ralph Wiggum mode activated (iteration ${iterInfo})
 `;
 
@@ -473,7 +560,7 @@ No completion promise set - loop runs until --max-iterations or ESC/Shift+Tab to
 `;
   }
 
-  reminder += `</system-reminder>`;
+  reminder += SYSTEM_REMINDER_CLOSE;
   return reminder;
 }
 
@@ -486,14 +573,26 @@ function buildRalphContinuationReminder(state: RalphState): string {
       : `${state.currentIteration}`;
 
   if (state.completionPromise) {
-    return `<system-reminder>
+    return `${SYSTEM_REMINDER_OPEN}
 🔄 Ralph iteration ${iterInfo} | To stop: output <promise>${state.completionPromise}</promise> (ONLY when statement is TRUE - do not lie to exit!)
-</system-reminder>`;
+${SYSTEM_REMINDER_CLOSE}`;
   } else {
-    return `<system-reminder>
+    return `${SYSTEM_REMINDER_OPEN}
 🔄 Ralph iteration ${iterInfo} | No completion promise set - loop runs infinitely
-</system-reminder>`;
+${SYSTEM_REMINDER_CLOSE}`;
   }
+}
+
+function stripSystemReminders(text: string): string {
+  return text
+    .replace(
+      new RegExp(
+        `${SYSTEM_REMINDER_OPEN}[\\s\\S]*?${SYSTEM_REMINDER_CLOSE}`,
+        "g",
+      ),
+      "",
+    )
+    .trim();
 }
 
 // Items that have finished rendering and no longer change
@@ -698,6 +797,10 @@ export default function App({
   >(null);
   const toolAbortControllerRef = useRef<AbortController | null>(null);
 
+  // Bash mode state - track running commands for input locking and ESC cancellation
+  const [bashRunning, setBashRunning] = useState(false);
+  const bashAbortControllerRef = useRef<AbortController | null>(null);
+
   // Eager approval checking: only enabled when resuming a session (LET-7101)
   // After first successful message, we disable it since any new approvals are from our own turn
   const [needsEagerApprovalCheck, setNeedsEagerApprovalCheck] = useState(
@@ -876,13 +979,24 @@ export default function App({
     | "subagent"
     | "feedback"
     | "memory"
+    | "memory-sync"
     | "pin"
     | "new"
     | "mcp"
     | "mcp-connect"
     | "help"
+    | "hooks"
+    | "connect"
     | null;
   const [activeOverlay, setActiveOverlay] = useState<ActiveOverlay>(null);
+  const [memorySyncConflicts, setMemorySyncConflicts] = useState<
+    MemorySyncConflict[] | null
+  >(null);
+  const memorySyncProcessedToolCallsRef = useRef<Set<string>>(new Set());
+  const memorySyncCommandIdRef = useRef<string | null>(null);
+  const memorySyncCommandInputRef = useRef<string>("/memory-sync");
+  const memorySyncInFlightRef = useRef(false);
+  const memoryFilesystemInitializedRef = useRef(false);
   const [feedbackPrefill, setFeedbackPrefill] = useState("");
   const [modelSelectorOptions, setModelSelectorOptions] = useState<{
     filterProvider?: string;
@@ -893,6 +1007,27 @@ export default function App({
     setFeedbackPrefill("");
     setModelSelectorOptions({});
   }, []);
+
+  // Queued overlay action - executed after end_turn when user makes a selection
+  // while agent is busy (streaming/executing tools)
+  type QueuedOverlayAction =
+    | { type: "switch_agent"; agentId: string }
+    | { type: "switch_model"; modelId: string }
+    | { type: "switch_conversation"; conversationId: string }
+    | {
+        type: "switch_toolset";
+        toolsetId:
+          | "codex"
+          | "codex_snake"
+          | "default"
+          | "gemini"
+          | "gemini_snake"
+          | "none";
+      }
+    | { type: "switch_system"; promptId: string }
+    | null;
+  const [queuedOverlayAction, setQueuedOverlayAction] =
+    useState<QueuedOverlayAction>(null);
 
   // Pin dialog state
   const [pinDialogLocal, setPinDialogLocal] = useState(false);
@@ -927,10 +1062,52 @@ export default function App({
       ? `${llmConfig.model_endpoint_type}/${llmConfig.model}`
       : (llmConfig?.model ?? null);
   const currentModelDisplay = currentModelLabel
-    ? (getModelDisplayName(currentModelLabel) ??
+    ? (getModelShortName(currentModelLabel) ??
       currentModelLabel.split("/").pop())
     : null;
   const currentModelProvider = llmConfig?.provider_name ?? null;
+
+  // Billing tier for conditional UI and error context (fetched once on mount)
+  const [billingTier, setBillingTier] = useState<string | null>(null);
+
+  // Update error context when model or billing tier changes
+  useEffect(() => {
+    setErrorContext({
+      modelDisplayName: currentModelDisplay ?? undefined,
+      billingTier: billingTier ?? undefined,
+    });
+  }, [currentModelDisplay, billingTier]);
+
+  // Fetch billing tier once on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const settings = settingsManager.getSettings();
+        const baseURL =
+          process.env.LETTA_BASE_URL ||
+          settings.env?.LETTA_BASE_URL ||
+          "https://api.letta.com";
+        const apiKey = process.env.LETTA_API_KEY || settings.env?.LETTA_API_KEY;
+
+        const response = await fetch(`${baseURL}/v1/metadata/balance`, {
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+            "X-Letta-Source": "letta-code",
+          },
+        });
+
+        if (response.ok) {
+          const data = (await response.json()) as { billing_tier?: string };
+          if (data.billing_tier) {
+            setBillingTier(data.billing_tier);
+          }
+        }
+      } catch {
+        // Silently ignore - billing tier is optional context
+      }
+    })();
+  }, []);
 
   // Token streaming preference (can be toggled at runtime)
   const [tokenStreamingEnabled, setTokenStreamingEnabled] =
@@ -956,6 +1133,47 @@ export default function App({
     // Cleanup on unmount (defensive, prevents potential memory leak)
     return () => {
       telemetry.setSessionStatsGetter(undefined);
+    };
+  }, []);
+
+  // Run SessionStart hooks when agent becomes available
+  useEffect(() => {
+    if (agentId && !sessionHooksRanRef.current) {
+      sessionHooksRanRef.current = true;
+      // Determine if this is a new session or resumed
+      const isNewSession = !initialConversationId;
+      runSessionStartHooks(
+        isNewSession,
+        agentId,
+        agentName ?? undefined,
+        conversationIdRef.current ?? undefined,
+      ).catch(() => {
+        // Silently ignore hook errors
+      });
+    }
+  }, [agentId, agentName, initialConversationId]);
+
+  // Run SessionEnd hooks on unmount
+  useEffect(() => {
+    return () => {
+      const durationMs = Date.now() - sessionStartTimeRef.current;
+      runSessionEndHooks(
+        durationMs,
+        undefined, // messageCount not tracked in SessionStats
+        undefined, // toolCallCount not tracked in SessionStats
+        agentIdRef.current ?? undefined,
+        conversationIdRef.current ?? undefined,
+      ).catch(() => {
+        // Silently ignore hook errors
+      });
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (queueAppendTimeoutRef.current) {
+        clearTimeout(queueAppendTimeoutRef.current);
+      }
     };
   }, []);
 
@@ -1001,7 +1219,11 @@ export default function App({
   // Message queue state for queueing messages during streaming
   const [messageQueue, setMessageQueue] = useState<string[]>([]);
 
-  // Queue cancellation: when any message is queued, we send cancel and wait for stream to end
+  const messageQueueRef = useRef<string[]>([]); // For synchronous access
+  useEffect(() => {
+    messageQueueRef.current = messageQueue;
+  }, [messageQueue]);
+
   const waitingForQueueCancelRef = useRef(false);
   const queueSnapshotRef = useRef<string[]>([]);
   const [restoreQueueOnCancel, setRestoreQueueOnCancel] = useState(false);
@@ -1009,6 +1231,24 @@ export default function App({
   useEffect(() => {
     restoreQueueOnCancelRef.current = restoreQueueOnCancel;
   }, [restoreQueueOnCancel]);
+
+  const queueAppendTimeoutRef = useRef<NodeJS.Timeout | null>(null); // 15s append mode timeout
+
+  // Cache last sent input - cleared on successful completion, remains if interrupted
+  const lastSentInputRef = useRef<Array<MessageCreate | ApprovalCreate> | null>(
+    null,
+  );
+
+  // Epoch counter to force dequeue effect re-run when refs change but state doesn't
+  // Incremented when userCancelledRef is reset while messages are queued
+  const [dequeueEpoch, setDequeueEpoch] = useState(0);
+
+  // Track last dequeued message for restoration on error
+  // If an error occurs after dequeue, we restore this to the input field (if input is empty)
+  const lastDequeuedMessageRef = useRef<string | null>(null);
+
+  // Restored input value - set when we need to restore a message to the input after error
+  const [restoredInput, setRestoredInput] = useState<string | null>(null);
 
   // Helper to check if agent is busy (streaming, executing tool, or running command)
   // Uses refs for synchronous access outside React's closure system
@@ -1020,6 +1260,18 @@ export default function App({
       commandRunningRef.current ||
       abortControllerRef.current !== null
     );
+  }, []);
+
+  // Consume queued messages for appending to tool results (clears queue + timeout)
+  const consumeQueuedMessages = useCallback((): string[] | null => {
+    if (messageQueueRef.current.length === 0) return null;
+    if (queueAppendTimeoutRef.current) {
+      clearTimeout(queueAppendTimeoutRef.current);
+      queueAppendTimeoutRef.current = null;
+    }
+    const messages = [...messageQueueRef.current];
+    setMessageQueue([]);
+    return messages;
   }, []);
 
   // Helper to wrap async handlers that need to close overlay and lock input
@@ -1249,6 +1501,16 @@ export default function App({
 
   // Track whether we've already backfilled history (should only happen once)
   const hasBackfilledRef = useRef(false);
+
+  // Keep buffers in sync with tokenStreamingEnabled state for aggressive static promotion
+  useEffect(() => {
+    buffersRef.current.tokenStreamingEnabled = tokenStreamingEnabled;
+  }, [tokenStreamingEnabled]);
+
+  // Keep buffers in sync with agentId for server-side tool hooks
+  useEffect(() => {
+    buffersRef.current.agentId = agentState?.id;
+  }, [agentState?.id]);
 
   // Cache precomputed diffs from approval dialogs for tool return rendering
   // Key: toolCallId or "toolCallId:filePath" for Patch operations
@@ -1670,6 +1932,239 @@ export default function App({
     [refreshDerived, currentModelId],
   );
 
+  const updateMemorySyncCommand = useCallback(
+    (
+      commandId: string,
+      output: string,
+      success: boolean,
+      input = "/memory-sync",
+      keepRunning = false, // If true, keep phase as "running" (for conflict dialogs)
+    ) => {
+      buffersRef.current.byId.set(commandId, {
+        kind: "command",
+        id: commandId,
+        input,
+        output,
+        phase: keepRunning ? "running" : "finished",
+        success,
+      });
+      refreshDerived();
+    },
+    [refreshDerived],
+  );
+
+  const runMemoryFilesystemSync = useCallback(
+    async (source: "startup" | "auto" | "command", commandId?: string) => {
+      if (!agentId || agentId === "loading") {
+        return;
+      }
+      if (memorySyncInFlightRef.current) {
+        return;
+      }
+
+      memorySyncInFlightRef.current = true;
+
+      try {
+        await ensureMemoryFilesystemBlock(agentId);
+        const result = await syncMemoryFilesystem(agentId);
+
+        if (result.conflicts.length > 0) {
+          memorySyncCommandIdRef.current = commandId ?? null;
+          setMemorySyncConflicts(result.conflicts);
+          setActiveOverlay("memory-sync");
+
+          if (commandId) {
+            updateMemorySyncCommand(
+              commandId,
+              `Memory sync paused — resolve ${result.conflicts.length} conflict${
+                result.conflicts.length === 1 ? "" : "s"
+              } to continue.`,
+              false,
+              "/memory-sync",
+              true, // keepRunning - don't commit until conflicts resolved
+            );
+          }
+          return;
+        }
+
+        await updateMemoryFilesystemBlock(agentId);
+
+        if (commandId) {
+          updateMemorySyncCommand(
+            commandId,
+            formatMemorySyncSummary(result),
+            true,
+          );
+        }
+      } catch (error) {
+        const errorText = formatErrorDetails(error, agentId);
+        if (commandId) {
+          updateMemorySyncCommand(commandId, `Failed: ${errorText}`, false);
+        } else if (source !== "startup") {
+          appendError(`Memory sync failed: ${errorText}`);
+        } else {
+          console.error(`Memory sync failed: ${errorText}`);
+        }
+      } finally {
+        memorySyncInFlightRef.current = false;
+      }
+    },
+    [agentId, appendError, updateMemorySyncCommand],
+  );
+
+  const maybeSyncMemoryFilesystemAfterTurn = useCallback(async () => {
+    // Only auto-sync if memfs is enabled for this agent
+    if (!agentId || agentId === "loading") return;
+    if (!settingsManager.isMemfsEnabled(agentId)) return;
+
+    const newToolCallIds: string[] = [];
+    for (const line of buffersRef.current.byId.values()) {
+      if (line.kind !== "tool_call") continue;
+      if (!line.toolCallId || !line.name) continue;
+      if (line.name !== "memory" && line.name !== "memory_apply_patch")
+        continue;
+      if (memorySyncProcessedToolCallsRef.current.has(line.toolCallId))
+        continue;
+      newToolCallIds.push(line.toolCallId);
+    }
+
+    if (newToolCallIds.length === 0) {
+      return;
+    }
+
+    for (const id of newToolCallIds) {
+      memorySyncProcessedToolCallsRef.current.add(id);
+    }
+    await runMemoryFilesystemSync("auto");
+  }, [agentId, runMemoryFilesystemSync]);
+
+  useEffect(() => {
+    if (loadingState !== "ready") {
+      return;
+    }
+    if (!agentId || agentId === "loading") {
+      return;
+    }
+    if (memoryFilesystemInitializedRef.current) {
+      return;
+    }
+    // Only run startup sync if memfs is enabled for this agent
+    if (!settingsManager.isMemfsEnabled(agentId)) {
+      return;
+    }
+
+    memoryFilesystemInitializedRef.current = true;
+    runMemoryFilesystemSync("startup");
+  }, [agentId, loadingState, runMemoryFilesystemSync]);
+
+  const handleMemorySyncConflictSubmit = useCallback(
+    async (answers: Record<string, string>) => {
+      if (!agentId || agentId === "loading" || !memorySyncConflicts) {
+        return;
+      }
+
+      const commandId = memorySyncCommandIdRef.current;
+      const commandInput = memorySyncCommandInputRef.current;
+      memorySyncCommandIdRef.current = null;
+      memorySyncCommandInputRef.current = "/memory-sync";
+
+      const resolutions: MemorySyncResolution[] = memorySyncConflicts.map(
+        (conflict) => {
+          const answer = answers[`Conflict for ${conflict.label}`];
+          return {
+            label: conflict.label,
+            resolution: answer === "Use file version" ? "file" : "block",
+          };
+        },
+      );
+
+      setMemorySyncConflicts(null);
+      setActiveOverlay(null);
+
+      if (memorySyncInFlightRef.current) {
+        return;
+      }
+
+      memorySyncInFlightRef.current = true;
+
+      try {
+        const result = await syncMemoryFilesystem(agentId, {
+          resolutions,
+        });
+
+        if (result.conflicts.length > 0) {
+          setMemorySyncConflicts(result.conflicts);
+          setActiveOverlay("memory-sync");
+          if (commandId) {
+            updateMemorySyncCommand(
+              commandId,
+              `Memory sync paused — resolve ${result.conflicts.length} conflict${
+                result.conflicts.length === 1 ? "" : "s"
+              } to continue.`,
+              false,
+              commandInput,
+              true, // keepRunning - don't commit until all conflicts resolved
+            );
+          }
+          return;
+        }
+
+        await updateMemoryFilesystemBlock(agentId);
+
+        // Format resolution summary (align with formatMemorySyncSummary which uses "⎿  " prefix)
+        const resolutionSummary = resolutions
+          .map(
+            (r) =>
+              `⎿  ${r.label}: used ${r.resolution === "file" ? "file" : "block"} version`,
+          )
+          .join("\n");
+
+        if (commandId) {
+          updateMemorySyncCommand(
+            commandId,
+            `${formatMemorySyncSummary(result)}\nConflicts resolved:\n${resolutionSummary}`,
+            true,
+            commandInput,
+          );
+        }
+      } catch (error) {
+        const errorText = formatErrorDetails(error, agentId);
+        if (commandId) {
+          updateMemorySyncCommand(
+            commandId,
+            `Failed: ${errorText}`,
+            false,
+            commandInput,
+          );
+        } else {
+          appendError(`Memory sync failed: ${errorText}`);
+        }
+      } finally {
+        memorySyncInFlightRef.current = false;
+      }
+    },
+    [agentId, appendError, memorySyncConflicts, updateMemorySyncCommand],
+  );
+
+  const handleMemorySyncConflictCancel = useCallback(() => {
+    const commandId = memorySyncCommandIdRef.current;
+    const commandInput = memorySyncCommandInputRef.current;
+    memorySyncCommandIdRef.current = null;
+    memorySyncCommandInputRef.current = "/memory-sync";
+    memorySyncInFlightRef.current = false;
+    setMemorySyncConflicts(null);
+    setActiveOverlay(null);
+
+    if (commandId) {
+      updateMemorySyncCommand(
+        commandId,
+        "Memory sync cancelled.",
+        false,
+        commandInput,
+      );
+    }
+  }, [updateMemorySyncCommand]);
+
   // Core streaming function - iterative loop that processes conversation turns
   const processConversation = useCallback(
     async (
@@ -1762,7 +2257,7 @@ export default function App({
       };
 
       // Copy so we can safely mutate for retry recovery flows
-      const currentInput = [...initialInput];
+      let currentInput = [...initialInput];
       const allowReentry = options?.allowReentry ?? false;
 
       // Use provided generation (from onSubmit) or capture current
@@ -1807,6 +2302,38 @@ export default function App({
 
         setStreaming(true);
         abortControllerRef.current = new AbortController();
+
+        // Recover interrupted message: if cache contains ONLY user messages, prepend them
+        // Note: type="message" is a local discriminator (not in SDK types) to distinguish from approvals
+        const originalInput = currentInput;
+        const cacheIsAllUserMsgs = lastSentInputRef.current?.every(
+          (m) => m.type === "message" && m.role === "user",
+        );
+        if (cacheIsAllUserMsgs && lastSentInputRef.current) {
+          currentInput = [
+            ...lastSentInputRef.current,
+            ...currentInput.map((m) =>
+              m.type === "message" && m.role === "user"
+                ? {
+                    ...m,
+                    content: [
+                      { type: "text" as const, text: INTERRUPT_RECOVERY_ALERT },
+                      ...(typeof m.content === "string"
+                        ? [{ type: "text" as const, text: m.content }]
+                        : m.content),
+                    ],
+                  }
+                : m,
+            ),
+          ];
+          // Cache old + new for chained recovery
+          lastSentInputRef.current = [
+            ...lastSentInputRef.current,
+            ...originalInput,
+          ];
+        } else {
+          lastSentInputRef.current = originalInput;
+        }
 
         // Clear any stale pending tool calls from previous turns
         // If we're sending a new message, old pending state is no longer relevant
@@ -1860,9 +2387,95 @@ export default function App({
             );
 
             if (hasApprovalInPayload) {
-              // Extract error detail from APIError (handles both direct and nested structures)
-              // Direct: e.error.detail | Nested: e.error.error.detail (matches formatErrorDetails)
-              let errorDetail = "";
+              // "Invalid tool call IDs" means server HAS pending approvals but with different IDs.
+              // We need to fetch the actual pending approvals and show them to the user.
+              if (isInvalidToolCallIdsError(errorDetail)) {
+                try {
+                  const client = await getClient();
+                  const agent = await client.agents.retrieve(
+                    agentIdRef.current,
+                  );
+                  const { pendingApprovals: serverApprovals } =
+                    await getResumeData(
+                      client,
+                      agent,
+                      conversationIdRef.current,
+                    );
+
+                  if (serverApprovals && serverApprovals.length > 0) {
+                    // Preserve user message from current input (if any)
+                    // Filter out system reminders to avoid re-injecting them
+                    const userMessage = currentInput.find(
+                      (item) => item?.type === "message",
+                    );
+                    if (userMessage && "content" in userMessage) {
+                      const content = userMessage.content;
+                      let textToRestore = "";
+                      if (typeof content === "string") {
+                        textToRestore = stripSystemReminders(content);
+                      } else if (Array.isArray(content)) {
+                        // Extract text parts, filtering out system reminders
+                        textToRestore = content
+                          .filter(
+                            (c): c is { type: "text"; text: string } =>
+                              typeof c === "object" &&
+                              c !== null &&
+                              "type" in c &&
+                              c.type === "text" &&
+                              "text" in c &&
+                              typeof c.text === "string" &&
+                              !c.text.includes(SYSTEM_REMINDER_OPEN),
+                          )
+                          .map((c) => c.text)
+                          .join("\n");
+                      }
+                      if (textToRestore.trim()) {
+                        setRestoredInput(textToRestore);
+                      }
+                    }
+
+                    // Clear all stale approval state before setting new approvals
+                    setApprovalResults([]);
+                    setAutoHandledResults([]);
+                    setAutoDeniedApprovals([]);
+                    setApprovalContexts([]);
+                    queueApprovalResults(null);
+
+                    // Set up approval UI with fetched approvals
+                    setPendingApprovals(serverApprovals);
+
+                    // Analyze approval contexts (same logic as /resume)
+                    try {
+                      const contexts = await Promise.all(
+                        serverApprovals.map(async (approval) => {
+                          const parsedArgs = safeJsonParseOr<
+                            Record<string, unknown>
+                          >(approval.toolArgs, {});
+                          return await analyzeToolApproval(
+                            approval.toolName,
+                            parsedArgs,
+                          );
+                        }),
+                      );
+                      setApprovalContexts(contexts);
+                    } catch {
+                      // If analysis fails, contexts remain empty (will show basic options)
+                    }
+
+                    // Stop streaming and exit - user needs to approve/deny
+                    // (finally block will decrement processingConversationRef)
+                    setStreaming(false);
+                    sendDesktopNotification("Approval needed");
+                    return;
+                  }
+                  // No approvals found - fall through to general desync recovery
+                } catch {
+                  // Fetch failed - fall through to general desync recovery
+                }
+              }
+
+              // General desync: "no tool call awaiting" or fetch failed above
+              // Recover with keep-alive prompt or strip stale approvals
               if (
                 preStreamError instanceof APIError &&
                 preStreamError.error &&
@@ -2068,6 +2681,55 @@ export default function App({
           if (stopReasonToHandle === "end_turn") {
             setStreaming(false);
             llmApiErrorRetriesRef.current = 0; // Reset retry counter on success
+            conversationBusyRetriesRef.current = 0;
+            lastDequeuedMessageRef.current = null; // Clear - message was processed successfully
+            lastSentInputRef.current = null; // Clear - no recovery needed
+
+            // Run Stop hooks - if blocked/errored, continue the conversation with feedback
+            const stopHookResult = await runStopHooks(
+              stopReasonToHandle,
+              buffersRef.current.order.length,
+              Array.from(buffersRef.current.byId.values()).filter(
+                (item) => item.kind === "tool_call",
+              ).length,
+            );
+
+            // If hook blocked (exit 2), inject stderr feedback and continue conversation
+            if (stopHookResult.blocked) {
+              const stderrOutput = stopHookResult.results
+                .map((r) => r.stderr)
+                .filter(Boolean)
+                .join("\n");
+              const feedback = stderrOutput || "Stop hook blocked";
+              const hookMessage = `<stop-hook>\n${feedback}\n</stop-hook>`;
+
+              // Add status to transcript so user sees what's happening
+              const statusId = uid("status");
+              buffersRef.current.byId.set(statusId, {
+                kind: "status",
+                id: statusId,
+                lines: [
+                  "Stop hook encountered blocking error, continuing loop with stderr feedback.",
+                ],
+              });
+              buffersRef.current.order.push(statusId);
+              refreshDerived();
+
+              // Continue conversation with the hook feedback
+              setTimeout(() => {
+                processConversation(
+                  [
+                    {
+                      type: "message",
+                      role: "user",
+                      content: hookMessage,
+                    },
+                  ],
+                  { allowReentry: true },
+                );
+              }, 0);
+              return;
+            }
 
             // Disable eager approval check after first successful message (LET-7101)
             // Any new approvals from here on are from our own turn, not orphaned
@@ -2104,6 +2766,8 @@ export default function App({
               waitingForQueueCancelRef.current = false;
               queueSnapshotRef.current = [];
             }
+
+            await maybeSyncMemoryFilesystemAfterTurn();
 
             // === RALPH WIGGUM CONTINUATION CHECK ===
             // Check if ralph mode is active and should auto-continue
@@ -2174,6 +2838,7 @@ export default function App({
             // Clear stale state immediately to prevent ID mismatch bugs
             setAutoHandledResults([]);
             setAutoDeniedApprovals([]);
+            lastSentInputRef.current = null; // Clear - message was received by server
 
             // Use new approvals array, fallback to legacy approval for backward compat
             const approvalsToProcess =
@@ -2506,7 +3171,37 @@ export default function App({
                   return;
                 }
 
-                // Check if user queued messages during auto-allowed tool execution
+                // Append queued messages if any (from 15s append mode)
+                const queuedMessagesToAppend = consumeQueuedMessages();
+                if (queuedMessagesToAppend?.length) {
+                  for (const msg of queuedMessagesToAppend) {
+                    const userId = uid("user");
+                    buffersRef.current.byId.set(userId, {
+                      kind: "user",
+                      id: userId,
+                      text: msg,
+                    });
+                    buffersRef.current.order.push(userId);
+                  }
+                  setThinkingMessage(getRandomThinkingVerb());
+                  refreshDerived();
+                  toolResultsInFlightRef.current = true;
+                  await processConversation(
+                    [
+                      { type: "approval", approvals: allResults },
+                      ...queuedMessagesToAppend.map((msg) => ({
+                        type: "message" as const,
+                        role: "user" as const,
+                        content: msg as unknown as MessageCreate["content"],
+                      })),
+                    ],
+                    { allowReentry: true },
+                  );
+                  toolResultsInFlightRef.current = false;
+                  return;
+                }
+
+                // Cancel mode - queue results and let dequeue effect handle
                 if (waitingForQueueCancelRef.current) {
                   if (restoreQueueOnCancelRef.current) {
                     // User hit ESC during queue cancel - abort the auto-send
@@ -2535,7 +3230,6 @@ export default function App({
                   return;
                 }
 
-                // Rotate to a new thinking message
                 setThinkingMessage(getRandomThinkingVerb());
                 refreshDerived();
 
@@ -2663,6 +3357,94 @@ export default function App({
 
           // Track last failure info so we can emit it if retries stop
           const lastFailureMessage = latestErrorText || detailFromRun || null;
+
+          // "Invalid tool call IDs" means server HAS pending approvals but with different IDs.
+          // Fetch the actual pending approvals and show them to the user.
+          const invalidIdsDetected =
+            isInvalidToolCallIdsError(detailFromRun) ||
+            isInvalidToolCallIdsError(latestErrorText);
+
+          if (hasApprovalInPayload && invalidIdsDetected) {
+            try {
+              const client = await getClient();
+              const agent = await client.agents.retrieve(agentIdRef.current);
+              const { pendingApprovals: serverApprovals } = await getResumeData(
+                client,
+                agent,
+                conversationIdRef.current,
+              );
+
+              if (serverApprovals && serverApprovals.length > 0) {
+                // Preserve user message from current input (if any)
+                // Filter out system reminders to avoid re-injecting them
+                const userMessage = currentInput.find(
+                  (item) => item?.type === "message",
+                );
+                if (userMessage && "content" in userMessage) {
+                  const content = userMessage.content;
+                  let textToRestore = "";
+                  if (typeof content === "string") {
+                    textToRestore = stripSystemReminders(content);
+                  } else if (Array.isArray(content)) {
+                    // Extract text parts, filtering out system reminders
+                    textToRestore = content
+                      .filter(
+                        (c): c is { type: "text"; text: string } =>
+                          typeof c === "object" &&
+                          c !== null &&
+                          "type" in c &&
+                          c.type === "text" &&
+                          "text" in c &&
+                          typeof c.text === "string" &&
+                          !c.text.includes(SYSTEM_REMINDER_OPEN),
+                      )
+                      .map((c) => c.text)
+                      .join("\n");
+                  }
+                  if (textToRestore.trim()) {
+                    setRestoredInput(textToRestore);
+                  }
+                }
+
+                // Clear all stale approval state before setting new approvals
+                setApprovalResults([]);
+                setAutoHandledResults([]);
+                setAutoDeniedApprovals([]);
+                setApprovalContexts([]);
+                queueApprovalResults(null);
+
+                // Set up approval UI with fetched approvals
+                setPendingApprovals(serverApprovals);
+
+                // Analyze approval contexts
+                try {
+                  const contexts = await Promise.all(
+                    serverApprovals.map(async (approval) => {
+                      const parsedArgs = safeJsonParseOr<
+                        Record<string, unknown>
+                      >(approval.toolArgs, {});
+                      return await analyzeToolApproval(
+                        approval.toolName,
+                        parsedArgs,
+                      );
+                    }),
+                  );
+                  setApprovalContexts(contexts);
+                } catch {
+                  // If analysis fails, contexts remain empty (will show basic options)
+                }
+
+                // Stop streaming and exit - user needs to approve/deny
+                // (finally block will decrement processingConversationRef)
+                setStreaming(false);
+                sendDesktopNotification("Approval needed");
+                return;
+              }
+              // No approvals found - fall through to general desync recovery
+            } catch {
+              // Fetch failed - fall through to general desync recovery
+            }
+          }
 
           // Check for approval desync errors even if stop_reason isn't llm_api_error.
           // Mixed payloads: strip stale approvals but preserve user message.
@@ -3125,6 +3907,8 @@ export default function App({
       updateStreamingOutput,
       needsEagerApprovalCheck,
       queueApprovalResults,
+      consumeQueuedMessages,
+      maybeSyncMemoryFilesystemAfterTurn,
     ],
   );
 
@@ -3371,7 +4155,10 @@ export default function App({
   }, [processConversation]);
 
   const handleAgentSelect = useCallback(
-    async (targetAgentId: string, _opts?: { profileName?: string }) => {
+    async (
+      targetAgentId: string,
+      opts?: { profileName?: string; conversationId?: string },
+    ) => {
       // Close selector immediately
       setActiveOverlay(null);
 
@@ -3384,6 +4171,26 @@ export default function App({
           id: cmdId,
           input: "/agents",
           output: `Already on "${label}"`,
+          phase: "finished",
+          success: true,
+        });
+        buffersRef.current.order.push(cmdId);
+        refreshDerived();
+        return;
+      }
+
+      // If agent is busy, queue the switch for after end_turn
+      if (isAgentBusy()) {
+        setQueuedOverlayAction({
+          type: "switch_agent",
+          agentId: targetAgentId,
+        });
+        const cmdId = uid("cmd");
+        buffersRef.current.byId.set(cmdId, {
+          kind: "command",
+          id: cmdId,
+          input: "/agents",
+          output: `Agent switch queued – will switch after current task completes`,
           phase: "finished",
           success: true,
         });
@@ -3414,13 +4221,8 @@ export default function App({
         // Fetch new agent
         const agent = await client.agents.retrieve(targetAgentId);
 
-        // Always create a new conversation when switching agents
-        // User can /resume to get back to a previous conversation if needed
-        const newConversation = await client.conversations.create({
-          agent_id: targetAgentId,
-          isolated_block_labels: [...ISOLATED_BLOCK_LABELS],
-        });
-        const targetConversationId = newConversation.id;
+        // Use specified conversation or default to the agent's default conversation
+        const targetConversationId = opts?.conversationId ?? "default";
 
         // Update project settings with new agent
         await updateProjectSettings({ lastAgent: targetAgentId });
@@ -3455,12 +4257,20 @@ export default function App({
         setConversationId(targetConversationId);
         clearSkillBlockCache();
 
-        // Build success message - always a new conversation
+        // Build success message
         const agentLabel = agent.name || targetAgentId;
-        const successOutput = [
-          `Started a new conversation with **${agentLabel}**.`,
-          `⎿  Type /resume to resume a previous conversation`,
-        ].join("\n");
+        const isSpecificConv =
+          opts?.conversationId && opts.conversationId !== "default";
+        const successOutput = isSpecificConv
+          ? [
+              `Switched to **${agentLabel}**`,
+              `⎿  Conversation: ${opts.conversationId}`,
+            ].join("\n")
+          : [
+              `Resumed the default conversation with **${agentLabel}**.`,
+              `⎿  Type /resume to browse all conversations`,
+              `⎿  Type /new to start a new conversation`,
+            ].join("\n");
         const successItem: StaticItem = {
           kind: "command",
           id: uid("cmd"),
@@ -3494,7 +4304,7 @@ export default function App({
         setCommandRunning(false);
       }
     },
-    [refreshDerived, agentId, agentName, setCommandRunning],
+    [refreshDerived, agentId, agentName, setCommandRunning, isAgentBusy],
   );
 
   // Handle creating a new agent and switching to it
@@ -3588,11 +4398,19 @@ export default function App({
   );
 
   // Handle bash mode command submission
-  // Uses the same shell runner as the Bash tool for consistency
+  // Expands aliases from shell config files, then runs with spawnCommand
+  // Implements input locking and ESC cancellation (LET-7199)
   const handleBashSubmit = useCallback(
     async (command: string) => {
+      // Input locking - prevent multiple concurrent bash commands
+      if (bashRunning) return;
+
       const cmdId = uid("bash");
       const startTime = Date.now();
+
+      // Set up state for input locking and cancellation
+      setBashRunning(true);
+      bashAbortControllerRef.current = new AbortController();
 
       // Add running bash_command line with streaming state
       buffersRef.current.byId.set(cmdId, {
@@ -3620,7 +4438,8 @@ export default function App({
         const result = await spawnCommand(command, {
           cwd: process.cwd(),
           env: getShellEnv(),
-          timeout: 30000, // 30 second timeout
+          timeout: 0, // No timeout - user must ESC to interrupt (LET-7199)
+          signal: bashAbortControllerRef.current.signal,
           onOutput: (chunk, stream) => {
             const entry = buffersRef.current.byId.get(cmdId);
             if (entry && entry.kind === "bash_command") {
@@ -3644,11 +4463,16 @@ export default function App({
         const success = result.exitCode === 0;
 
         // Update line with output, clear streaming state
+        const displayOutput =
+          output ||
+          (success
+            ? "(Command completed with no output)"
+            : `Exit code: ${result.exitCode}`);
         buffersRef.current.byId.set(cmdId, {
           kind: "bash_command",
           id: cmdId,
           input: command,
-          output: output || (success ? "" : `Exit code: ${result.exitCode}`),
+          output: displayOutput,
           phase: "finished",
           success,
           streaming: undefined,
@@ -3657,16 +4481,29 @@ export default function App({
         // Cache for next user message
         bashCommandCacheRef.current.push({
           input: command,
-          output: output || (success ? "" : `Exit code: ${result.exitCode}`),
+          output: displayOutput,
         });
       } catch (error: unknown) {
-        // Handle command errors (timeout, abort, etc.)
-        const errOutput =
-          error instanceof Error
-            ? (error as { stderr?: string; stdout?: string }).stderr ||
-              (error as { stdout?: string }).stdout ||
-              error.message
-            : String(error);
+        // Check if this was an abort (user pressed ESC)
+        const err = error as { name?: string; code?: string; message?: string };
+        const isAbort =
+          bashAbortControllerRef.current?.signal.aborted ||
+          err.code === "ABORT_ERR" ||
+          err.name === "AbortError" ||
+          err.message === "The operation was aborted";
+
+        let errOutput: string;
+        if (isAbort) {
+          errOutput = INTERRUPTED_BY_USER;
+        } else {
+          // Handle command errors (timeout, other failures)
+          errOutput =
+            error instanceof Error
+              ? (error as { stderr?: string; stdout?: string }).stderr ||
+                (error as { stdout?: string }).stdout ||
+                error.message
+              : String(error);
+        }
 
         buffersRef.current.byId.set(cmdId, {
           kind: "bash_command",
@@ -3680,12 +4517,23 @@ export default function App({
 
         // Still cache for next user message (even failures are visible to agent)
         bashCommandCacheRef.current.push({ input: command, output: errOutput });
+      } finally {
+        // Clean up state
+        setBashRunning(false);
+        bashAbortControllerRef.current = null;
       }
 
       refreshDerived();
     },
-    [refreshDerived, refreshDerivedStreaming],
+    [bashRunning, refreshDerived, refreshDerivedStreaming],
   );
+
+  // Handle ESC interrupt for bash mode commands (LET-7199)
+  const handleBashInterrupt = useCallback(() => {
+    if (bashAbortControllerRef.current) {
+      bashAbortControllerRef.current.abort();
+    }
+  }, []);
 
   /**
    * Check and handle any pending approvals before sending a slash command.
@@ -3941,6 +4789,36 @@ export default function App({
 
       if (!msg) return { submitted: false };
 
+      // Run UserPromptSubmit hooks - can block the prompt from being processed
+      const isCommand = msg.startsWith("/");
+      const hookResult = await runUserPromptSubmitHooks(
+        msg,
+        isCommand,
+        agentId,
+        conversationIdRef.current,
+      );
+      if (hookResult.blocked) {
+        // Show feedback from hook in the transcript
+        const feedbackId = uid("status");
+        const feedback = hookResult.feedback.join("\n") || "Blocked by hook";
+        buffersRef.current.byId.set(feedbackId, {
+          kind: "status",
+          id: feedbackId,
+          lines: [
+            `<user-prompt-submit-hook>${feedback}</user-prompt-submit-hook>`,
+          ],
+        });
+        buffersRef.current.order.push(feedbackId);
+        refreshDerived();
+        return { submitted: false };
+      }
+
+      // Capture successful hook feedback to inject into agent context
+      const userPromptSubmitHookFeedback =
+        hookResult.feedback.length > 0
+          ? `${SYSTEM_REMINDER_OPEN}\n${hookResult.feedback.join("\n")}\n${SYSTEM_REMINDER_CLOSE}`
+          : "";
+
       // Capture the generation at submission time, BEFORE any async work.
       // This allows detecting if ESC was pressed during async operations.
       const submissionGeneration = conversationGenerationRef.current;
@@ -3962,38 +4840,70 @@ export default function App({
       // userCancelledRef.current, so we must clear it here to prevent blocking.
       userCancelledRef.current = false;
 
-      if (isAgentBusy()) {
+      // If there are queued messages and agent is not busy, bump epoch to trigger
+      // dequeue effect. Without this, the effect won't re-run because refs aren't
+      // in its deps array (only state values are).
+      if (!isAgentBusy() && messageQueue.length > 0) {
+        debugLog(
+          "queue",
+          `Bumping dequeueEpoch: userCancelledRef was reset, ${messageQueue.length} message(s) queued, agent not busy`,
+        );
+        setDequeueEpoch((e) => e + 1);
+      }
+
+      // Interactive slash commands (like /memory, /model, /agents) bypass queueing
+      // so users can browse/view while the agent is working.
+      // Changes made in these overlays will be queued until end_turn.
+      const shouldBypassQueue =
+        isInteractiveCommand(msg) || isNonStateCommand(msg);
+
+      if (isAgentBusy() && !shouldBypassQueue) {
         setMessageQueue((prev) => {
           const newQueue = [...prev, msg];
 
-          // For slash commands, just queue and wait - don't interrupt the agent.
-          // For regular messages, cancel the stream so the new message can be sent.
           const isSlashCommand = msg.startsWith("/");
 
+          // Regular messages: use append mode (wait 15s for tools, then append to API call)
           if (
             !isSlashCommand &&
             streamingRef.current &&
-            !waitingForQueueCancelRef.current
+            !waitingForQueueCancelRef.current &&
+            !queueAppendTimeoutRef.current
           ) {
-            waitingForQueueCancelRef.current = true;
-            queueSnapshotRef.current = [...newQueue];
+            queueAppendTimeoutRef.current = setTimeout(() => {
+              if (messageQueueRef.current.length === 0) {
+                queueAppendTimeoutRef.current = null;
+                return;
+              }
+              queueAppendTimeoutRef.current = null;
 
-            // Abort client-side tool execution if in progress
-            // This makes tool interruption visible immediately instead of waiting for completion
-            if (toolAbortControllerRef.current) {
-              toolAbortControllerRef.current.abort();
-            }
-
-            // Send cancel request to backend (fire-and-forget)
-            getClient()
-              .then((client) =>
-                client.conversations.cancel(conversationIdRef.current),
-              )
-              .then(() => {})
-              .catch(() => {
-                // Reset flag if cancel fails
-                waitingForQueueCancelRef.current = false;
-              });
+              // 15s expired - fall back to cancel
+              waitingForQueueCancelRef.current = true;
+              queueSnapshotRef.current = [...messageQueueRef.current];
+              if (toolAbortControllerRef.current) {
+                toolAbortControllerRef.current.abort();
+              }
+              getClient()
+                .then((client) => {
+                  if (conversationIdRef.current === "default") {
+                    return client.agents.messages.cancel(agentIdRef.current);
+                  }
+                  return client.conversations.cancel(conversationIdRef.current);
+                })
+                .catch(() => {
+                  waitingForQueueCancelRef.current = false;
+                });
+              setTimeout(() => {
+                if (
+                  waitingForQueueCancelRef.current &&
+                  abortControllerRef.current
+                ) {
+                  abortControllerRef.current.abort();
+                  waitingForQueueCancelRef.current = false;
+                  queueSnapshotRef.current = [];
+                }
+              }, 3000);
+            }, 15000);
           }
 
           return newQueue;
@@ -4145,11 +5055,14 @@ export default function App({
           return { submitted: true };
         }
 
-        // Special handling for /connect command - OAuth connection
-        if (msg.trim().startsWith("/connect")) {
-          // Handle all /connect commands through the unified handler
-          // For codex: uses local ChatGPT OAuth server (no dialog needed)
-          // For zai: requires API key as argument
+        // Special handling for /connect command - opens provider selector
+        if (msg.trim() === "/connect") {
+          setActiveOverlay("connect");
+          return { submitted: true };
+        }
+
+        // /connect codex - direct OAuth flow (kept for backwards compatibility)
+        if (msg.trim().startsWith("/connect codex")) {
           const { handleConnect } = await import("./commands/connect");
           await handleConnect(
             {
@@ -4544,7 +5457,7 @@ export default function App({
               kind: "command",
               id: cmdId,
               input: msg,
-              output: "Started new conversation",
+              output: "Started new conversation (use /resume to change convos)",
               phase: "finished",
               success: true,
             });
@@ -4753,14 +5666,9 @@ export default function App({
 
           try {
             const client = await getClient();
-            // SDK types are out of date - compact returns CompactionResponse, not void
-            const result = (await client.agents.messages.compact(
-              agentId,
-            )) as unknown as {
-              num_messages_before: number;
-              num_messages_after: number;
-              summary: string;
-            };
+            const result = await client.conversations.messages.compact(
+              conversationIdRef.current,
+            );
 
             // Format success message with before/after counts and summary
             const outputLines = [
@@ -5379,6 +6287,231 @@ export default function App({
           return { submitted: true };
         }
 
+        // Special handling for /memory-sync command - sync filesystem memory
+        if (trimmed === "/memory-sync") {
+          // Check if memfs is enabled for this agent
+          if (!settingsManager.isMemfsEnabled(agentId)) {
+            const cmdId = uid("cmd");
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: msg,
+              output:
+                "Memory filesystem is disabled. Run `/memfs enable` first.",
+              phase: "finished",
+              success: false,
+            });
+            buffersRef.current.order.push(cmdId);
+            refreshDerived();
+            return { submitted: true };
+          }
+
+          const cmdId = uid("cmd");
+          buffersRef.current.byId.set(cmdId, {
+            kind: "command",
+            id: cmdId,
+            input: msg,
+            output: "Syncing memory filesystem...",
+            phase: "running",
+          });
+          buffersRef.current.order.push(cmdId);
+          refreshDerived();
+
+          setCommandRunning(true);
+
+          try {
+            await runMemoryFilesystemSync("command", cmdId);
+          } finally {
+            setCommandRunning(false);
+          }
+
+          return { submitted: true };
+        }
+
+        // Special handling for /memfs command - enable/disable filesystem-backed memory
+        if (trimmed.startsWith("/memfs")) {
+          const [, subcommand] = trimmed.split(/\s+/);
+          const cmdId = uid("cmd");
+
+          if (!subcommand || subcommand === "status") {
+            // Show status
+            const enabled = settingsManager.isMemfsEnabled(agentId);
+            let output: string;
+            if (enabled) {
+              const memoryDir = getMemoryFilesystemRoot(agentId);
+              output = `Memory filesystem is enabled.\nPath: ${memoryDir}`;
+            } else {
+              output =
+                "Memory filesystem is disabled. Run `/memfs enable` to enable.";
+            }
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: msg,
+              output,
+              phase: "finished",
+              success: true,
+            });
+            buffersRef.current.order.push(cmdId);
+            refreshDerived();
+            return { submitted: true };
+          }
+
+          if (subcommand === "enable") {
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: msg,
+              output: "Enabling memory filesystem...",
+              phase: "running",
+            });
+            buffersRef.current.order.push(cmdId);
+            refreshDerived();
+            setCommandRunning(true);
+
+            try {
+              // 1. Detach memory tools from agent
+              const { detachMemoryTools } = await import("../tools/toolset");
+              await detachMemoryTools(agentId);
+
+              // 2. Update settings
+              settingsManager.setMemfsEnabled(agentId, true);
+
+              // 3. Update system prompt to include memfs section
+              const { updateAgentSystemPromptMemfs } = await import(
+                "../agent/modify"
+              );
+              await updateAgentSystemPromptMemfs(agentId, true);
+
+              // 4. Run initial sync (creates files from blocks)
+              await ensureMemoryFilesystemBlock(agentId);
+              const result = await syncMemoryFilesystem(agentId);
+
+              if (result.conflicts.length > 0) {
+                // Handle conflicts - show overlay (keep running so it stays in liveItems)
+                memorySyncCommandIdRef.current = cmdId;
+                memorySyncCommandInputRef.current = msg;
+                setMemorySyncConflicts(result.conflicts);
+                setActiveOverlay("memory-sync");
+                updateMemorySyncCommand(
+                  cmdId,
+                  `Memory filesystem enabled with ${result.conflicts.length} conflict${result.conflicts.length === 1 ? "" : "s"} to resolve.`,
+                  false,
+                  msg,
+                  true, // keepRunning - don't commit until conflict resolved
+                );
+              } else {
+                await updateMemoryFilesystemBlock(agentId);
+                const memoryDir = getMemoryFilesystemRoot(agentId);
+                updateMemorySyncCommand(
+                  cmdId,
+                  `Memory filesystem enabled.\nPath: ${memoryDir}\n${formatMemorySyncSummary(result)}`,
+                  true,
+                  msg,
+                );
+              }
+            } catch (error) {
+              const errorText =
+                error instanceof Error ? error.message : String(error);
+              updateMemorySyncCommand(
+                cmdId,
+                `Failed to enable memfs: ${errorText}`,
+                false,
+                msg,
+              );
+            } finally {
+              setCommandRunning(false);
+            }
+
+            return { submitted: true };
+          }
+
+          if (subcommand === "disable") {
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: msg,
+              output: "Disabling memory filesystem...",
+              phase: "running",
+            });
+            buffersRef.current.order.push(cmdId);
+            refreshDerived();
+            setCommandRunning(true);
+
+            try {
+              // 1. Run final sync to ensure blocks are up-to-date
+              const result = await syncMemoryFilesystem(agentId);
+
+              if (result.conflicts.length > 0) {
+                // Handle conflicts - show overlay (keep running so it stays in liveItems)
+                memorySyncCommandIdRef.current = cmdId;
+                memorySyncCommandInputRef.current = msg;
+                setMemorySyncConflicts(result.conflicts);
+                setActiveOverlay("memory-sync");
+                updateMemorySyncCommand(
+                  cmdId,
+                  `Cannot disable: resolve ${result.conflicts.length} conflict${result.conflicts.length === 1 ? "" : "s"} first.`,
+                  false,
+                  msg,
+                  true, // keepRunning - don't commit until conflict resolved
+                );
+                return { submitted: true };
+              }
+
+              // 2. Re-attach memory tool
+              const { reattachMemoryTool } = await import("../tools/toolset");
+              // Use current model or default to Claude
+              const modelId = currentModelId || "anthropic/claude-sonnet-4";
+              await reattachMemoryTool(agentId, modelId);
+
+              // 3. Detach memory_filesystem block
+              await detachMemoryFilesystemBlock(agentId);
+
+              // 4. Update system prompt to remove memfs section
+              const { updateAgentSystemPromptMemfs } = await import(
+                "../agent/modify"
+              );
+              await updateAgentSystemPromptMemfs(agentId, false);
+
+              // 5. Update settings
+              settingsManager.setMemfsEnabled(agentId, false);
+
+              updateMemorySyncCommand(
+                cmdId,
+                "Memory filesystem disabled. Memory tool re-attached.\nFiles on disk have been kept.",
+                true,
+                msg,
+              );
+            } catch (error) {
+              const errorText =
+                error instanceof Error ? error.message : String(error);
+              updateMemorySyncCommand(
+                cmdId,
+                `Failed to disable memfs: ${errorText}`,
+                false,
+                msg,
+              );
+            } finally {
+              setCommandRunning(false);
+            }
+
+            return { submitted: true };
+          }
+
+          // Unknown subcommand
+          buffersRef.current.byId.set(cmdId, {
+            kind: "command",
+            id: cmdId,
+            input: msg,
+            output: `Unknown subcommand: ${subcommand}. Use /memfs, /memfs enable, or /memfs disable.`,
+            phase: "finished",
+            success: false,
+          });
+          buffersRef.current.order.push(cmdId);
+          refreshDerived();
+          return { submitted: true };
+        }
+
         // Special handling for /skill command - enter skill creation mode
         if (trimmed.startsWith("/skill")) {
           // Check for pending approvals before sending
@@ -5420,7 +6553,7 @@ export default function App({
               ? `\n\nUser-provided skill description:\n${description}`
               : "\n\nThe user did not provide a description with /skill. Ask what kind of skill they want to create before proceeding.";
 
-            const skillMessage = `<system-reminder>\n${SKILL_CREATOR_PROMPT}${userDescriptionLine}\n</system-reminder>`;
+            const skillMessage = `${SYSTEM_REMINDER_OPEN}\n${SKILL_CREATOR_PROMPT}${userDescriptionLine}\n${SYSTEM_REMINDER_CLOSE}`;
 
             // Mark command as finished before sending message
             buffersRef.current.byId.set(cmdId, {
@@ -5498,8 +6631,8 @@ export default function App({
 
             // Build system-reminder content for memory request
             const rememberMessage = userText
-              ? `<system-reminder>\n${REMEMBER_PROMPT}\n</system-reminder>${userText}`
-              : `<system-reminder>\n${REMEMBER_PROMPT}\n\nThe user did not specify what to remember. Look at the recent conversation context to identify what they likely want you to remember, or ask them to clarify.\n</system-reminder>`;
+              ? `${SYSTEM_REMINDER_OPEN}\n${REMEMBER_PROMPT}\n${SYSTEM_REMINDER_CLOSE}${userText}`
+              : `${SYSTEM_REMINDER_OPEN}\n${REMEMBER_PROMPT}\n\nThe user did not specify what to remember. Look at the recent conversation context to identify what they likely want you to remember, or ask them to clarify.\n${SYSTEM_REMINDER_CLOSE}`;
 
             // Mark command as finished before sending message
             buffersRef.current.byId.set(cmdId, {
@@ -5654,7 +6787,7 @@ ${recentCommits}
             refreshDerived();
 
             // Send trigger message instructing agent to load the initializing-memory skill
-            const initMessage = `<system-reminder>
+            const initMessage = `${SYSTEM_REMINDER_OPEN}
 The user has requested memory initialization via /init.
 
 ## 1. Load the initializing-memory skill
@@ -5673,7 +6806,7 @@ If the skill fails to load, proceed with your best judgment based on these guide
 
 Once loaded, follow the instructions in the \`initializing-memory\` skill to complete the initialization.
 ${gitContext}
-</system-reminder>`;
+${SYSTEM_REMINDER_CLOSE}`;
 
             // Process conversation with the init prompt
             await processConversation([
@@ -5763,7 +6896,7 @@ ${gitContext}
               {
                 type: "message",
                 role: "user",
-                content: `<system-reminder>\n${prompt}\n</system-reminder>`,
+                content: `${SYSTEM_REMINDER_OPEN}\n${prompt}\n${SYSTEM_REMINDER_CLOSE}`,
               },
             ]);
           } catch (error) {
@@ -5786,26 +6919,16 @@ ${gitContext}
         }
         // === END custom command handling ===
 
-        // Immediately add command to transcript with "running" phase
-        const cmdId = uid("cmd");
-        buffersRef.current.byId.set(cmdId, {
-          kind: "command",
-          id: cmdId,
-          input: msg,
-          output: "",
-          phase: "running",
-        });
-        buffersRef.current.order.push(cmdId);
-        refreshDerived();
+        // Check if this is a known command before treating it as a slash command
+        const { executeCommand } = await import("./commands/registry");
+        const result = await executeCommand(aliasedMsg);
 
-        // Lock input during async operation
-        setCommandRunning(true);
-
-        try {
-          const { executeCommand } = await import("./commands/registry");
-          const result = await executeCommand(msg);
-
-          // Update the same command with result
+        // If command not found, fall through to send as regular message to agent
+        if (result.notFound) {
+          // Don't treat as command - continue to regular message handling below
+        } else {
+          // Known command - show in transcript and handle result
+          const cmdId = uid("cmd");
           buffersRef.current.byId.set(cmdId, {
             kind: "command",
             id: cmdId,
@@ -5814,24 +6937,10 @@ ${gitContext}
             phase: "finished",
             success: result.success,
           });
+          buffersRef.current.order.push(cmdId);
           refreshDerived();
-        } catch (error) {
-          // Mark command as failed if executeCommand throws
-          const errorDetails = formatErrorDetails(error, agentId);
-          buffersRef.current.byId.set(cmdId, {
-            kind: "command",
-            id: cmdId,
-            input: msg,
-            output: `Failed: ${errorDetails}`,
-            phase: "finished",
-            success: false,
-          });
-          refreshDerived();
-        } finally {
-          // Unlock input
-          setCommandRunning(false);
+          return { submitted: true }; // Don't send commands to Letta agent
         }
-        return { submitted: true }; // Don't send commands to Letta agent
       }
 
       // Build message content from display value (handles placeholders for text/images)
@@ -5881,10 +6990,10 @@ ${gitContext}
       // Build bash command prefix if there are cached commands
       let bashCommandPrefix = "";
       if (bashCommandCacheRef.current.length > 0) {
-        bashCommandPrefix = `<system-reminder>
+        bashCommandPrefix = `${SYSTEM_REMINDER_OPEN}
 The messages below were generated by the user while running local commands using "bash mode" in the Letta Code CLI tool.
 DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.
-</system-reminder>
+${SYSTEM_REMINDER_CLOSE}
 `;
         for (const cmd of bashCommandCacheRef.current) {
           bashCommandPrefix += `<bash-input>${cmd.input}</bash-input>\n<bash-output>${cmd.output}</bash-output>\n`;
@@ -5915,7 +7024,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         lastNotifiedModeRef.current = currentMode;
       }
 
-      // Combine reminders with content (session context first, then permission mode, then plan mode, then ralph mode, then skill unload, then bash commands, then memory reminder)
+      // Combine reminders with content (session context first, then permission mode, then plan mode, then ralph mode, then skill unload, then bash commands, then hook feedback, then memory reminder)
       const allReminders =
         sessionContextReminder +
         permissionModeAlert +
@@ -5923,6 +7032,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         ralphModeReminder +
         skillUnloadReminder +
         bashCommandPrefix +
+        userPromptSubmitHookFeedback +
         memoryReminderContent;
       const messageContent =
         allReminders && typeof contentParts === "string"
@@ -6536,8 +7646,9 @@ DO NOT respond to these messages or otherwise consider them in your response unl
             approvals: queuedApprovalResults,
           });
         } else {
-          console.warn(
-            "[WARN] Dropping stale queued approval results for mismatched conversation or generation",
+          debugWarn(
+            "queue",
+            "Dropping stale queued approval results for mismatched conversation or generation",
           );
         }
         queueApprovalResults(null);
@@ -6773,13 +7884,36 @@ DO NOT respond to these messages or otherwise consider them in your response unl
           waitingForQueueCancelRef.current = false;
           queueSnapshotRef.current = [];
         } else {
-          // Continue conversation with all results
-          await processConversation([
-            {
-              type: "approval",
-              approvals: allResults as ApprovalResult[],
-            },
-          ]);
+          const queuedMessagesToAppend = consumeQueuedMessages();
+          const input: Array<MessageCreate | ApprovalCreate> = [
+            { type: "approval", approvals: allResults as ApprovalResult[] },
+          ];
+          if (queuedMessagesToAppend?.length) {
+            for (const msg of queuedMessagesToAppend) {
+              const userId = uid("user");
+              buffersRef.current.byId.set(userId, {
+                kind: "user",
+                id: userId,
+                text: msg,
+              });
+              buffersRef.current.order.push(userId);
+              input.push({
+                type: "message",
+                role: "user",
+                content: msg as unknown as MessageCreate["content"],
+              });
+            }
+            refreshDerived();
+          }
+          toolResultsInFlightRef.current = true;
+          await processConversation(input);
+          toolResultsInFlightRef.current = false;
+
+          // Clear any stale queued results from previous interrupts.
+          // This approval flow supersedes any previously queued results - if we don't
+          // clear them here, they persist with matching generation and get sent on the
+          // next onSubmit, causing "Invalid tool call IDs" errors.
+          queueApprovalResults(null);
         }
       } finally {
         // Always release the execution guard, even if an error occurred
@@ -6801,6 +7935,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
       setIsExecutingTool,
       updateStreamingOutput,
       queueApprovalResults,
+      consumeQueuedMessages,
     ],
   );
 
@@ -7116,6 +8251,24 @@ DO NOT respond to these messages or otherwise consider them in your response unl
 
   const handleModelSelect = useCallback(
     async (modelId: string) => {
+      // If agent is busy, queue the model switch for after end_turn
+      if (isAgentBusy()) {
+        setActiveOverlay(null);
+        setQueuedOverlayAction({ type: "switch_model", modelId });
+        const cmdId = uid("cmd");
+        buffersRef.current.byId.set(cmdId, {
+          kind: "command",
+          id: cmdId,
+          input: `/model ${modelId}`,
+          output: `Model switch queued – will switch after current task completes`,
+          phase: "finished",
+          success: true,
+        });
+        buffersRef.current.order.push(cmdId);
+        refreshDerived();
+        return;
+      }
+
       await withCommandLock(async () => {
         // Declare cmdId outside try block so it's accessible in catch
         let cmdId: string | null = null;
@@ -7274,11 +8427,239 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         }
       });
     },
-    [agentId, refreshDerived, currentToolset, currentSystemPromptId, withCommandLock],
+    [agentId, refreshDerived, currentToolset, currentSystemPromptId, withCommandLock, isAgentBusy],
   );
+
+  // Process queued overlay actions when streaming ends
+  // These are actions from interactive commands (like /agents, /model) that were
+  // used while the agent was busy. The change is applied after end_turn.
+  useEffect(() => {
+    if (
+      !streaming &&
+      !commandRunning &&
+      !isExecutingTool &&
+      pendingApprovals.length === 0 &&
+      queuedOverlayAction !== null
+    ) {
+      const action = queuedOverlayAction;
+      setQueuedOverlayAction(null); // Clear immediately to prevent re-runs
+
+      // Process the queued action
+      if (action.type === "switch_agent") {
+        // Call handleAgentSelect - it will see isAgentBusy() as false now
+        handleAgentSelect(action.agentId);
+      } else if (action.type === "switch_model") {
+        // Call handleModelSelect - it will see isAgentBusy() as false now
+        handleModelSelect(action.modelId);
+      } else if (action.type === "switch_conversation") {
+        // For conversation switch, we need to handle it inline since the handler
+        // is defined in JSX. We'll dispatch a synthetic event or handle directly.
+        const cmdId = uid("cmd");
+        buffersRef.current.byId.set(cmdId, {
+          kind: "command",
+          id: cmdId,
+          input: "/resume",
+          output: `Processing queued conversation switch...`,
+          phase: "running",
+        });
+        buffersRef.current.order.push(cmdId);
+        refreshDerived();
+
+        // Execute the conversation switch asynchronously
+        (async () => {
+          setCommandRunning(true);
+          try {
+            if (action.conversationId === conversationId) {
+              buffersRef.current.byId.set(cmdId, {
+                kind: "command",
+                id: cmdId,
+                input: "/resume",
+                output: "Already on this conversation",
+                phase: "finished",
+                success: true,
+              });
+            } else {
+              const client = await getClient();
+              if (agentState) {
+                const resumeData = await getResumeData(
+                  client,
+                  agentState,
+                  action.conversationId,
+                );
+
+                setConversationId(action.conversationId);
+                settingsManager.setLocalLastSession(
+                  { agentId, conversationId: action.conversationId },
+                  process.cwd(),
+                );
+                settingsManager.setGlobalLastSession({
+                  agentId,
+                  conversationId: action.conversationId,
+                });
+
+                buffersRef.current.byId.set(cmdId, {
+                  kind: "command",
+                  id: cmdId,
+                  input: "/resume",
+                  output: `Switched to conversation (${resumeData.messageHistory.length} messages)`,
+                  phase: "finished",
+                  success: true,
+                });
+              }
+            }
+          } catch (error) {
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: "/resume",
+              output: `Failed to switch conversation: ${error instanceof Error ? error.message : String(error)}`,
+              phase: "finished",
+              success: false,
+            });
+          } finally {
+            setCommandRunning(false);
+            refreshDerived();
+          }
+        })();
+      } else if (action.type === "switch_toolset") {
+        // Execute toolset switch inline (handler defined later, can't call directly)
+        (async () => {
+          setCommandRunning(true);
+          const cmdId = uid("cmd");
+          try {
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: `/toolset ${action.toolsetId}`,
+              output: `Switching toolset to ${action.toolsetId}...`,
+              phase: "running",
+            });
+            buffersRef.current.order.push(cmdId);
+            refreshDerived();
+
+            const { forceToolsetSwitch } = await import("../tools/toolset");
+            await forceToolsetSwitch(action.toolsetId, agentId);
+            setCurrentToolset(action.toolsetId);
+
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: `/toolset ${action.toolsetId}`,
+              output: `Switched toolset to ${action.toolsetId}`,
+              phase: "finished",
+              success: true,
+            });
+          } catch (error) {
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: `/toolset ${action.toolsetId}`,
+              output: `Failed to switch toolset: ${error instanceof Error ? error.message : String(error)}`,
+              phase: "finished",
+              success: false,
+            });
+          } finally {
+            setCommandRunning(false);
+            refreshDerived();
+          }
+        })();
+      } else if (action.type === "switch_system") {
+        // Execute system prompt switch inline (handler defined later, can't call directly)
+        (async () => {
+          setCommandRunning(true);
+          const cmdId = uid("cmd");
+          try {
+            const { SYSTEM_PROMPTS } = await import("../agent/promptAssets");
+            const selectedPrompt = SYSTEM_PROMPTS.find(
+              (p) => p.id === action.promptId,
+            );
+
+            if (!selectedPrompt) {
+              buffersRef.current.byId.set(cmdId, {
+                kind: "command",
+                id: cmdId,
+                input: `/system ${action.promptId}`,
+                output: `System prompt not found: ${action.promptId}`,
+                phase: "finished",
+                success: false,
+              });
+              buffersRef.current.order.push(cmdId);
+              return;
+            }
+
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: `/system ${action.promptId}`,
+              output: `Switching system prompt to ${selectedPrompt.label}...`,
+              phase: "running",
+            });
+            buffersRef.current.order.push(cmdId);
+            refreshDerived();
+
+            const { updateAgentSystemPrompt } = await import("../agent/modify");
+            await updateAgentSystemPrompt(agentId, selectedPrompt.content);
+            setCurrentSystemPromptId(action.promptId);
+
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: `/system ${action.promptId}`,
+              output: `Switched system prompt to ${selectedPrompt.label}`,
+              phase: "finished",
+              success: true,
+            });
+          } catch (error) {
+            buffersRef.current.byId.set(cmdId, {
+              kind: "command",
+              id: cmdId,
+              input: `/system ${action.promptId}`,
+              output: `Failed to switch system prompt: ${error instanceof Error ? error.message : String(error)}`,
+              phase: "finished",
+              success: false,
+            });
+          } finally {
+            setCommandRunning(false);
+            refreshDerived();
+          }
+        })();
+      }
+    }
+  }, [
+    streaming,
+    commandRunning,
+    isExecutingTool,
+    pendingApprovals,
+    queuedOverlayAction,
+    handleAgentSelect,
+    handleModelSelect,
+    agentId,
+    agentState,
+    conversationId,
+    refreshDerived,
+    setCommandRunning,
+  ]);
 
   const handleSystemPromptSelect = useCallback(
     async (promptId: string) => {
+      // If agent is busy, queue the system prompt switch for after end_turn
+      if (isAgentBusy()) {
+        setActiveOverlay(null);
+        setQueuedOverlayAction({ type: "switch_system", promptId });
+        const cmdId = uid("cmd");
+        buffersRef.current.byId.set(cmdId, {
+          kind: "command",
+          id: cmdId,
+          input: `/system ${promptId}`,
+          output: `System prompt switch queued – will switch after current task completes`,
+          phase: "finished",
+          success: true,
+        });
+        buffersRef.current.order.push(cmdId);
+        refreshDerived();
+        return;
+      }
+
       await withCommandLock(async () => {
         const cmdId = uid("cmd");
 
@@ -7356,7 +8737,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         }
       });
     },
-    [agentId, refreshDerived, withCommandLock],
+    [agentId, refreshDerived, withCommandLock, isAgentBusy],
   );
 
   const handleToolsetSelect = useCallback(
@@ -7369,6 +8750,24 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         | "gemini_snake"
         | "none",
     ) => {
+      // If agent is busy, queue the toolset switch for after end_turn
+      if (isAgentBusy()) {
+        setActiveOverlay(null);
+        setQueuedOverlayAction({ type: "switch_toolset", toolsetId });
+        const cmdId = uid("cmd");
+        buffersRef.current.byId.set(cmdId, {
+          kind: "command",
+          id: cmdId,
+          input: `/toolset ${toolsetId}`,
+          output: `Toolset switch queued – will switch after current task completes`,
+          phase: "finished",
+          success: true,
+        });
+        buffersRef.current.order.push(cmdId);
+        refreshDerived();
+        return;
+      }
+
       await withCommandLock(async () => {
         const cmdId = uid("cmd");
 
@@ -7413,7 +8812,7 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         }
       });
     },
-    [agentId, refreshDerived, withCommandLock],
+    [agentId, refreshDerived, withCommandLock, isAgentBusy],
   );
 
   // Handle escape when profile confirmation is pending
@@ -7467,6 +8866,31 @@ DO NOT respond to these messages or otherwise consider them in your response unl
                 version: process.env.npm_package_version || "unknown",
                 platform: process.platform,
                 settings: JSON.stringify(safeSettings),
+                // Additional context for debugging
+                system_info: {
+                  local_time: getLocalTime(),
+                  device_type: getDeviceType(),
+                  cwd: process.cwd(),
+                },
+                session_stats: (() => {
+                  const stats = sessionStatsRef.current?.getSnapshot();
+                  if (!stats) return undefined;
+                  return {
+                    total_api_ms: stats.totalApiMs,
+                    total_wall_ms: stats.totalWallMs,
+                    step_count: stats.usage.stepCount,
+                    prompt_tokens: stats.usage.promptTokens,
+                    completion_tokens: stats.usage.completionTokens,
+                  };
+                })(),
+                agent_info: {
+                  agent_name: agentName,
+                  agent_description: agentDescription,
+                  model: currentModelId,
+                },
+                account_info: {
+                  billing_tier: billingTier,
+                },
               }),
             },
           );
@@ -7502,7 +8926,16 @@ DO NOT respond to these messages or otherwise consider them in your response unl
         }
       });
     },
-    [agentId, refreshDerived, withCommandLock, closeOverlay],
+    [
+      agentId,
+      agentName,
+      agentDescription,
+      currentModelId,
+      billingTier,
+      refreshDerived,
+      withCommandLock,
+      closeOverlay,
+    ],
   );
 
   const handleProfileEscapeCancel = useCallback(() => {
@@ -8085,7 +9518,9 @@ Plan file path: ${planFilePath}`;
             ) : item.kind === "status" ? (
               <StatusMessage line={item} />
             ) : item.kind === "separator" ? (
-              <Text dimColor>{"─".repeat(columns)}</Text>
+              <Box marginTop={1}>
+                <Text dimColor>{"─".repeat(columns)}</Text>
+              </Box>
             ) : item.kind === "command" ? (
               <CommandMessage line={item} />
             ) : item.kind === "bash_command" ? (
@@ -8308,6 +9743,8 @@ Plan file path: ${planFilePath}`;
                 thinkingMessage={thinkingMessage}
                 onSubmit={onSubmit}
                 onBashSubmit={handleBashSubmit}
+                bashRunning={bashRunning}
+                onBashInterrupt={handleBashInterrupt}
                 permissionMode={uiPermissionMode}
                 onPermissionModeChange={handlePermissionModeChange}
                 onExit={handleExit}
@@ -8338,6 +9775,42 @@ Plan file path: ${planFilePath}`;
                 onCancel={closeOverlay}
                 filterProvider={modelSelectorOptions.filterProvider}
                 forceRefresh={modelSelectorOptions.forceRefresh}
+                billingTier={billingTier ?? undefined}
+                isSelfHosted={(() => {
+                  const settings = settingsManager.getSettings();
+                  const baseURL =
+                    process.env.LETTA_BASE_URL ||
+                    settings.env?.LETTA_BASE_URL ||
+                    "https://api.letta.com";
+                  return !baseURL.includes("api.letta.com");
+                })()}
+              />
+            )}
+
+            {/* Provider Selector - for connecting BYOK providers */}
+            {activeOverlay === "connect" && (
+              <ProviderSelector
+                onCancel={closeOverlay}
+                onStartOAuth={async () => {
+                  // Close selector and start OAuth flow
+                  closeOverlay();
+                  const { handleConnect } = await import("./commands/connect");
+                  await handleConnect(
+                    {
+                      buffersRef,
+                      refreshDerived,
+                      setCommandRunning,
+                      onCodexConnected: () => {
+                        setModelSelectorOptions({
+                          filterProvider: "chatgpt-plus-pro",
+                          forceRefresh: true,
+                        });
+                        setActiveOverlay("model");
+                      },
+                    },
+                    "/connect codex",
+                  );
+                }}
               />
             )}
 
@@ -8397,6 +9870,26 @@ Plan file path: ${planFilePath}`;
                       id: cmdId,
                       input: "/resume",
                       output: "Already on this conversation",
+                      phase: "finished",
+                      success: true,
+                    });
+                    buffersRef.current.order.push(cmdId);
+                    refreshDerived();
+                    return;
+                  }
+
+                  // If agent is busy, queue the switch for after end_turn
+                  if (isAgentBusy()) {
+                    setQueuedOverlayAction({
+                      type: "switch_conversation",
+                      conversationId: convId,
+                    });
+                    const cmdId = uid("cmd");
+                    buffersRef.current.byId.set(cmdId, {
+                      kind: "command",
+                      id: cmdId,
+                      input: "/resume",
+                      output: `Conversation switch queued – will switch after current task completes`,
                       phase: "finished",
                       success: true,
                     });
@@ -8659,7 +10152,189 @@ Plan file path: ${planFilePath}`;
 
             {/* Message Search - conditionally mounted as overlay */}
             {activeOverlay === "search" && (
-              <MessageSearch onClose={closeOverlay} />
+              <MessageSearch
+                onClose={closeOverlay}
+                initialQuery={searchQuery || undefined}
+                agentId={agentId}
+                conversationId={conversationId}
+                onOpenConversation={async (targetAgentId, targetConvId) => {
+                  closeOverlay();
+
+                  // Different agent: use handleAgentSelect (which supports optional conversationId)
+                  if (targetAgentId !== agentId) {
+                    await handleAgentSelect(targetAgentId, {
+                      conversationId: targetConvId,
+                    });
+                    return;
+                  }
+
+                  // Normalize undefined/null to "default"
+                  const actualTargetConv = targetConvId || "default";
+
+                  // Same agent, same conversation: nothing to do
+                  if (actualTargetConv === conversationId) {
+                    return;
+                  }
+
+                  // Same agent, different conversation: switch conversation
+                  // (Reuses ConversationSelector's onSelect logic pattern)
+                  if (isAgentBusy()) {
+                    setQueuedOverlayAction({
+                      type: "switch_conversation",
+                      conversationId: actualTargetConv,
+                    });
+                    const cmdId = uid("cmd");
+                    buffersRef.current.byId.set(cmdId, {
+                      kind: "command",
+                      id: cmdId,
+                      input: "/search",
+                      output: `Conversation switch queued – will switch after current task completes`,
+                      phase: "finished",
+                      success: true,
+                    });
+                    buffersRef.current.order.push(cmdId);
+                    refreshDerived();
+                    return;
+                  }
+
+                  setCommandRunning(true);
+                  const cmdId = uid("cmd");
+                  buffersRef.current.byId.set(cmdId, {
+                    kind: "command",
+                    id: cmdId,
+                    input: "/search",
+                    output: "Switching conversation...",
+                    phase: "running",
+                  });
+                  buffersRef.current.order.push(cmdId);
+                  refreshDerived();
+
+                  try {
+                    if (agentState) {
+                      const client = await getClient();
+                      const resumeData = await getResumeData(
+                        client,
+                        agentState,
+                        actualTargetConv,
+                      );
+
+                      setConversationId(actualTargetConv);
+                      settingsManager.setLocalLastSession(
+                        { agentId, conversationId: actualTargetConv },
+                        process.cwd(),
+                      );
+                      settingsManager.setGlobalLastSession({
+                        agentId,
+                        conversationId: actualTargetConv,
+                      });
+
+                      // Clear current transcript and static items
+                      buffersRef.current.byId.clear();
+                      buffersRef.current.order = [];
+                      buffersRef.current.tokenCount = 0;
+                      emittedIdsRef.current.clear();
+                      setStaticItems([]);
+                      setStaticRenderEpoch((e) => e + 1);
+
+                      const currentAgentName =
+                        agentState.name || "Unnamed Agent";
+                      const successOutput = [
+                        `Switched to conversation with "${currentAgentName}"`,
+                        `⎿  Conversation: ${actualTargetConv}`,
+                      ].join("\n");
+                      const successItem: StaticItem = {
+                        kind: "command",
+                        id: uid("cmd"),
+                        input: "/search",
+                        output: successOutput,
+                        phase: "finished",
+                        success: true,
+                      };
+
+                      // Backfill message history
+                      if (resumeData.messageHistory.length > 0) {
+                        hasBackfilledRef.current = false;
+                        backfillBuffers(
+                          buffersRef.current,
+                          resumeData.messageHistory,
+                        );
+                        const backfilledItems: StaticItem[] = [];
+                        for (const id of buffersRef.current.order) {
+                          const ln = buffersRef.current.byId.get(id);
+                          if (!ln) continue;
+                          emittedIdsRef.current.add(id);
+                          backfilledItems.push({ ...ln } as StaticItem);
+                        }
+                        const separator = {
+                          kind: "separator" as const,
+                          id: uid("sep"),
+                        };
+                        setStaticItems([
+                          separator,
+                          ...backfilledItems,
+                          successItem,
+                        ]);
+                        setLines(toLines(buffersRef.current));
+                        hasBackfilledRef.current = true;
+                      } else {
+                        const separator = {
+                          kind: "separator" as const,
+                          id: uid("sep"),
+                        };
+                        setStaticItems([separator, successItem]);
+                        setLines(toLines(buffersRef.current));
+                      }
+
+                      // Restore pending approvals if any
+                      if (resumeData.pendingApprovals.length > 0) {
+                        setPendingApprovals(resumeData.pendingApprovals);
+                        try {
+                          const contexts = await Promise.all(
+                            resumeData.pendingApprovals.map(
+                              async (approval) => {
+                                const parsedArgs = safeJsonParseOr<
+                                  Record<string, unknown>
+                                >(approval.toolArgs, {});
+                                return await analyzeToolApproval(
+                                  approval.toolName,
+                                  parsedArgs,
+                                );
+                              },
+                            ),
+                          );
+                          setApprovalContexts(contexts);
+                        } catch {
+                          // If analysis fails, leave context as null
+                        }
+                      }
+                    }
+                  } catch (error) {
+                    let errorMsg = "Unknown error";
+                    if (error instanceof APIError) {
+                      if (error.status === 404) {
+                        errorMsg = "Conversation not found";
+                      } else if (error.status === 422) {
+                        errorMsg = "Invalid conversation ID";
+                      } else {
+                        errorMsg = error.message;
+                      }
+                    } else if (error instanceof Error) {
+                      errorMsg = error.message;
+                    }
+                    buffersRef.current.byId.set(cmdId, {
+                      kind: "command",
+                      id: cmdId,
+                      input: "/search",
+                      output: `Failed: ${errorMsg}`,
+                      phase: "finished",
+                      success: false,
+                    });
+                    refreshDerived();
+                  } finally {
+                    setCommandRunning(false);
+                  }
+                }}
+              />
             )}
 
             {/* Feedback Dialog - conditionally mounted as overlay */}
@@ -8678,6 +10353,30 @@ Plan file path: ${planFilePath}`;
                 agentId={agentId}
                 onClose={closeOverlay}
                 conversationId={conversationId}
+              />
+            )}
+
+            {/* Memory Sync Conflict Resolver */}
+            {activeOverlay === "memory-sync" && memorySyncConflicts && (
+              <InlineQuestionApproval
+                questions={memorySyncConflicts.map((conflict) => ({
+                  header: "Memory sync",
+                  question: `Conflict for ${conflict.label}`,
+                  options: [
+                    {
+                      label: "Use file version",
+                      description: "Overwrite memory block with file contents",
+                    },
+                    {
+                      label: "Use block version",
+                      description: "Overwrite file with memory block contents",
+                    },
+                  ],
+                  multiSelect: false,
+                  allowOther: false, // Only file or block - no custom option
+                }))}
+                onSubmit={handleMemorySyncConflictSubmit}
+                onCancel={handleMemorySyncConflictCancel}
               />
             )}
 
@@ -8720,6 +10419,11 @@ Plan file path: ${planFilePath}`;
 
             {/* Help Dialog - conditionally mounted as overlay */}
             {activeOverlay === "help" && <HelpDialog onClose={closeOverlay} />}
+
+            {/* Hooks Manager - for managing hooks configuration */}
+            {activeOverlay === "hooks" && (
+              <HooksManager onClose={closeOverlay} agentId={agentId} />
+            )}
 
             {/* New Agent Dialog - for naming new agent before creation */}
             {activeOverlay === "new" && (

@@ -89,7 +89,7 @@ OPTIONS
   --new                 Create new conversation (for concurrent sessions)
   --new-agent           Create new agent directly (skip profile selection)
   --init-blocks <list>  Comma-separated memory blocks to initialize when using --new-agent (e.g., "persona,skills")
-  --base-tools <list>   Comma-separated base tools to attach when using --new-agent (e.g., "memory,web_search,conversation_search")
+  --base-tools <list>   Comma-separated base tools to attach when using --new-agent (e.g., "memory,web_search,fetch_webpage")
   -a, --agent <id>      Use a specific agent ID
   -n, --name <name>     Resume agent by name (from pinned agents, case-insensitive)
   -m, --model <id>      Model ID or handle (e.g., "opus-4.5" or "anthropic/claude-opus-4-5")
@@ -123,6 +123,7 @@ EXAMPLES
   # when installed as an executable
   letta                    # Show profile selector or create new
   letta --new-agent        # Create new agent directly
+  letta --new              # Create new conversation
   letta --agent agent_123  # Open specific agent
 
   # inside the interactive session
@@ -364,9 +365,21 @@ async function main(): Promise<void> {
 
   // Check for updates on startup (non-blocking)
   const { checkAndAutoUpdate } = await import("./updater/auto-update");
-  checkAndAutoUpdate().catch(() => {
-    // Silently ignore update failures
-  });
+  checkAndAutoUpdate()
+    .then((result) => {
+      // Surface ENOTEMPTY failures so users know how to fix
+      if (result?.enotemptyFailed) {
+        console.error(
+          "\nAuto-update failed due to filesystem issue (ENOTEMPTY).",
+        );
+        console.error(
+          "Fix: rm -rf $(npm prefix -g)/lib/node_modules/@letta-ai/letta-code && npm i -g @letta-ai/letta-code\n",
+        );
+      }
+    })
+    .catch(() => {
+      // Silently ignore other update failures (network timeouts, etc.)
+    });
 
   // Clean up old overflow files (non-blocking, 24h retention)
   const { cleanupOldOverflowFiles } = await import("./tools/impl/overflow");
@@ -994,6 +1007,23 @@ async function main(): Promise<void> {
     >(null);
     // Track when user explicitly requested new agent from selector (not via --new flag)
     const [userRequestedNewAgent, setUserRequestedNewAgent] = useState(false);
+    // Message to show when LRU/selected agent failed to load
+    const [failedAgentMessage, setFailedAgentMessage] = useState<string | null>(
+      null,
+    );
+    // For self-hosted: available model handles from server and user's selection
+    const [availableServerModels, setAvailableServerModels] = useState<
+      string[]
+    >([]);
+    const [selectedServerModel, setSelectedServerModel] = useState<
+      string | null
+    >(null);
+    const [selfHostedDefaultModel, setSelfHostedDefaultModel] = useState<
+      string | null
+    >(null);
+    const [selfHostedBaseUrl, setSelfHostedBaseUrl] = useState<string | null>(
+      null,
+    );
 
     // Release notes to display (checked once on mount)
     const [releaseNotes, setReleaseNotes] = useState<string | null>(null);
@@ -1090,6 +1120,35 @@ async function main(): Promise<void> {
         let globalPinned = settingsManager.getGlobalPinnedAgents();
         const client = await getClient();
 
+        // For self-hosted servers, pre-fetch available models
+        // This is needed so ProfileSelectionInline can show model picker
+        // if the default model isn't available
+        const baseURL =
+          process.env.LETTA_BASE_URL ||
+          settings.env?.LETTA_BASE_URL ||
+          LETTA_CLOUD_API_URL;
+        const isSelfHosted = !baseURL.includes("api.letta.com");
+
+        if (isSelfHosted) {
+          setSelfHostedBaseUrl(baseURL);
+          try {
+            const { getDefaultModel } = await import("./agent/model");
+            const defaultModel = getDefaultModel();
+            setSelfHostedDefaultModel(defaultModel);
+            const modelsList = await client.models.list();
+            const handles = modelsList
+              .map((m) => m.handle)
+              .filter((h): h is string => typeof h === "string");
+
+            // Only set if default model isn't available
+            if (!handles.includes(defaultModel)) {
+              setAvailableServerModels(handles);
+            }
+          } catch {
+            // Ignore errors - will fail naturally during agent creation if needed
+          }
+        }
+
         // =====================================================================
         // TOP-LEVEL PATH: --conversation <id>
         // Conversation ID is unique, so we can derive the agent from it
@@ -1153,12 +1212,12 @@ async function main(): Promise<void> {
               return;
             } catch {
               // Local agent doesn't exist, try global
-              console.log(
+              setFailedAgentMessage(
                 `Unable to locate agent ${localAgentId} in .letta/, checking global (~/.letta)`,
               );
             }
           } else {
-            console.log("No recent agent in .letta/, using global (~/.letta)");
+            // No recent agent locally, silently fall through to global
           }
 
           // Try global LRU
@@ -1204,7 +1263,7 @@ async function main(): Promise<void> {
               return;
             } catch {
               // Local agent doesn't exist, try global
-              console.log(
+              setFailedAgentMessage(
                 `Unable to locate agent ${localAgentId} in .letta/, checking global (~/.letta)`,
               );
             }
@@ -1283,7 +1342,7 @@ async function main(): Promise<void> {
             return;
           } catch {
             // LRU agent doesn't exist, show message and fall through to selector
-            console.log(
+            setFailedAgentMessage(
               `Unable to locate recently used agent ${localSettings.lastAgent}`,
             );
           }
@@ -1460,10 +1519,47 @@ async function main(): Promise<void> {
 
         // Priority 3: Check if --new flag was passed or user requested new from selector
         if (!agent && shouldCreateNew) {
-          const updateArgs = getModelUpdateArgs(model);
+          // For self-hosted: if default model unavailable and no model selected yet, show picker
+          if (availableServerModels.length > 0 && !selectedServerModel) {
+            setLoadingState("selecting_global");
+            return;
+          }
+
+          // Determine effective model:
+          // 1. Use selectedServerModel if user picked from self-hosted picker
+          // 2. Use model if --model flag was passed
+          // 3. Otherwise, use billing-tier-aware default (free tier gets glm-4.7)
+          let effectiveModel = selectedServerModel || model;
+          if (!effectiveModel && !selfHostedBaseUrl) {
+            // On Letta API without explicit model - check billing tier for appropriate default
+            const { getDefaultModelForTier } = await import("./agent/model");
+            let billingTier: string | null = null;
+            try {
+              const baseURL =
+                process.env.LETTA_BASE_URL ||
+                settings.env?.LETTA_BASE_URL ||
+                LETTA_CLOUD_API_URL;
+              const apiKey =
+                process.env.LETTA_API_KEY || settings.env?.LETTA_API_KEY;
+              const response = await fetch(`${baseURL}/v1/metadata/balance`, {
+                headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+              });
+              if (response.ok) {
+                const data = (await response.json()) as {
+                  billing_tier?: string;
+                };
+                billingTier = data.billing_tier ?? null;
+              }
+            } catch {
+              // Ignore - will use standard default
+            }
+            effectiveModel = getDefaultModelForTier(billingTier);
+          }
+
+          const updateArgs = getModelUpdateArgs(effectiveModel);
           const result = await createAgent(
             undefined,
-            model,
+            effectiveModel,
             undefined,
             updateArgs,
             skillsDirectory,
@@ -1608,26 +1704,22 @@ async function main(): Promise<void> {
         // If resuming and a model or system prompt was specified, apply those changes
         if (resuming && (model || systemPromptPreset)) {
           if (model) {
-            const { resolveModelAsync } = await import("./agent/model");
+            const { resolveModelAsync, getModelUpdateArgs } = await import(
+              "./agent/model"
+            );
             const modelHandle = await resolveModelAsync(model);
             if (!modelHandle) {
               console.error(`Error: Invalid model "${model}"`);
               process.exit(1);
             }
 
-            // Optimization: Skip update if agent is already using the specified model
-            const currentModel = agent.llm_config?.model;
-            const currentEndpointType = agent.llm_config?.model_endpoint_type;
-            const currentHandle = `${currentEndpointType}/${currentModel}`;
-
-            if (currentHandle !== modelHandle) {
-              const { updateAgentLLMConfig } = await import("./agent/modify");
-              const { getModelUpdateArgs } = await import("./agent/model");
-              const updateArgs = getModelUpdateArgs(model);
-              await updateAgentLLMConfig(agent.id, modelHandle, updateArgs);
-              // Refresh agent state after model update
-              agent = await client.agents.retrieve(agent.id);
-            }
+            // Always apply model update - different model IDs can share the same
+            // handle but have different settings (e.g., gpt-5.2-medium vs gpt-5.2-xhigh)
+            const { updateAgentLLMConfig } = await import("./agent/modify");
+            const updateArgs = getModelUpdateArgs(model);
+            await updateAgentLLMConfig(agent.id, modelHandle, updateArgs);
+            // Refresh agent state after model update
+            agent = await client.agents.retrieve(agent.id);
           }
 
           if (systemPromptPreset) {
@@ -1843,9 +1935,17 @@ async function main(): Promise<void> {
       return null;
     }
 
-    // Don't render anything during initial "selecting" phase - wait for checkAndStart
+    // During initial "selecting" phase, render ProfileSelectionInline with loading state
+    // to prevent component tree switch whitespace artifacts
     if (loadingState === "selecting") {
-      return null;
+      return React.createElement(ProfileSelectionInline, {
+        lruAgentId: null,
+        loading: true, // Show loading state while checking
+        freshRepoMode: true,
+        onSelect: () => {},
+        onCreateNew: () => {},
+        onExit: () => process.exit(0),
+      });
     }
 
     // Show conversation selector for --resume flag
@@ -1874,12 +1974,23 @@ async function main(): Promise<void> {
         lruAgentId: null, // No LRU in fresh repo
         loading: false,
         freshRepoMode: true, // Hides "(global)" labels and simplifies context message
+        failedAgentMessage: failedAgentMessage ?? undefined,
+        // For self-hosted: pass available models so user can pick one when creating new agent
+        serverModelsForNewAgent:
+          availableServerModels.length > 0 ? availableServerModels : undefined,
+        defaultModelHandle: selfHostedDefaultModel ?? undefined,
+        serverBaseUrl: selfHostedBaseUrl ?? undefined,
         onSelect: (agentId: string) => {
           setSelectedGlobalAgentId(agentId);
           setLoadingState("assembling");
         },
         onCreateNew: () => {
           setUserRequestedNewAgent(true);
+          setLoadingState("assembling");
+        },
+        onCreateNewWithModel: (modelHandle: string) => {
+          setUserRequestedNewAgent(true);
+          setSelectedServerModel(modelHandle);
           setLoadingState("assembling");
         },
         onExit: () => {

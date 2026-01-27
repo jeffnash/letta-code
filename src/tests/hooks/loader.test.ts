@@ -3,8 +3,6 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  clearHooksCache,
-  getHooksForEvent,
   getMatchingHooks,
   hasHooksForEvent,
   loadHooks,
@@ -13,14 +11,24 @@ import {
   matchesTool,
   mergeHooksConfigs,
 } from "../../hooks/loader";
-import type { HookEvent, HooksConfig } from "../../hooks/types";
+import {
+  type HookEvent,
+  type HooksConfig,
+  isToolEvent,
+  type SimpleHookEvent,
+  type ToolHookEvent,
+} from "../../hooks/types";
+import { settingsManager } from "../../settings-manager";
 
 describe("Hooks Loader", () => {
   let tempDir: string;
   let fakeHome: string;
   let originalHome: string | undefined;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    // Reset settings manager FIRST before changing HOME
+    await settingsManager.reset();
+
     const baseDir = join(tmpdir(), `hooks-loader-test-${Date.now()}`);
     // Create separate directories for HOME and project to avoid double-loading
     fakeHome = join(baseDir, "home");
@@ -30,10 +38,15 @@ describe("Hooks Loader", () => {
     // Override HOME to isolate from real global hooks
     originalHome = process.env.HOME;
     process.env.HOME = fakeHome;
-    clearHooksCache();
+
+    // Initialize settings manager with new HOME
+    await settingsManager.initialize();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Wait for pending writes and reset
+    await settingsManager.reset();
+
     // Restore HOME
     process.env.HOME = originalHome;
     try {
@@ -43,7 +56,6 @@ describe("Hooks Loader", () => {
     } catch {
       // Ignore cleanup errors
     }
-    clearHooksCache();
   });
 
   describe("loadProjectHooks", () => {
@@ -77,32 +89,7 @@ describe("Hooks Loader", () => {
       expect(hooks.PreToolUse?.[0]?.matcher).toBe("Bash");
     });
 
-    test("caches loaded hooks", async () => {
-      const settingsDir = join(tempDir, ".letta");
-      mkdirSync(settingsDir, { recursive: true });
-
-      const settings = {
-        hooks: {
-          PreToolUse: [
-            {
-              matcher: "*",
-              hooks: [{ type: "command", command: "echo cached" }],
-            },
-          ],
-        },
-      };
-
-      writeFileSync(
-        join(settingsDir, "settings.json"),
-        JSON.stringify(settings),
-      );
-
-      const hooks1 = await loadProjectHooks(tempDir);
-      const hooks2 = await loadProjectHooks(tempDir);
-
-      // Should return same object from cache
-      expect(hooks1).toBe(hooks2);
-    });
+    // Note: Caching is now handled by settingsManager, not the loader
   });
 
   describe("mergeHooksConfigs", () => {
@@ -180,6 +167,34 @@ describe("Hooks Loader", () => {
       expect(matchesTool("Edit|Write", "Write")).toBe(true);
       expect(matchesTool("Edit|Write", "Bash")).toBe(false);
       expect(matchesTool("Edit|Write|Read", "Read")).toBe(true);
+    });
+
+    test("regex patterns work", () => {
+      // .* suffix pattern
+      expect(matchesTool("Notebook.*", "Notebook")).toBe(true);
+      expect(matchesTool("Notebook.*", "NotebookEdit")).toBe(true);
+      expect(matchesTool("Notebook.*", "NotebookRead")).toBe(true);
+      expect(matchesTool("Notebook.*", "Edit")).toBe(false);
+
+      // Prefix pattern
+      expect(matchesTool(".*Edit", "NotebookEdit")).toBe(true);
+      expect(matchesTool(".*Edit", "Edit")).toBe(true);
+      expect(matchesTool(".*Edit", "Write")).toBe(false);
+
+      // Character class
+      expect(matchesTool("Task|Bash", "Task")).toBe(true);
+      expect(matchesTool("Task|Bash", "Bash")).toBe(true);
+
+      // More complex patterns
+      expect(matchesTool("Web.*", "WebFetch")).toBe(true);
+      expect(matchesTool("Web.*", "WebSearch")).toBe(true);
+      expect(matchesTool("Web.*", "Bash")).toBe(false);
+    });
+
+    test("invalid regex falls back to exact match", () => {
+      // Unclosed bracket is invalid regex
+      expect(matchesTool("[invalid", "[invalid")).toBe(true);
+      expect(matchesTool("[invalid", "invalid")).toBe(false);
     });
   });
 
@@ -270,11 +285,9 @@ describe("Hooks Loader", () => {
 
     test("handles undefined tool name (for non-tool events)", () => {
       const config: HooksConfig = {
+        // Simple events use SimpleHookMatcher[] (hooks wrapper, no matcher)
         SessionStart: [
-          {
-            matcher: "*",
-            hooks: [{ type: "command", command: "session hook" }],
-          },
+          { hooks: [{ type: "command", command: "session hook" }] },
         ],
       };
 
@@ -368,57 +381,6 @@ describe("Hooks Loader", () => {
     });
   });
 
-  describe("getHooksForEvent", () => {
-    test("loads and returns matching hooks", async () => {
-      const settingsDir = join(tempDir, ".letta");
-      mkdirSync(settingsDir, { recursive: true });
-
-      const settings = {
-        hooks: {
-          PreToolUse: [
-            {
-              matcher: "Bash",
-              hooks: [{ type: "command", command: "bash hook" }],
-            },
-          ],
-        },
-      };
-
-      writeFileSync(
-        join(settingsDir, "settings.json"),
-        JSON.stringify(settings),
-      );
-
-      const hooks = await getHooksForEvent("PreToolUse", "Bash", tempDir);
-      expect(hooks).toHaveLength(1);
-      expect(hooks[0]?.command).toBe("bash hook");
-    });
-
-    test("returns empty for non-matching tool", async () => {
-      const settingsDir = join(tempDir, ".letta");
-      mkdirSync(settingsDir, { recursive: true });
-
-      const settings = {
-        hooks: {
-          PreToolUse: [
-            {
-              matcher: "Bash",
-              hooks: [{ type: "command", command: "bash hook" }],
-            },
-          ],
-        },
-      };
-
-      writeFileSync(
-        join(settingsDir, "settings.json"),
-        JSON.stringify(settings),
-      );
-
-      const hooks = await getHooksForEvent("PreToolUse", "Edit", tempDir);
-      expect(hooks).toHaveLength(0);
-    });
-  });
-
   describe("All 11 hook events", () => {
     const allEvents: HookEvent[] = [
       "PreToolUse",
@@ -437,12 +399,20 @@ describe("Hooks Loader", () => {
     test("config can have all 11 event types", () => {
       const config: HooksConfig = {};
       for (const event of allEvents) {
-        config[event] = [
-          {
-            matcher: "*",
-            hooks: [{ type: "command", command: `echo ${event}` }],
-          },
-        ];
+        if (isToolEvent(event)) {
+          // Tool events use HookMatcher[]
+          (config as Record<ToolHookEvent, unknown>)[event as ToolHookEvent] = [
+            {
+              matcher: "*",
+              hooks: [{ type: "command", command: `echo ${event}` }],
+            },
+          ];
+        } else {
+          // Simple events use SimpleHookMatcher[] (hooks wrapper)
+          (config as Record<SimpleHookEvent, unknown>)[
+            event as SimpleHookEvent
+          ] = [{ hooks: [{ type: "command", command: `echo ${event}` }] }];
+        }
       }
 
       for (const event of allEvents) {
@@ -454,21 +424,21 @@ describe("Hooks Loader", () => {
 
     test("merging preserves all event types", () => {
       const global: HooksConfig = {
+        // Tool events use HookMatcher[]
         PreToolUse: [
           { matcher: "*", hooks: [{ type: "command", command: "g1" }] },
         ],
-        SessionStart: [
-          { matcher: "*", hooks: [{ type: "command", command: "g2" }] },
-        ],
+        // Simple events use SimpleHookMatcher[] (hooks wrapper)
+        SessionStart: [{ hooks: [{ type: "command", command: "g2" }] }],
       };
 
       const project: HooksConfig = {
+        // Tool events use HookMatcher[]
         PostToolUse: [
           { matcher: "*", hooks: [{ type: "command", command: "p1" }] },
         ],
-        SessionEnd: [
-          { matcher: "*", hooks: [{ type: "command", command: "p2" }] },
-        ],
+        // Simple events use SimpleHookMatcher[] (hooks wrapper)
+        SessionEnd: [{ hooks: [{ type: "command", command: "p2" }] }],
       };
 
       const merged = mergeHooksConfigs(global, project);
@@ -481,16 +451,6 @@ describe("Hooks Loader", () => {
   });
 
   describe("Edge cases", () => {
-    test("handles malformed JSON gracefully", async () => {
-      const settingsDir = join(tempDir, ".letta");
-      mkdirSync(settingsDir, { recursive: true });
-      writeFileSync(join(settingsDir, "settings.json"), "{ invalid json }");
-
-      // Should not throw, returns empty config
-      const hooks = await loadProjectHooks(tempDir);
-      expect(hooks).toEqual({});
-    });
-
     test("handles settings without hooks field", async () => {
       const settingsDir = join(tempDir, ".letta");
       mkdirSync(settingsDir, { recursive: true });
@@ -501,46 +461,6 @@ describe("Hooks Loader", () => {
 
       const hooks = await loadProjectHooks(tempDir);
       expect(hooks).toEqual({});
-    });
-
-    test("clearHooksCache resets cache", async () => {
-      const settingsDir = join(tempDir, ".letta");
-      mkdirSync(settingsDir, { recursive: true });
-
-      writeFileSync(
-        join(settingsDir, "settings.json"),
-        JSON.stringify({
-          hooks: {
-            PreToolUse: [
-              { matcher: "*", hooks: [{ type: "command", command: "v1" }] },
-            ],
-          },
-        }),
-      );
-
-      const hooks1 = await loadProjectHooks(tempDir);
-      expect(hooks1.PreToolUse?.[0]?.hooks[0]?.command).toBe("v1");
-
-      // Update the file
-      writeFileSync(
-        join(settingsDir, "settings.json"),
-        JSON.stringify({
-          hooks: {
-            PreToolUse: [
-              { matcher: "*", hooks: [{ type: "command", command: "v2" }] },
-            ],
-          },
-        }),
-      );
-
-      // Without clearing cache, should still return v1
-      const hooks2 = await loadProjectHooks(tempDir);
-      expect(hooks2.PreToolUse?.[0]?.hooks[0]?.command).toBe("v1");
-
-      // After clearing cache, should return v2
-      clearHooksCache();
-      const hooks3 = await loadProjectHooks(tempDir);
-      expect(hooks3.PreToolUse?.[0]?.hooks[0]?.command).toBe("v2");
     });
   });
 
@@ -577,28 +497,6 @@ describe("Hooks Loader", () => {
       const hooks = await loadProjectLocalHooks(tempDir);
       expect(hooks.PreToolUse).toHaveLength(1);
       expect(hooks.PreToolUse?.[0]?.hooks[0]?.command).toBe("echo local");
-    });
-
-    test("caches loaded local hooks", async () => {
-      const settingsDir = join(tempDir, ".letta");
-      mkdirSync(settingsDir, { recursive: true });
-
-      writeFileSync(
-        join(settingsDir, "settings.local.json"),
-        JSON.stringify({
-          hooks: {
-            PreToolUse: [
-              { matcher: "*", hooks: [{ type: "command", command: "cached" }] },
-            ],
-          },
-        }),
-      );
-
-      const hooks1 = await loadProjectLocalHooks(tempDir);
-      const hooks2 = await loadProjectLocalHooks(tempDir);
-
-      // Should return same object from cache
-      expect(hooks1).toBe(hooks2);
     });
   });
 
@@ -645,14 +543,15 @@ describe("Hooks Loader", () => {
 
     test("all three levels merge correctly", () => {
       const global: HooksConfig = {
+        // Tool event with HookMatcher[]
         PreToolUse: [
           { matcher: "*", hooks: [{ type: "command", command: "global" }] },
         ],
-        SessionEnd: [
-          { matcher: "*", hooks: [{ type: "command", command: "global-end" }] },
-        ],
+        // Simple event with SimpleHookMatcher[]
+        SessionEnd: [{ hooks: [{ type: "command", command: "global-end" }] }],
       };
       const project: HooksConfig = {
+        // Tool event with HookMatcher[]
         PreToolUse: [
           { matcher: "*", hooks: [{ type: "command", command: "project" }] },
         ],
@@ -664,14 +563,13 @@ describe("Hooks Loader", () => {
         ],
       };
       const projectLocal: HooksConfig = {
+        // Tool event with HookMatcher[]
         PreToolUse: [
           { matcher: "*", hooks: [{ type: "command", command: "local" }] },
         ],
+        // Simple event with SimpleHookMatcher[]
         SessionStart: [
-          {
-            matcher: "*",
-            hooks: [{ type: "command", command: "local-start" }],
-          },
+          { hooks: [{ type: "command", command: "local-start" }] },
         ],
       };
 

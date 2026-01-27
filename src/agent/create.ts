@@ -190,7 +190,6 @@ export async function createAgent(
   const defaultBaseTools = options.baseTools ?? [
     baseMemoryTool,
     "web_search",
-    "conversation_search",
     "fetch_webpage",
   ];
 
@@ -335,9 +334,11 @@ export async function createAgent(
     blockProvenance.push({ label: blockId, source: "shared" });
   }
 
-  // Get the model's context window from its configuration
+  // Get the model's context window from its configuration (if known)
+  // For unknown models (e.g., from self-hosted servers), don't set a context window
+  // and let the server use its default
   const modelUpdateArgs = getModelUpdateArgs(modelHandle);
-  const contextWindow = (modelUpdateArgs?.context_window as number) || 200_000;
+  const contextWindow = modelUpdateArgs?.context_window as number | undefined;
 
   // Resolve system prompt content:
   // 1. If systemPromptCustom is provided, use it as-is
@@ -373,7 +374,7 @@ export async function createAgent(
     description: agentDescription,
     embedding: embeddingModelVal || undefined,
     model: modelHandle,
-    context_window_limit: contextWindow,
+    ...(contextWindow && { context_window_limit: contextWindow }),
     tools: toolNames,
     // New blocks created inline with agent (saves ~2s of sequential API calls)
     memory_blocks:

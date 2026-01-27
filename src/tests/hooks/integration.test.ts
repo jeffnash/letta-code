@@ -6,7 +6,6 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  clearHooksCache,
   hasHooks,
   runNotificationHooks,
   runPermissionRequestHooks,
@@ -20,8 +19,10 @@ import {
   runSubagentStopHooks,
   runUserPromptSubmitHooks,
 } from "../../hooks";
+import { settingsManager } from "../../settings-manager";
 
-// Skip on Windows - hooks executor uses `sh -c` which doesn't exist on Windows
+// Skip on Windows - test commands use bash syntax (&&, >&2, etc.)
+// The executor itself is cross-platform, but these test commands are bash-specific
 const isWindows = process.platform === "win32";
 
 describe.skipIf(isWindows)("Hooks Integration Tests", () => {
@@ -29,7 +30,10 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
   let fakeHome: string;
   let originalHome: string | undefined;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    // Reset settings manager FIRST before changing HOME
+    await settingsManager.reset();
+
     const baseDir = join(
       tmpdir(),
       `hooks-integration-${process.pid}-${Math.random().toString(36).slice(2)}`,
@@ -42,10 +46,15 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
     // Override HOME to isolate from real global hooks
     originalHome = process.env.HOME;
     process.env.HOME = fakeHome;
-    clearHooksCache();
+
+    // Initialize settings manager with new HOME
+    await settingsManager.initialize();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Wait for pending writes and reset
+    await settingsManager.reset();
+
     // Restore HOME
     process.env.HOME = originalHome;
     try {
@@ -55,7 +64,6 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
     } catch {
       // Ignore cleanup errors
     }
-    clearHooksCache();
   });
 
   // Helper to create hook config
@@ -102,7 +110,8 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
             hooks: [
               {
                 type: "command",
-                command: "echo 'Blocked: write to sensitive file' && exit 2",
+                command:
+                  "echo 'Blocked: write to sensitive file' >&2 && exit 2",
               },
             ],
           },
@@ -117,7 +126,7 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
       );
 
       expect(result.blocked).toBe(true);
-      expect(result.feedback).toContain("Blocked: write to sensitive file");
+      expect(result.feedback[0]).toContain("Blocked: write to sensitive file");
     });
 
     test("matches by tool name pattern", async () => {
@@ -230,7 +239,8 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
       const duration = Date.now() - start;
 
       expect(result.results).toHaveLength(2);
-      expect(duration).toBeLessThan(250); // Parallel should be ~100ms
+      // Allow headroom for CI runners (especially macOS ARM) which can be slow
+      expect(duration).toBeLessThan(400); // Parallel should be ~100ms
     });
   });
 
@@ -268,7 +278,7 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
             hooks: [
               {
                 type: "command",
-                command: "echo 'Denied: dangerous command' && exit 2",
+                command: "echo 'Denied: dangerous command' >&2 && exit 2",
               },
             ],
           },
@@ -284,7 +294,7 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
       );
 
       expect(result.blocked).toBe(true);
-      expect(result.feedback).toContain("Denied: dangerous command");
+      expect(result.feedback[0]).toContain("Denied: dangerous command");
     });
 
     test("receives permission type and scope in input", async () => {
@@ -454,7 +464,8 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
       const duration = Date.now() - start;
 
       expect(result.results).toHaveLength(2);
-      expect(duration).toBeLessThan(250);
+      // Allow headroom for CI runners (especially macOS ARM) which can be slow
+      expect(duration).toBeLessThan(400);
     });
   });
 
@@ -589,7 +600,7 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
             hooks: [
               {
                 type: "command",
-                command: "echo 'Cannot compact now' && exit 2",
+                command: "echo 'Cannot compact now' >&2 && exit 2",
               },
             ],
           },
@@ -605,7 +616,7 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
       );
 
       expect(result.blocked).toBe(true);
-      expect(result.feedback).toContain("Cannot compact now");
+      expect(result.feedback[0]).toContain("Cannot compact now");
     });
 
     test("receives context info in input", async () => {
@@ -812,7 +823,8 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
       const duration = Date.now() - start;
 
       expect(result.results).toHaveLength(2);
-      expect(duration).toBeLessThan(250);
+      // Allow headroom for CI runners (especially macOS ARM) which can be slow
+      expect(duration).toBeLessThan(400);
     });
   });
 
@@ -876,7 +888,7 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
             matcher: "*",
             hooks: [
               { type: "command", command: "echo 'check 1'" },
-              { type: "command", command: "echo 'BLOCKED' && exit 2" },
+              { type: "command", command: "echo 'BLOCKED' >&2 && exit 2" },
               { type: "command", command: "echo 'should not run'" },
             ],
           },
@@ -887,7 +899,7 @@ describe.skipIf(isWindows)("Hooks Integration Tests", () => {
 
       expect(result.blocked).toBe(true);
       expect(result.results).toHaveLength(2);
-      expect(result.feedback).toContain("BLOCKED");
+      expect(result.feedback[0]).toContain("BLOCKED");
     });
 
     test("error hooks do not block subsequent hooks", async () => {

@@ -1,122 +1,86 @@
 // src/hooks/loader.ts
-// Loads and matches hooks from settings
+// Loads and matches hooks from settings-manager
 
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { exists, readFile } from "../utils/fs.js";
-import type { HookCommand, HookEvent, HooksConfig } from "./types";
+import { settingsManager } from "../settings-manager";
+import {
+  type HookCommand,
+  type HookEvent,
+  type HookMatcher,
+  type HooksConfig,
+  isToolEvent,
+  type SimpleHookEvent,
+  type SimpleHookMatcher,
+  type ToolHookEvent,
+} from "./types";
 
 /**
- * Cache for loaded hooks configurations
- */
-let globalHooksCache: HooksConfig | null = null;
-const projectHooksCache: Map<string, HooksConfig> = new Map();
-const projectLocalHooksCache: Map<string, HooksConfig> = new Map();
-
-/**
- * Clear hooks cache (useful for testing or when settings change)
+ * Clear hooks cache - kept for API compatibility with existing callers.
  */
 export function clearHooksCache(): void {
-  globalHooksCache = null;
-  projectHooksCache.clear();
-  projectLocalHooksCache.clear();
-}
-
-/**
- * Get the path to global hooks settings
- */
-function getGlobalSettingsPath(): string {
-  const home = process.env.HOME || homedir();
-  return join(home, ".letta", "settings.json");
-}
-
-/**
- * Get the path to project hooks settings
- */
-function getProjectSettingsPath(workingDirectory: string): string {
-  return join(workingDirectory, ".letta", "settings.json");
-}
-
-/**
- * Get the path to project-local hooks settings (gitignored)
- */
-function getProjectLocalSettingsPath(workingDirectory: string): string {
-  return join(workingDirectory, ".letta", "settings.local.json");
-}
-
-/**
- * Load hooks configuration from a settings file
- */
-async function loadHooksFromFile(path: string): Promise<HooksConfig | null> {
-  if (!exists(path)) {
-    return null;
-  }
-
-  try {
-    const content = await readFile(path);
-    const settings = JSON.parse(content) as { hooks?: HooksConfig };
-    return settings.hooks || null;
-  } catch (error) {
-    // Silently ignore parse errors - don't break the app for bad hooks config
-    console.warn(`Failed to load hooks from ${path}:`, error);
-    return null;
-  }
+  // Settings-manager handles caching
 }
 
 /**
  * Load global hooks configuration from ~/.letta/settings.json
+ * Uses settings-manager cache (loaded at app startup)
  */
-export async function loadGlobalHooks(): Promise<HooksConfig> {
-  if (globalHooksCache !== null) {
-    return globalHooksCache;
+export function loadGlobalHooks(): HooksConfig {
+  try {
+    return settingsManager.getSettings().hooks || {};
+  } catch {
+    // Settings not initialized yet
+    return {};
   }
-
-  const path = getGlobalSettingsPath();
-  const hooks = await loadHooksFromFile(path);
-  globalHooksCache = hooks || {};
-  return globalHooksCache;
 }
 
 /**
  * Load project hooks configuration from .letta/settings.json
+ * Uses settings-manager cache
  */
 export async function loadProjectHooks(
   workingDirectory: string = process.cwd(),
 ): Promise<HooksConfig> {
-  const cached = projectHooksCache.get(workingDirectory);
-  if (cached !== undefined) {
-    return cached;
+  try {
+    // Ensure project settings are loaded
+    try {
+      settingsManager.getProjectSettings(workingDirectory);
+    } catch {
+      await settingsManager.loadProjectSettings(workingDirectory);
+    }
+    return settingsManager.getProjectSettings(workingDirectory)?.hooks || {};
+  } catch {
+    // Settings not available
+    return {};
   }
-
-  const path = getProjectSettingsPath(workingDirectory);
-  const hooks = await loadHooksFromFile(path);
-  const result = hooks || {};
-  projectHooksCache.set(workingDirectory, result);
-  return result;
 }
 
 /**
  * Load project-local hooks configuration from .letta/settings.local.json
+ * Uses settings-manager cache
  */
 export async function loadProjectLocalHooks(
   workingDirectory: string = process.cwd(),
 ): Promise<HooksConfig> {
-  const cached = projectLocalHooksCache.get(workingDirectory);
-  if (cached !== undefined) {
-    return cached;
+  try {
+    // Ensure local project settings are loaded
+    try {
+      settingsManager.getLocalProjectSettings(workingDirectory);
+    } catch {
+      await settingsManager.loadLocalProjectSettings(workingDirectory);
+    }
+    return (
+      settingsManager.getLocalProjectSettings(workingDirectory)?.hooks || {}
+    );
+  } catch {
+    // Settings not available
+    return {};
   }
-
-  const path = getProjectLocalSettingsPath(workingDirectory);
-  const hooks = await loadHooksFromFile(path);
-  const result = hooks || {};
-  projectLocalHooksCache.set(workingDirectory, result);
-  return result;
 }
 
 /**
  * Merge hooks configurations
  * Priority order: project-local > project > global
- * For each event, matchers are ordered by priority (local first, global last)
+ * For each event, hooks are ordered by priority (local first, global last)
  */
 export function mergeHooksConfigs(
   global: HooksConfig,
@@ -131,15 +95,34 @@ export function mergeHooksConfigs(
   ]) as Set<HookEvent>;
 
   for (const event of allEvents) {
-    const globalMatchers = global[event] || [];
-    const projectMatchers = project[event] || [];
-    const projectLocalMatchers = projectLocal[event] || [];
-    // Project-local matchers run first, then project, then global
-    merged[event] = [
-      ...projectLocalMatchers,
-      ...projectMatchers,
-      ...globalMatchers,
-    ];
+    if (isToolEvent(event)) {
+      // Tool events use HookMatcher[]
+      const toolEvent = event as ToolHookEvent;
+      const globalMatchers = (global[toolEvent] || []) as HookMatcher[];
+      const projectMatchers = (project[toolEvent] || []) as HookMatcher[];
+      const projectLocalMatchers = (projectLocal[toolEvent] ||
+        []) as HookMatcher[];
+      // Project-local runs first, then project, then global
+      (merged as Record<ToolHookEvent, HookMatcher[]>)[toolEvent] = [
+        ...projectLocalMatchers,
+        ...projectMatchers,
+        ...globalMatchers,
+      ];
+    } else {
+      // Simple events use SimpleHookMatcher[] (same as HookMatcher but without matcher field)
+      const simpleEvent = event as SimpleHookEvent;
+      const globalMatchers = (global[simpleEvent] || []) as SimpleHookMatcher[];
+      const projectMatchers = (project[simpleEvent] ||
+        []) as SimpleHookMatcher[];
+      const projectLocalMatchers = (projectLocal[simpleEvent] ||
+        []) as SimpleHookMatcher[];
+      // Project-local runs first, then project, then global
+      (merged as Record<SimpleHookEvent, SimpleHookMatcher[]>)[simpleEvent] = [
+        ...projectLocalMatchers,
+        ...projectMatchers,
+        ...globalMatchers,
+      ];
+    }
   }
 
   return merged;
@@ -152,7 +135,7 @@ export async function loadHooks(
   workingDirectory: string = process.cwd(),
 ): Promise<HooksConfig> {
   const [global, project, projectLocal] = await Promise.all([
-    loadGlobalHooks(),
+    Promise.resolve(loadGlobalHooks()),
     loadProjectHooks(workingDirectory),
     loadProjectLocalHooks(workingDirectory),
   ]);
@@ -164,8 +147,10 @@ export async function loadHooks(
  * Check if a tool name matches a matcher pattern
  * Patterns:
  * - "*" or "": matches all tools
- * - "ToolName": exact match
- * - "Tool1|Tool2|Tool3": matches any of the listed tools
+ * - "ToolName": exact match (simple alphanumeric strings)
+ * - "Edit|Write": regex alternation, matches Edit or Write
+ * - "Notebook.*": regex pattern, matches Notebook, NotebookEdit, etc.
+ * - Any valid regex pattern is supported (case-sensitive)
  */
 export function matchesTool(pattern: string, toolName: string): boolean {
   // Empty or "*" matches everything
@@ -173,14 +158,14 @@ export function matchesTool(pattern: string, toolName: string): boolean {
     return true;
   }
 
-  // Check for pipe-separated list
-  if (pattern.includes("|")) {
-    const tools = pattern.split("|").map((t) => t.trim());
-    return tools.includes(toolName);
+  // Treat pattern as regex (anchored to match full tool name)
+  try {
+    const regex = new RegExp(`^(?:${pattern})$`);
+    return regex.test(toolName);
+  } catch {
+    // Invalid regex, fall back to exact match
+    return pattern === toolName;
   }
-
-  // Exact match
-  return pattern === toolName;
 }
 
 /**
@@ -191,22 +176,37 @@ export function getMatchingHooks(
   event: HookEvent,
   toolName?: string,
 ): HookCommand[] {
-  const matchers = config[event];
-  if (!matchers || matchers.length === 0) {
-    return [];
-  }
+  if (isToolEvent(event)) {
+    // Tool events use HookMatcher[] - need to match against tool name
+    const matchers = config[event as ToolHookEvent] as
+      | HookMatcher[]
+      | undefined;
+    if (!matchers || matchers.length === 0) {
+      return [];
+    }
 
-  const hooks: HookCommand[] = [];
+    const hooks: HookCommand[] = [];
+    for (const matcher of matchers) {
+      if (!toolName || matchesTool(matcher.matcher, toolName)) {
+        hooks.push(...matcher.hooks);
+      }
+    }
+    return hooks;
+  } else {
+    // Simple events use SimpleHookMatcher[] - extract hooks from each matcher
+    const matchers = config[event as SimpleHookEvent] as
+      | SimpleHookMatcher[]
+      | undefined;
+    if (!matchers || matchers.length === 0) {
+      return [];
+    }
 
-  for (const matcher of matchers) {
-    // For non-tool events, matcher is usually empty/"*"
-    // For tool events, check if the tool matches
-    if (!toolName || matchesTool(matcher.matcher, toolName)) {
+    const hooks: HookCommand[] = [];
+    for (const matcher of matchers) {
       hooks.push(...matcher.hooks);
     }
+    return hooks;
   }
-
-  return hooks;
 }
 
 /**
@@ -216,13 +216,27 @@ export function hasHooksForEvent(
   config: HooksConfig,
   event: HookEvent,
 ): boolean {
-  const matchers = config[event];
-  if (!matchers || matchers.length === 0) {
-    return false;
+  if (isToolEvent(event)) {
+    // Tool events use HookMatcher[]
+    const matchers = config[event as ToolHookEvent] as
+      | HookMatcher[]
+      | undefined;
+    if (!matchers || matchers.length === 0) {
+      return false;
+    }
+    // Check if any matcher has hooks
+    return matchers.some((m) => m.hooks && m.hooks.length > 0);
+  } else {
+    // Simple events use SimpleHookMatcher[]
+    const matchers = config[event as SimpleHookEvent] as
+      | SimpleHookMatcher[]
+      | undefined;
+    if (!matchers || matchers.length === 0) {
+      return false;
+    }
+    // Check if any matcher has hooks
+    return matchers.some((m) => m.hooks && m.hooks.length > 0);
   }
-
-  // Check if any matcher has hooks
-  return matchers.some((m) => m.hooks && m.hooks.length > 0);
 }
 
 /**

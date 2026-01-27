@@ -26,6 +26,12 @@ interface AgentSelectorProps {
   command?: string;
 }
 
+type TabId = "pinned" | "letta-code" | "all";
+
+type ViewState =
+  | { type: "list" }
+  | { type: "deleteConfirm"; agent: AgentState; agentId: string };
+
 interface PinnedAgentData {
   agentId: string;
   agent: AgentState | null;
@@ -121,9 +127,10 @@ export function getFooterHints(
     return "Enter search · ↑↓ navigate · Esc cancel";
   }
   const searchHint = activeTab === "pinned" ? " · P unpin" : " · / search";
+  const deleteHint = " · D delete";
   const newHint = hasCreateNewAgent ? " · N new" : "";
   const escHint = activeQuery && activeTab !== "pinned" ? "clear" : "cancel";
-  return `Enter select · ↑↓ navigate · ←→ page · Tab switch${searchHint}${newHint} · Esc ${escHint}`;
+  return `Enter select · ↑↓ navigate · ←→ page · Tab switch${searchHint}${deleteHint}${newHint} · Esc ${escHint}`;
 }
 
 export function AgentSelector({
@@ -173,6 +180,11 @@ export function AgentSelector({
   const [isSearchMode, setIsSearchMode] = useState(false);
   const [searchInput, setSearchInput] = useState("");
   const [activeQuery, setActiveQuery] = useState("");
+
+  // Delete confirmation state
+  const [viewState, setViewState] = useState<ViewState>({ type: "list" });
+  const [deleteConfirmInput, setDeleteConfirmInput] = useState("");
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   // Load pinned agents
   const loadPinnedAgents = useCallback(async () => {
@@ -372,10 +384,13 @@ export function AgentSelector({
     }
   }, [allLoadingMore, allHasMore, allCursor, fetchListAgents, activeQuery]);
 
-  // Pagination calculations - Pinned
-  const pinnedTotalPages = Math.ceil(pinnedAgents.length / DISPLAY_PAGE_SIZE);
+  // Pagination calculations - Pinned (filter out 404 agents)
+  const validPinnedAgents = pinnedAgents.filter((p) => p.agent !== null);
+  const pinnedTotalPages = Math.ceil(
+    validPinnedAgents.length / DISPLAY_PAGE_SIZE,
+  );
   const pinnedStartIndex = pinnedPage * DISPLAY_PAGE_SIZE;
-  const pinnedPageAgents = pinnedAgents.slice(
+  const pinnedPageAgents = validPinnedAgents.slice(
     pinnedStartIndex,
     pinnedStartIndex + DISPLAY_PAGE_SIZE,
   );
@@ -447,12 +462,64 @@ export function AgentSelector({
     }
   }, [activeQuery]);
 
+  // Handle agent deletion
+  const handleDeleteAgent = useCallback(async () => {
+    if (viewState.type !== "deleteConfirm") return;
+    const { agent, agentId } = viewState;
+    const expectedName = agent.name || agentId.slice(0, 12);
+
+    if (deleteConfirmInput !== expectedName) return;
+
+    setDeleteLoading(true);
+    try {
+      const client = clientRef.current || (await getClient());
+      clientRef.current = client;
+      await client.agents.delete(agentId);
+
+      // Reset state and refresh tabs
+      setViewState({ type: "list" });
+      setDeleteConfirmInput("");
+      // Reload pinned and invalidate cached tabs
+      loadPinnedAgents();
+      setLettaCodeLoaded(false);
+      setAllLoaded(false);
+    } catch {
+      // Stay on confirmation screen on error
+    } finally {
+      setDeleteLoading(false);
+    }
+  }, [viewState, deleteConfirmInput, loadPinnedAgents]);
+
   useInput((input, key) => {
     // CTRL-C: immediately cancel
     if (key.ctrl && input === "c") {
       onCancel();
       return;
     }
+
+    // Handle delete confirmation view
+    if (viewState.type === "deleteConfirm") {
+      // Always allow Esc to back out (even during deletion)
+      if (key.escape) {
+        setViewState({ type: "list" });
+        setDeleteConfirmInput("");
+        return;
+      }
+
+      // Disable all other input while deleting
+      if (deleteLoading) return;
+
+      if (key.return) {
+        handleDeleteAgent();
+      } else if (key.backspace || key.delete) {
+        setDeleteConfirmInput((prev) => prev.slice(0, -1));
+      } else if (input && !key.ctrl && !key.meta) {
+        setDeleteConfirmInput((prev) => prev + input);
+      }
+      return;
+    }
+
+    // List view handlers below
 
     // Tab key cycles through tabs
     if (key.tab) {
@@ -470,8 +537,6 @@ export function AgentSelector({
 
     if (currentLoading) return;
 
-    // For pinned tab, use pinnedPageAgents.length to include "not found" entries
-    // For other tabs, use currentAgents.length
     const maxIndex =
       activeTab === "pinned"
         ? pinnedPageAgents.length - 1
@@ -574,14 +639,6 @@ export function AgentSelector({
           setAllSelectedIndex(0);
         }
       }
-      // NOTE: "D" for unpin all disabled - too destructive without confirmation
-      // } else if (activeTab === "pinned" && (input === "d" || input === "D")) {
-      //   const selected = pinnedPageAgents[pinnedSelectedIndex];
-      //   if (selected) {
-      //     settingsManager.unpinBoth(selected.agentId);
-      //     loadPinnedAgents();
-      //   }
-      // }
     } else if (activeTab === "pinned" && (input === "p" || input === "P")) {
       // Unpin from current scope (pinned tab only)
       const selected = pinnedPageAgents[pinnedSelectedIndex];
@@ -592,6 +649,33 @@ export function AgentSelector({
           settingsManager.unpinGlobal(selected.agentId);
         }
         loadPinnedAgents();
+      }
+    } else if (input === "d" || input === "D") {
+      // Delete agent - open confirmation
+      let selectedAgent: AgentState | null = null;
+      let selectedAgentId: string | null = null;
+
+      if (activeTab === "pinned") {
+        const selected = pinnedPageAgents[pinnedSelectedIndex];
+        if (selected?.agent) {
+          selectedAgent = selected.agent;
+          selectedAgentId = selected.agentId;
+        }
+      } else if (activeTab === "letta-code") {
+        selectedAgent = lettaCodePageAgents[lettaCodeSelectedIndex] ?? null;
+        selectedAgentId = selectedAgent?.id ?? null;
+      } else {
+        selectedAgent = allPageAgents[allSelectedIndex] ?? null;
+        selectedAgentId = selectedAgent?.id ?? null;
+      }
+
+      if (selectedAgent && selectedAgentId) {
+        setViewState({
+          type: "deleteConfirm",
+          agent: selectedAgent,
+          agentId: selectedAgentId,
+        });
+        setDeleteConfirmInput("");
       }
     } else {
       // Handle '/' to enter search, 'n'/'N' for new agent, and search input
@@ -735,8 +819,61 @@ export function AgentSelector({
     );
   };
 
+  // Render delete confirmation view
+  const renderDeleteConfirm = () => {
+    if (viewState.type !== "deleteConfirm") return null;
+    const { agent, agentId } = viewState;
+    const displayName = agent.name || agentId.slice(0, 12);
+    const inputMatches = deleteConfirmInput === displayName;
+
+    return (
+      <>
+        <Box flexDirection="column" marginBottom={1}>
+          <Text>
+            {"  "}Are you sure you want to delete{" "}
+            <Text bold>{displayName}</Text>?
+          </Text>
+          <Text color="red">{"  "}This action can not be undone.</Text>
+        </Box>
+
+        <Box flexDirection="row">
+          <Text color={colors.selector.itemHighlighted}>{"> "}</Text>
+          <Text dimColor={!deleteConfirmInput}>
+            {deleteConfirmInput || "(type the agent's name)"}
+          </Text>
+        </Box>
+
+        <Box marginTop={1}>
+          <Text dimColor>
+            {"  "}
+            {deleteLoading
+              ? "Deleting... · Esc cancel"
+              : inputMatches
+                ? "Enter to delete · Esc cancel"
+                : "Esc cancel"}
+          </Text>
+        </Box>
+      </>
+    );
+  };
+
   // Calculate horizontal line width
   const solidLine = SOLID_LINE.repeat(Math.max(terminalWidth, 10));
+
+  // If in delete confirmation view, render that instead of the list
+  if (viewState.type === "deleteConfirm") {
+    return (
+      <Box flexDirection="column">
+        {/* Command header */}
+        <Text dimColor>{`> ${command}`}</Text>
+        <Text dimColor>{solidLine}</Text>
+
+        <Box height={1} />
+
+        {renderDeleteConfirm()}
+      </Box>
+    );
+  }
 
   return (
     <Box flexDirection="column">
@@ -798,7 +935,7 @@ export function AgentSelector({
 
       {/* Empty state */}
       {!currentLoading &&
-        ((activeTab === "pinned" && pinnedAgents.length === 0) ||
+        ((activeTab === "pinned" && validPinnedAgents.length === 0) ||
           (activeTab === "letta-code" &&
             !lettaCodeError &&
             lettaCodeAgents.length === 0) ||
@@ -810,13 +947,15 @@ export function AgentSelector({
         )}
 
       {/* Pinned tab content */}
-      {activeTab === "pinned" && !pinnedLoading && pinnedAgents.length > 0 && (
-        <Box flexDirection="column">
-          {pinnedPageAgents.map((data, index) =>
-            renderPinnedItem(data, index, index === pinnedSelectedIndex),
-          )}
-        </Box>
-      )}
+      {activeTab === "pinned" &&
+        !pinnedLoading &&
+        validPinnedAgents.length > 0 && (
+          <Box flexDirection="column">
+            {pinnedPageAgents.map((data, index) =>
+              renderPinnedItem(data, index, index === pinnedSelectedIndex),
+            )}
+          </Box>
+        )}
 
       {/* Letta Code tab content */}
       {activeTab === "letta-code" &&
@@ -844,7 +983,7 @@ export function AgentSelector({
 
       {/* Footer */}
       {!currentLoading &&
-        ((activeTab === "pinned" && pinnedAgents.length > 0) ||
+        ((activeTab === "pinned" && validPinnedAgents.length > 0) ||
           (activeTab === "letta-code" &&
             !lettaCodeError &&
             lettaCodeAgents.length > 0) ||

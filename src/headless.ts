@@ -14,6 +14,7 @@ import {
   isApprovalPendingError,
   isApprovalStateDesyncError,
   isConversationBusyError,
+  isInvalidToolCallIdsError,
 } from "./agent/approval-recovery";
 import { getClient } from "./agent/client";
 import {
@@ -23,6 +24,12 @@ import {
 } from "./agent/context";
 import { createAgent } from "./agent/create";
 import { ensureSkillsBlocks, ISOLATED_BLOCK_LABELS } from "./agent/memory";
+import {
+  ensureMemoryFilesystemBlock,
+  formatMemorySyncSummary,
+  syncMemoryFilesystem,
+  updateMemoryFilesystemBlock,
+} from "./agent/memoryFilesystem";
 import { sendMessageStream } from "./agent/message";
 import { getModelUpdateArgs } from "./agent/model";
 import { SessionStats } from "./agent/stats";
@@ -540,18 +547,13 @@ export async function handleHeadlessCommand(
         process.exit(1);
       }
 
-      // Optimization: Skip update if agent is already using the specified model
-      const currentModel = agent.llm_config?.model;
-      const currentEndpointType = agent.llm_config?.model_endpoint_type;
-      const currentHandle = `${currentEndpointType}/${currentModel}`;
-
-      if (currentHandle !== modelHandle) {
-        const { updateAgentLLMConfig } = await import("./agent/modify");
-        const updateArgs = getModelUpdateArgs(model);
-        await updateAgentLLMConfig(agent.id, modelHandle, updateArgs);
-        // Refresh agent state after model update
-        agent = await client.agents.retrieve(agent.id);
-      }
+      // Always apply model update - different model IDs can share the same
+      // handle but have different settings (e.g., gpt-5.2-medium vs gpt-5.2-xhigh)
+      const { updateAgentLLMConfig } = await import("./agent/modify");
+      const updateArgs = getModelUpdateArgs(model);
+      await updateAgentLLMConfig(agent.id, modelHandle, updateArgs);
+      // Refresh agent state after model update
+      agent = await client.agents.retrieve(agent.id);
     }
 
     if (systemPromptPreset) {
@@ -588,6 +590,36 @@ export async function handleHeadlessCommand(
     const createdBlocks = await ensureSkillsBlocks(agent.id);
     if (createdBlocks.length > 0) {
       console.log("Created missing skills blocks for agent compatibility");
+    }
+  }
+
+  // Sync filesystem-backed memory before creating conversations (only if memfs is enabled)
+  if (settingsManager.isMemfsEnabled(agent.id)) {
+    try {
+      await ensureMemoryFilesystemBlock(agent.id);
+      const syncResult = await syncMemoryFilesystem(agent.id);
+      if (syncResult.conflicts.length > 0) {
+        console.error(
+          `Memory filesystem sync conflicts detected (${syncResult.conflicts.length}). Run in interactive mode to resolve.`,
+        );
+        process.exit(1);
+      }
+      await updateMemoryFilesystemBlock(agent.id);
+      if (
+        syncResult.updatedBlocks.length > 0 ||
+        syncResult.createdBlocks.length > 0 ||
+        syncResult.deletedBlocks.length > 0 ||
+        syncResult.updatedFiles.length > 0 ||
+        syncResult.createdFiles.length > 0 ||
+        syncResult.deletedFiles.length > 0
+      ) {
+        console.log(formatMemorySyncSummary(syncResult));
+      }
+    } catch (error) {
+      console.error(
+        `Memory filesystem sync failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exit(1);
     }
   }
 
@@ -753,8 +785,8 @@ export async function handleHeadlessCommand(
     return;
   }
 
-  // Create buffers to accumulate stream
-  const buffers = createBuffers();
+  // Create buffers to accumulate stream (pass agent.id for server-side tool hooks)
+  const buffers = createBuffers(agent.id);
 
   // Initialize session stats
   const sessionStats = new SessionStats();
@@ -924,7 +956,11 @@ export async function handleHeadlessCommand(
           // no-op
         }
       } else {
-        await drainStreamWithResume(approvalStream, createBuffers(), () => {});
+        await drainStreamWithResume(
+          approvalStream,
+          createBuffers(agent.id),
+          () => {},
+        );
       }
     }
   };
@@ -1420,6 +1456,39 @@ export async function handleHeadlessCommand(
       // Fallback: if we were sending only approvals and hit an internal error that
       // says there is no pending approval, resend using the keep-alive recovery prompt.
       if (approvalDesynced) {
+        // "Invalid tool call IDs" means server HAS pending approvals but with different IDs.
+        // Fetch the actual pending approvals and process them before retrying.
+        if (
+          isInvalidToolCallIdsError(detailFromRun) ||
+          isInvalidToolCallIdsError(latestErrorText)
+        ) {
+          if (outputFormat === "stream-json") {
+            const recoveryMsg: RecoveryMessage = {
+              type: "recovery",
+              recovery_type: "invalid_tool_call_ids",
+              message:
+                "Tool call ID mismatch; fetching actual pending approvals and resyncing",
+              run_id: lastRunId ?? undefined,
+              session_id: sessionId,
+              uuid: `recovery-${lastRunId || crypto.randomUUID()}`,
+            };
+            console.log(JSON.stringify(recoveryMsg));
+          } else {
+            console.error(
+              "Tool call ID mismatch; fetching actual pending approvals...",
+            );
+          }
+
+          try {
+            // Fetch and process actual pending approvals from server
+            await resolveAllPendingApprovals();
+            // After processing, continue to next iteration (fresh state)
+            continue;
+          } catch {
+            // If fetch fails, fall through to general desync recovery
+          }
+        }
+
         if (llmApiErrorRetries < LLM_API_ERROR_MAX_RETRIES) {
           llmApiErrorRetries += 1;
 
@@ -1973,7 +2042,7 @@ async function runBidirectionalMode(
       currentAbortController = new AbortController();
 
       try {
-        const buffers = createBuffers();
+        const buffers = createBuffers(agent.id);
         const startTime = performance.now();
         let numTurns = 0;
 

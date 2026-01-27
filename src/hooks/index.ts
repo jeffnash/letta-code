@@ -1,6 +1,7 @@
 // src/hooks/index.ts
 // Main hooks module - provides high-level API for running hooks
 
+import { sessionPermissions } from "../permissions/session";
 import { executeHooks, executeHooksParallel } from "./executor";
 import { getHooksForEvent, hasHooksForEvent, loadHooks } from "./loader";
 import type {
@@ -36,6 +37,7 @@ export async function runPreToolUseHooks(
   toolInput: Record<string, unknown>,
   toolCallId?: string,
   workingDirectory: string = process.cwd(),
+  agentId?: string,
 ): Promise<HookExecutionResult> {
   const hooks = await getHooksForEvent(
     "PreToolUse",
@@ -52,6 +54,7 @@ export async function runPreToolUseHooks(
     tool_name: toolName,
     tool_input: toolInput,
     tool_call_id: toolCallId,
+    agent_id: agentId,
   };
 
   // Run sequentially - stop on first block
@@ -68,6 +71,7 @@ export async function runPostToolUseHooks(
   toolResult: { status: "success" | "error"; output?: string },
   toolCallId?: string,
   workingDirectory: string = process.cwd(),
+  agentId?: string,
 ): Promise<HookExecutionResult> {
   const hooks = await getHooksForEvent(
     "PostToolUse",
@@ -85,6 +89,7 @@ export async function runPostToolUseHooks(
     tool_input: toolInput,
     tool_call_id: toolCallId,
     tool_result: toolResult,
+    agent_id: agentId,
   };
 
   // Run in parallel since PostToolUse cannot block
@@ -120,6 +125,7 @@ export async function runPermissionRequestHooks(
       type: permissionType,
       scope,
     },
+    session_permissions: sessionPermissions.getRules(),
   };
 
   // Run sequentially - first hook that returns 0 or 2 determines outcome

@@ -544,17 +544,16 @@ describe("Settings Manager - Hooks", () => {
   test("Hooks configuration persists to disk", async () => {
     settingsManager.updateSettings({
       hooks: {
+        // Tool event with HookMatcher[]
         PreToolUse: [
           {
             matcher: "*",
             hooks: [{ type: "command", command: "echo persisted" }],
           },
         ],
+        // Simple event with SimpleHookMatcher[]
         SessionStart: [
-          {
-            matcher: "*",
-            hooks: [{ type: "command", command: "echo session" }],
-          },
+          { hooks: [{ type: "command", command: "echo session" }] },
         ],
       },
     });
@@ -603,11 +602,9 @@ describe("Settings Manager - Hooks", () => {
     settingsManager.updateLocalProjectSettings(
       {
         hooks: {
+          // Simple event uses SimpleHookMatcher[] (hooks wrapper)
           UserPromptSubmit: [
-            {
-              matcher: "*",
-              hooks: [{ type: "command", command: "echo local-hook" }],
-            },
+            { hooks: [{ type: "command", command: "echo local-hook" }] },
           ],
         },
       },
@@ -625,12 +622,8 @@ describe("Settings Manager - Hooks", () => {
     settingsManager.updateLocalProjectSettings(
       {
         hooks: {
-          Stop: [
-            {
-              matcher: "*",
-              hooks: [{ type: "command", command: "echo stop-hook" }],
-            },
-          ],
+          // Simple event uses SimpleHookMatcher[] (hooks wrapper)
+          Stop: [{ hooks: [{ type: "command", command: "echo stop-hook" }] }],
         },
       },
       testProjectDir,
@@ -646,6 +639,7 @@ describe("Settings Manager - Hooks", () => {
       await settingsManager.loadLocalProjectSettings(testProjectDir);
 
     expect(reloaded.hooks?.Stop).toHaveLength(1);
+    // Simple event hooks are in SimpleHookMatcher format with hooks array
     expect(reloaded.hooks?.Stop?.[0]?.hooks[0]?.command).toBe("echo stop-hook");
   });
 
@@ -833,5 +827,167 @@ describe("Settings Manager - Default Model", () => {
     // Default model should be preserved
     expect(settingsManager.getSetting("defaultModel")).toBe("haiku");
     expect(settingsManager.getSetting("tokenStreaming")).toBe(false);
+  });
+});
+
+// ============================================================================
+// Agents Array Migration Tests
+// ============================================================================
+
+describe("Settings Manager - Agents Array Migration", () => {
+  test("Migrates from pinnedAgents (oldest legacy format)", async () => {
+    // Setup: Write old format to disk
+    const { writeFile, mkdir } = await import("../utils/fs.js");
+    const settingsDir = join(testHomeDir, ".letta");
+    await mkdir(settingsDir, { recursive: true });
+    await writeFile(
+      join(settingsDir, "settings.json"),
+      JSON.stringify({
+        pinnedAgents: ["agent-old-1", "agent-old-2"],
+        tokenStreaming: true,
+      }),
+    );
+
+    await settingsManager.initialize();
+    const settings = settingsManager.getSettings();
+
+    // Should have migrated to agents array
+    expect(settings.agents).toBeDefined();
+    expect(settings.agents).toHaveLength(2);
+    expect(settings.agents?.[0]).toEqual({
+      agentId: "agent-old-1",
+      pinned: true,
+    });
+    expect(settings.agents?.[1]).toEqual({
+      agentId: "agent-old-2",
+      pinned: true,
+    });
+    // Legacy field should still exist for downgrade compat
+    expect(settings.pinnedAgents).toEqual(["agent-old-1", "agent-old-2"]);
+  });
+
+  test("Migrates from pinnedAgentsByServer (newer legacy format)", async () => {
+    const { writeFile, mkdir } = await import("../utils/fs.js");
+    const settingsDir = join(testHomeDir, ".letta");
+    await mkdir(settingsDir, { recursive: true });
+    await writeFile(
+      join(settingsDir, "settings.json"),
+      JSON.stringify({
+        pinnedAgentsByServer: {
+          "api.letta.com": ["agent-cloud-1"],
+          "localhost:8283": ["agent-local-1", "agent-local-2"],
+        },
+      }),
+    );
+
+    await settingsManager.initialize();
+    const settings = settingsManager.getSettings();
+
+    expect(settings.agents).toHaveLength(3);
+    // Cloud agents have no baseUrl (or undefined)
+    expect(settings.agents).toContainEqual({
+      agentId: "agent-cloud-1",
+      pinned: true,
+    });
+    // Local agents have baseUrl
+    expect(settings.agents).toContainEqual({
+      agentId: "agent-local-1",
+      baseUrl: "localhost:8283",
+      pinned: true,
+    });
+    expect(settings.agents).toContainEqual({
+      agentId: "agent-local-2",
+      baseUrl: "localhost:8283",
+      pinned: true,
+    });
+  });
+
+  test("Migrates from both legacy formats (deduplicated)", async () => {
+    const { writeFile, mkdir } = await import("../utils/fs.js");
+    const settingsDir = join(testHomeDir, ".letta");
+    await mkdir(settingsDir, { recursive: true });
+    await writeFile(
+      join(settingsDir, "settings.json"),
+      JSON.stringify({
+        pinnedAgents: ["agent-1", "agent-2"], // Old old format
+        pinnedAgentsByServer: {
+          "api.letta.com": ["agent-1", "agent-3"], // agent-1 is duplicate
+        },
+      }),
+    );
+
+    await settingsManager.initialize();
+    const settings = settingsManager.getSettings();
+
+    // Should have 3 agents (agent-1 deduped)
+    expect(settings.agents).toHaveLength(3);
+    const agentIds = settings.agents?.map((a) => a.agentId);
+    expect(agentIds).toContain("agent-1");
+    expect(agentIds).toContain("agent-2");
+    expect(agentIds).toContain("agent-3");
+  });
+
+  test("Already migrated settings are not re-migrated", async () => {
+    const { writeFile, mkdir } = await import("../utils/fs.js");
+    const settingsDir = join(testHomeDir, ".letta");
+    await mkdir(settingsDir, { recursive: true });
+    await writeFile(
+      join(settingsDir, "settings.json"),
+      JSON.stringify({
+        agents: [{ agentId: "agent-new", pinned: true, memfs: true }],
+        pinnedAgentsByServer: {
+          "api.letta.com": ["agent-old"], // Should be ignored since agents exists
+        },
+      }),
+    );
+
+    await settingsManager.initialize();
+    const settings = settingsManager.getSettings();
+
+    // Should only have the new format agent
+    expect(settings.agents).toHaveLength(1);
+    expect(settings.agents?.[0]?.agentId).toBe("agent-new");
+    expect(settings.agents?.[0]?.memfs).toBe(true);
+  });
+
+  test("isMemfsEnabled returns false for agents without memfs flag", async () => {
+    await settingsManager.initialize();
+
+    // Manually set up agents array
+    settingsManager.updateSettings({
+      agents: [
+        { agentId: "agent-with-memfs", pinned: true, memfs: true },
+        { agentId: "agent-without-memfs", pinned: true },
+      ],
+    });
+
+    expect(settingsManager.isMemfsEnabled("agent-with-memfs")).toBe(true);
+    expect(settingsManager.isMemfsEnabled("agent-without-memfs")).toBe(false);
+    expect(settingsManager.isMemfsEnabled("agent-unknown")).toBe(false);
+  });
+
+  test("setMemfsEnabled adds/removes memfs flag", async () => {
+    await settingsManager.initialize();
+
+    settingsManager.setMemfsEnabled("agent-test", true);
+    expect(settingsManager.isMemfsEnabled("agent-test")).toBe(true);
+
+    settingsManager.setMemfsEnabled("agent-test", false);
+    expect(settingsManager.isMemfsEnabled("agent-test")).toBe(false);
+  });
+
+  test("setMemfsEnabled persists to disk", async () => {
+    await settingsManager.initialize();
+
+    settingsManager.setMemfsEnabled("agent-persist-test", true);
+
+    // Wait for async persist
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // Reset and reload
+    await settingsManager.reset();
+    await settingsManager.initialize();
+
+    expect(settingsManager.isMemfsEnabled("agent-persist-test")).toBe(true);
   });
 });
