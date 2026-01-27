@@ -20,11 +20,12 @@ type ModelSettings =
 /**
  * Builds model_settings from updateArgs based on provider type.
  * Always ensures parallel_tool_calls is enabled.
+ * Returns null for providers that don't support model_settings (e.g., CLIProxy).
  */
 function buildModelSettings(
   modelHandle: string,
   updateArgs?: Record<string, unknown>,
-): ModelSettings {
+): ModelSettings | null {
   // Include our custom ChatGPT OAuth provider (chatgpt-plus-pro)
   const isOpenAI =
     modelHandle.startsWith("openai/") ||
@@ -38,6 +39,8 @@ function buildModelSettings(
   const isGoogleVertex = modelHandle.startsWith("google_vertex/");
   const isOpenRouter = modelHandle.startsWith("openrouter/");
   const isBedrock = modelHandle.startsWith("bedrock/");
+  // CLIProxy is a passthrough service that doesn't use model_settings
+  const isCliProxy = modelHandle.startsWith("cliproxy/");
 
   let settings: ModelSettings;
 
@@ -131,6 +134,10 @@ function buildModelSettings(
       };
     }
     settings = bedrockSettings;
+  } else if (isCliProxy) {
+    // CLIProxy is a passthrough service - don't send model_settings
+    // The backend doesn't support model_settings for cliproxy provider
+    return null;
   } else {
     // For BYOK/unknown providers, return generic settings with parallel_tool_calls
     settings = {};
@@ -165,7 +172,9 @@ export async function updateAgentLLMConfig(
 
   const modelSettings = buildModelSettings(modelHandle, updateArgs);
   const contextWindow = updateArgs?.context_window as number | undefined;
-  const hasModelSettings = Object.keys(modelSettings).length > 0;
+  // Only include model_settings if it's not null and has keys
+  const hasModelSettings =
+    modelSettings !== null && Object.keys(modelSettings).length > 0;
 
   await client.agents.update(agentId, {
     model: modelHandle,
