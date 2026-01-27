@@ -680,6 +680,10 @@ export function isOpenAIModel(modelIdentifier: string): boolean {
  * Check if a model identifier is a Gemini model (uses gemini toolset)
  */
 function isGeminiModelHandle(handle: string): boolean {
+  // Exclude Claude models hosted on Gemini infrastructure (cliproxy/gemini-claude-*)
+  if (handle.startsWith("cliproxy/gemini-claude-")) {
+    return false;
+  }
   return (
     handle.startsWith("google/") ||
     handle.startsWith("google_ai/") ||
