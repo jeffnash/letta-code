@@ -1520,7 +1520,8 @@ async function main(): Promise<void> {
         // Priority 3: Check if --new flag was passed or user requested new from selector
         if (!agent && shouldCreateNew) {
           // For self-hosted: if default model unavailable and no model selected yet, show picker
-          if (availableServerModels.length > 0 && !selectedServerModel) {
+          // BUT skip the picker if user already specified a model via -m flag
+          if (availableServerModels.length > 0 && !selectedServerModel && !model) {
             setLoadingState("selecting_global");
             return;
           }
