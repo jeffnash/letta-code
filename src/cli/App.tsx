@@ -33,6 +33,7 @@ import {
 } from "../agent/approval-execution";
 import {
   buildApprovalRecoveryMessage,
+  cancelWithFallbackDenials,
   fetchRunErrorDetail,
   isApprovalPendingError,
   isApprovalStateDesyncError,
@@ -1888,64 +1889,60 @@ export default function App({
                 errorDetail = preStreamError.message;
               }
 
-              // If desync detected and retries available, recover with keep-alive prompt
-              if (
-                isApprovalStateDesyncError(errorDetail) &&
-                llmApiErrorRetriesRef.current < LLM_API_ERROR_MAX_RETRIES
-              ) {
-                llmApiErrorRetriesRef.current += 1;
+              // If desync detected, handle based on payload type.
+              // Mixed payloads: strip stale approvals but preserve user message.
+              // Approval-only payloads: send recovery prompt to unblock the agent.
+              if (isApprovalStateDesyncError(errorDetail)) {
+                // Check if there's a user message we need to preserve
+                const messageItems = currentInput.filter(
+                  (item) => item?.type !== "approval",
+                );
 
-                // Show transient status (matches post-stream desync handler UX)
-                const statusId = uid("status");
-                buffersRef.current.byId.set(statusId, {
-                  kind: "status",
-                  id: statusId,
-                  lines: [
-                    "Approval state desynced; resending keep-alive recovery prompt...",
-                  ],
-                });
-                buffersRef.current.order.push(statusId);
-                refreshDerived();
+                if (messageItems.length > 0) {
+                  // Mixed payload: strip stale approvals, keep user message
+                  currentInput.splice(
+                    0,
+                    currentInput.length,
+                    ...messageItems,
+                  );
+                  // Reset interrupted flag so retry stream chunks are processed
+                  buffersRef.current.interrupted = false;
+                  continue;
+                }
 
-                // Swap payload to recovery message (or strip stale approvals)
-                const isApprovalOnlyPayload =
-                  hasApprovalInPayload && currentInput.length === 1;
-                if (isApprovalOnlyPayload) {
+                // Approval-only payload: send recovery prompt
+                if (llmApiErrorRetriesRef.current < LLM_API_ERROR_MAX_RETRIES) {
+                  llmApiErrorRetriesRef.current += 1;
+
+                  // Show transient status
+                  const statusId = uid("status");
+                  buffersRef.current.byId.set(statusId, {
+                    kind: "status",
+                    id: statusId,
+                    lines: [
+                      "Approval state desynced; resending keep-alive recovery prompt...",
+                    ],
+                  });
+                  buffersRef.current.order.push(statusId);
+                  refreshDerived();
+
                   currentInput.splice(
                     0,
                     currentInput.length,
                     buildApprovalRecoveryMessage(),
                   );
-                } else {
-                  // Mixed payload: strip stale approvals, keep user message
-                  const messageItems = currentInput.filter(
-                    (item) => item?.type !== "approval",
+
+                  // Remove transient status before retry
+                  buffersRef.current.byId.delete(statusId);
+                  buffersRef.current.order = buffersRef.current.order.filter(
+                    (id) => id !== statusId,
                   );
-                  if (messageItems.length > 0) {
-                    currentInput.splice(
-                      0,
-                      currentInput.length,
-                      ...messageItems,
-                    );
-                  } else {
-                    currentInput.splice(
-                      0,
-                      currentInput.length,
-                      buildApprovalRecoveryMessage(),
-                    );
-                  }
+                  refreshDerived();
+
+                  // Reset interrupted flag so retry stream chunks are processed
+                  buffersRef.current.interrupted = false;
+                  continue;
                 }
-
-                // Remove transient status before retry
-                buffersRef.current.byId.delete(statusId);
-                buffersRef.current.order = buffersRef.current.order.filter(
-                  (id) => id !== statusId,
-                );
-                refreshDerived();
-
-                // Reset interrupted flag so retry stream chunks are processed
-                buffersRef.current.interrupted = false;
-                continue;
               }
             }
 
@@ -2645,8 +2642,6 @@ export default function App({
           const hasApprovalInPayload = currentInput.some(
             (item) => item?.type === "approval",
           );
-          const isApprovalOnlyPayload =
-            hasApprovalInPayload && currentInput.length === 1;
 
           // Capture the most recent error text in this turn (if any)
           let latestErrorText: string | null = null;
@@ -2670,8 +2665,23 @@ export default function App({
           const lastFailureMessage = latestErrorText || detailFromRun || null;
 
           // Check for approval desync errors even if stop_reason isn't llm_api_error.
-          // Handle both approval-only payloads and mixed [approval, message] payloads.
+          // Mixed payloads: strip stale approvals but preserve user message.
+          // Approval-only payloads: send recovery prompt to unblock the agent.
           if (hasApprovalInPayload && desyncDetected) {
+            // Check if there's a user message we need to preserve
+            const messageItems = currentInput.filter(
+              (item) => item?.type !== "approval",
+            );
+
+            if (messageItems.length > 0) {
+              // Mixed payload: strip stale approvals, keep user message
+              currentInput.splice(0, currentInput.length, ...messageItems);
+              // Reset interrupted flag so retry stream chunks are processed
+              buffersRef.current.interrupted = false;
+              continue;
+            }
+
+            // Approval-only payload: send recovery prompt
             if (llmApiErrorRetriesRef.current < LLM_API_ERROR_MAX_RETRIES) {
               llmApiErrorRetriesRef.current += 1;
               const statusId = uid("status");
@@ -2685,29 +2695,11 @@ export default function App({
               buffersRef.current.order.push(statusId);
               refreshDerived();
 
-              if (isApprovalOnlyPayload) {
-                // Approval-only payload: send recovery prompt
-                currentInput.splice(
-                  0,
-                  currentInput.length,
-                  buildApprovalRecoveryMessage(),
-                );
-              } else {
-                // Mixed payload [approval, message]: strip stale approval, keep user message
-                const messageItems = currentInput.filter(
-                  (item) => item?.type !== "approval",
-                );
-                if (messageItems.length > 0) {
-                  currentInput.splice(0, currentInput.length, ...messageItems);
-                } else {
-                  // Fallback if somehow no message items remain
-                  currentInput.splice(
-                    0,
-                    currentInput.length,
-                    buildApprovalRecoveryMessage(),
-                  );
-                }
-              }
+              currentInput.splice(
+                0,
+                currentInput.length,
+                buildApprovalRecoveryMessage(),
+              );
 
               // Remove the transient status before retrying
               buffersRef.current.byId.delete(statusId);
@@ -3215,6 +3207,9 @@ export default function App({
       setStreaming(false);
       setIsExecutingTool(false);
 
+      // Capture pending approvals BEFORE clearing - needed for fallback if cancel fails
+      const pendingApprovalsSnapshot = [...pendingApprovals];
+
       // Clear any pending approvals since we're cancelling
       setPendingApprovals([]);
       setApprovalContexts([]);
@@ -3224,61 +3219,15 @@ export default function App({
 
       refreshDerived();
 
-      // If the backend has already created an approval_request_message, it will refuse
-      // new user messages until it receives an approval/denial. Best-effort: detect
-      // any server-side pending approvals and queue denials to be sent with the next
-      // user message (same logic as EAGER_CANCEL branch).
-      // Capture the current agent id before the async call to avoid stale state
-      // if the user switches agents while the promise is pending.
+      // Send cancel request to backend with retry and fallback denial queueing
       const capturedAgentId = agentIdRef.current;
-      getClient()
-        .then(async (client) => {
-          // Check if agent changed during the async call - if so, skip to avoid
-          // enqueuing denials for a different agent
-          if (capturedAgentId !== agentIdRef.current) {
-            return;
-          }
-
-          // Fire-and-forget cancel request to backend (do not await)
-          client.agents.messages.cancel(capturedAgentId).catch(() => {
-            // Silently ignore - cancellation already happened client-side
-          });
-
-          try {
-            const agent = await client.agents.retrieve(capturedAgentId);
-
-            // Check again after retrieve in case agent switched during the await
-            if (capturedAgentId !== agentIdRef.current) {
-              return;
-            }
-
-            const { pendingApprovals: existingApprovals } = await getResumeData(
-              client,
-              agent,
-            );
-
-            // Final check before setting state
-            if (capturedAgentId !== agentIdRef.current) {
-              return;
-            }
-
-            if (existingApprovals.length > 0) {
-              setQueuedApprovalResults(
-                existingApprovals.map((a) => ({
-                  type: "approval" as const,
-                  tool_call_id: a.toolCallId,
-                  approve: false,
-                  reason: "User cancelled",
-                })),
-              );
-            }
-          } catch {
-            // Best-effort only; failing to fetch approvals should not block interrupt UX.
-          }
-        })
-        .catch(() => {
-          // Silently ignore - cancellation already happened client-side
-        });
+      cancelWithFallbackDenials(
+        (client) => client.agents.messages.cancel(capturedAgentId),
+        pendingApprovalsSnapshot,
+        capturedAgentId,
+        () => agentIdRef.current,
+        queueApprovalResults,
+      );
 
       // Delay flag reset to ensure React has flushed state updates before dequeue can fire.
       // Use setTimeout(50) instead of setTimeout(0) - the longer delay ensures React's
@@ -3339,35 +3288,24 @@ export default function App({
       }
       refreshDerived();
 
-      // Cache pending approvals, plus any auto-handled results, for the next message.
-      const denialResults = pendingApprovals.map((approval) => ({
-        type: "approval" as const,
-        tool_call_id: approval.toolCallId,
-        approve: false,
-        reason: "User interrupted the stream",
-      }));
+      // Queue any auto-handled tool results (client-side tool executions that completed).
+      // Note: We do NOT queue approval denials here - the server-side cancel already
+      // handles creating denial messages for any pending approvals.
       const autoHandledSnapshot = [...autoHandledResults];
-      const autoDeniedSnapshot = [...autoDeniedApprovals];
-      const queuedResults = [
-        ...autoHandledSnapshot.map((ar) => ({
-          type: "tool" as const,
-          tool_call_id: ar.toolCallId,
-          tool_return: ar.result.toolReturn,
-          status: ar.result.status,
-          stdout: ar.result.stdout,
-          stderr: ar.result.stderr,
-        })),
-        ...autoDeniedSnapshot.map((ad) => ({
-          type: "approval" as const,
-          tool_call_id: ad.approval.toolCallId,
-          approve: false,
-          reason: ad.reason,
-        })),
-        ...denialResults,
-      ];
-      if (queuedResults.length > 0) {
-        queueApprovalResults(queuedResults);
+      const toolResults = autoHandledSnapshot.map((ar) => ({
+        type: "tool" as const,
+        tool_call_id: ar.toolCallId,
+        tool_return: ar.result.toolReturn,
+        status: ar.result.status,
+        stdout: ar.result.stdout,
+        stderr: ar.result.stderr,
+      }));
+      if (toolResults.length > 0) {
+        queueApprovalResults(toolResults);
       }
+
+      // Capture pending approvals BEFORE clearing - needed for fallback if cancel fails
+      const pendingApprovalsSnapshot = [...pendingApprovals];
 
       // Clear local approval state
       setPendingApprovals([]);
@@ -3376,20 +3314,16 @@ export default function App({
       setAutoHandledResults([]);
       setAutoDeniedApprovals([]);
 
-      // If the backend has already created an approval_request_message, it will refuse
-      // new user messages until it receives an approval/denial. Best-effort: detect
-      // any server-side pending approvals and queue denials to be sent with the next
-      // user message (see queuedApprovalResults flow below).
-      // Capture the current agent id before the async call to avoid stale state
-      // if the user switches agents while the promise is pending.
-      const capturedAgentIdEager = agentIdRef.current;
-      getClient()
-        .then((client) =>
-          client.conversations.cancel(conversationIdRef.current),
-        )
-        .catch(() => {
-          // Silently ignore - cancellation already happened client-side
-        });
+      // Send cancel request to backend with retry and fallback denial queueing
+      const capturedConversationId = conversationIdRef.current;
+      const capturedAgentId = agentIdRef.current;
+      cancelWithFallbackDenials(
+        (client) => client.conversations.cancel(capturedConversationId),
+        pendingApprovalsSnapshot,
+        capturedAgentId,
+        () => agentIdRef.current,
+        queueApprovalResults,
+      );
 
       // Reset cancellation flags after cleanup is complete.
       // Use setTimeout(50) instead of setTimeout(0) to ensure React has fully processed
@@ -3427,7 +3361,6 @@ export default function App({
     setIsExecutingTool,
     pendingApprovals,
     autoHandledResults,
-    autoDeniedApprovals,
     queueApprovalResults,
   ]);
 
