@@ -7744,7 +7744,6 @@ ${SYSTEM_REMINDER_CLOSE}
                   toolAbortControllerRef.current = null;
                   executingToolCallIdsRef.current = [];
                   autoAllowedExecutionRef.current = null;
-                  toolResultsInFlightRef.current = false;
                 }
               }
             }
