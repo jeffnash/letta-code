@@ -1281,8 +1281,48 @@ export async function handleHeadlessCommand(
       // Case 2: Requires approval - batch process all approvals
       if (stopReason === "requires_approval") {
         if (approvals.length === 0) {
-          console.error("Unexpected empty approvals array");
-          process.exit(1);
+          // Approvals may not have been captured due to missing tool_call_id in stream chunks.
+          // Try to fetch pending approvals from the server.
+          console.warn(
+            "[headless] Received requires_approval but no approvals captured from stream. " +
+              "Fetching pending approvals from server...",
+          );
+
+          try {
+            const { getResumeData } = await import("./agent/check-approval");
+            const freshAgent = await client.agents.retrieve(agent.id);
+            const resume = await getResumeData(client, freshAgent, conversationId);
+            approvals = resume.pendingApprovals || [];
+          } catch (error) {
+            console.warn(
+              "[headless] Failed to fetch pending approvals from server:",
+              error instanceof Error ? error.message : String(error),
+            );
+            approvals = [];
+          }
+
+          if (approvals.length === 0) {
+            // Still no approvals - check if we're in bypassPermissions mode
+            const { permissionMode } = await import("./permissions/mode");
+
+            if (permissionMode.getMode() === "bypassPermissions") {
+              console.warn(
+                "[headless] No pending approvals found, but in bypassPermissions mode. " +
+                  "Sending recovery message to continue...",
+              );
+              // Send a recovery message to let the agent continue
+              currentInput = [buildApprovalRecoveryMessage()];
+              continue;
+            }
+
+            // Not in bypass mode - exit with helpful error
+            console.error(
+              "Error: Subagent stopped with requires_approval, but no approval requests were captured. " +
+                "This can happen when the stream is missing tool_call_id. " +
+                "Run with --yolo (bypassPermissions mode) to auto-approve subagent tools.",
+            );
+            process.exit(1);
+          }
         }
 
         // Phase 1: Collect decisions for all approvals

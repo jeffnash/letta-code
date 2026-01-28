@@ -11,6 +11,12 @@ import { debugWarn } from "../utils/debug";
 // Number of recent messages to backfill when resuming a session
 const MESSAGE_HISTORY_LIMIT = 15;
 
+// When looking for pending approvals, scan backwards through the most recent
+// in-context message IDs. The backend *should* keep an approval_request_message
+// as the last in-context message while approvals are pending, but in practice
+// it can drift due to message history issues (e.g., compaction, variants).
+const APPROVAL_MESSAGE_LOOKBACK_LIMIT = 10;
+
 /**
  * Check if message backfilling is enabled via LETTA_BACKFILL env var.
  * Defaults to true. Set LETTA_BACKFILL=0 or LETTA_BACKFILL=false to disable.
@@ -25,6 +31,54 @@ export interface ResumeData {
   pendingApproval: ApprovalRequest | null; // Deprecated: use pendingApprovals
   pendingApprovals: ApprovalRequest[];
   messageHistory: Message[];
+}
+
+async function findLatestApprovalRequestMessage(
+  client: Letta,
+  inContextMessageIds: string[],
+): Promise<Message | null> {
+  const idsToScan = inContextMessageIds
+    .slice(-APPROVAL_MESSAGE_LOOKBACK_LIMIT)
+    .reverse();
+
+  const lastInContextId = inContextMessageIds.at(-1);
+
+  for (const messageId of idsToScan) {
+    let retrievedMessages: Message[];
+    try {
+      retrievedMessages = await client.messages.retrieve(messageId);
+    } catch (error) {
+      // If a message disappeared or is from a stale conversation state, skip it.
+      // Higher-level callers treat lack of approvals as "nothing pending".
+      if (error instanceof APIError && (error.status === 404 || error.status === 422)) {
+        continue;
+      }
+      throw error;
+    }
+
+    // A single DB message can have multiple content types returned as separate
+    // Message objects; prefer the approval_request_message variant if present.
+    const approvalVariant =
+      retrievedMessages.find(
+        (msg) => msg.message_type === "approval_request_message",
+      ) ?? null;
+
+    if (!approvalVariant) {
+      continue;
+    }
+
+    debugWarn(
+      "check-approval",
+      `Found approval request message: ${approvalVariant.id}` +
+        (lastInContextId && approvalVariant.id !== lastInContextId
+          ? ` (non-terminal; last in-context was ${lastInContextId})`
+          : ""),
+    );
+
+    return approvalVariant;
+  }
+
+  return null;
 }
 
 /**
@@ -180,14 +234,6 @@ export async function getResumeData(
         };
       }
 
-      // Fetch the last in-context message directly by ID
-      // (We already checked inContextMessageIds.length > 0 above)
-      const lastInContextId = inContextMessageIds.at(-1);
-      if (!lastInContextId) {
-        throw new Error("Expected at least one in-context message");
-      }
-      const retrievedMessages = await client.messages.retrieve(lastInContextId);
-
       // Fetch message history separately for backfill (desc then reverse for last N chronological)
       // Wrapped in try/catch so backfill failures don't crash the CLI
       if (isBackfillEnabled()) {
@@ -208,37 +254,18 @@ export async function getResumeData(
         }
       }
 
-      // Find the approval_request_message variant if it exists
-      // (A single DB message can have multiple content types returned as separate Message objects)
-      const messageToCheck =
-        retrievedMessages.find(
-          (msg) => msg.message_type === "approval_request_message",
-        ) ?? retrievedMessages[0];
-
-      if (messageToCheck) {
-        debugWarn(
-          "check-approval",
-          `Found last in-context message: ${messageToCheck.id} (type: ${messageToCheck.message_type})` +
-            (retrievedMessages.length > 1
-              ? ` - had ${retrievedMessages.length} variants`
-              : ""),
-        );
-
-        // Check for pending approval(s) inline since we already have the message
-        if (messageToCheck.message_type === "approval_request_message") {
-          const { pendingApproval, pendingApprovals } =
-            extractApprovals(messageToCheck);
-          return {
-            pendingApproval,
-            pendingApprovals,
-            messageHistory: prepareMessageHistory(messages),
-          };
-        }
-      } else {
-        debugWarn(
-          "check-approval",
-          `Last in-context message ${lastInContextId} not found via retrieve`,
-        );
+      const approvalMessage = await findLatestApprovalRequestMessage(
+        client,
+        inContextMessageIds,
+      );
+      if (approvalMessage) {
+        const { pendingApproval, pendingApprovals } =
+          extractApprovals(approvalMessage);
+        return {
+          pendingApproval,
+          pendingApprovals,
+          messageHistory: prepareMessageHistory(messages),
+        };
       }
 
       return {
@@ -263,14 +290,6 @@ export async function getResumeData(
           messageHistory: [],
         };
       }
-
-      // Fetch the last in-context message directly by ID
-      // (We already checked inContextMessageIds.length > 0 above)
-      const lastInContextId = inContextMessageIds.at(-1);
-      if (!lastInContextId) {
-        throw new Error("Expected at least one in-context message");
-      }
-      const retrievedMessages = await client.messages.retrieve(lastInContextId);
 
       // Fetch message history for backfill using conversation_id=default
       // This filters to only the default conversation's messages (like the ADE does)
@@ -298,35 +317,18 @@ export async function getResumeData(
         }
       }
 
-      // Find the approval_request_message variant if it exists
-      const messageToCheck =
-        retrievedMessages.find(
-          (msg) => msg.message_type === "approval_request_message",
-        ) ?? retrievedMessages[0];
-
-      if (messageToCheck) {
-        debugWarn(
-          "check-approval",
-          `Found last in-context message: ${messageToCheck.id} (type: ${messageToCheck.message_type})` +
-            (retrievedMessages.length > 1
-              ? ` - had ${retrievedMessages.length} variants`
-              : ""),
-        );
-
-        if (messageToCheck.message_type === "approval_request_message") {
-          const { pendingApproval, pendingApprovals } =
-            extractApprovals(messageToCheck);
-          return {
-            pendingApproval,
-            pendingApprovals,
-            messageHistory: prepareMessageHistory(messages),
-          };
-        }
-      } else {
-        debugWarn(
-          "check-approval",
-          `Last in-context message ${lastInContextId} not found via retrieve (default/agent API)`,
-        );
+      const approvalMessage = await findLatestApprovalRequestMessage(
+        client,
+        inContextMessageIds,
+      );
+      if (approvalMessage) {
+        const { pendingApproval, pendingApprovals } =
+          extractApprovals(approvalMessage);
+        return {
+          pendingApproval,
+          pendingApprovals,
+          messageHistory: prepareMessageHistory(messages),
+        };
       }
 
       return {

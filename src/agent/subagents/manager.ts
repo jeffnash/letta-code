@@ -162,12 +162,12 @@ function recordToolCall(
 function handleInitEvent(
   event: { agent_id?: string; conversation_id?: string },
   state: ExecutionState,
-  baseURL: string,
+  agentDisplayURL: string,
   subagentId: string,
 ): void {
   if (event.agent_id) {
     state.agentId = event.agent_id;
-    const agentURL = `${baseURL}/agents/${event.agent_id}`;
+    const agentURL = `${agentDisplayURL}/agents/${event.agent_id}`;
     updateSubagent(subagentId, { agentURL });
   }
   if (event.conversation_id) {
@@ -277,7 +277,7 @@ function handleResultEvent(
 function processStreamEvent(
   line: string,
   state: ExecutionState,
-  baseURL: string,
+  agentDisplayURL: string,
   subagentId: string,
 ): void {
   try {
@@ -288,7 +288,7 @@ function processStreamEvent(
       case "system":
         // Handle both legacy "init" type and new "system" type with subtype "init"
         if (event.type === "init" || event.subtype === "init") {
-          handleInitEvent(event, state, baseURL, subagentId);
+          handleInitEvent(event, state, agentDisplayURL, subagentId);
         }
         break;
 
@@ -464,7 +464,7 @@ function buildSubagentArgs(
  * @param config - Subagent configuration
  * @param model - Model handle to use
  * @param userPrompt - The task prompt
- * @param baseURL - Base URL for agent links
+ * @param agentDisplayURL - Display URL for constructing agent links (UI only)
  * @param subagentId - ID for tracking
  * @param expansionChain - Full list of fallback models for rate limit retry
  * @param chainIndex - Current position in the expansion chain (for retry tracking)
@@ -475,7 +475,7 @@ async function executeSubagent(
   config: SubagentConfig,
   model: string | null,
   userPrompt: string,
-  baseURL: string,
+  agentDisplayURL: string,
   subagentId: string,
   expansionChain: string[] = [],
   chainIndex = 0,
@@ -579,7 +579,7 @@ async function executeSubagent(
 
     rl.on("line", (line: string) => {
       stdoutChunks.push(Buffer.from(`${line}\n`));
-      processStreamEvent(line, state, baseURL, subagentId);
+      processStreamEvent(line, state, agentDisplayURL, subagentId);
     });
 
     proc.stderr.on("data", (data: Buffer) => {
@@ -624,7 +624,7 @@ async function executeSubagent(
             config,
             nextModel,
             userPrompt,
-            baseURL,
+            agentDisplayURL,
             subagentId,
             expansionChain,
             nextIndex,
@@ -648,7 +648,7 @@ async function executeSubagent(
             config,
             nextModel,
             userPrompt,
-            baseURL,
+            agentDisplayURL,
             subagentId,
             expansionChain,
             1,
@@ -667,7 +667,7 @@ async function executeSubagent(
             config,
             primaryModelHandle,
             userPrompt,
-            baseURL,
+            agentDisplayURL,
             subagentId,
             [], // No chain for fallback
             0,
@@ -723,9 +723,10 @@ async function executeSubagent(
 }
 
 /**
- * Get the base URL for constructing agent links
+ * Get the display URL for constructing agent links shown in the UI.
+ * This is for display purposes only - API calls use getClient() which has its own logic.
  */
-function getBaseURL(): string {
+function getAgentDisplayURL(): string {
   const settings = settingsManager.getSettings();
 
   const baseURL =
@@ -736,6 +737,16 @@ function getBaseURL(): string {
   // Convert API URL to web UI URL if using hosted service
   if (baseURL === "https://api.letta.com") {
     return "https://app.letta.com";
+  }
+
+  // If a custom server UUID is provided, use the Letta web app URL
+  // This allows users with custom Letta servers to link to the web UI
+  // e.g., https://app.letta.com/development-servers/[UUID]/agents/agent-...
+  const customServerUUID =
+    process.env.CUSTOM_LETTA_SERVER_UUID ||
+    settings.env?.CUSTOM_LETTA_SERVER_UUID;
+  if (customServerUUID) {
+    return `https://app.letta.com/development-servers/${customServerUUID}`;
   }
 
   return baseURL;
@@ -975,7 +986,7 @@ export async function spawnSubagent(
     }
   }
 
-  const baseURL = getBaseURL();
+  const agentDisplayURL = getAgentDisplayURL();
 
   // Build the prompt with system reminder for deployed agents
   let finalPrompt = prompt;
@@ -1002,7 +1013,7 @@ export async function spawnSubagent(
     config,
     model,
     finalPrompt,
-    baseURL,
+    agentDisplayURL,
     subagentId,
     expansionChain,
     0, // Start at beginning of chain
