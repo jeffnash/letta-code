@@ -961,6 +961,26 @@
     }
   },
   {
+    "id": "cliproxy-copilot-claude-opus-4.6",
+    "handle": "cliproxy/copilot-claude-opus-4.6",
+    "label": "Claude Opus 4.6 (CLIProxy/Copilot)",
+    "description": "Claude Opus 4.6 via CLIProxyAPI Copilot",
+    "updateArgs": {
+      "context_window": 200000,
+      "max_output_tokens": 64000
+    }
+  },
+  {
+    "id": "opus-4.6",
+    "handle": "cliproxy/copilot-claude-opus-4.6",
+    "label": "Opus 4.6",
+    "description": "Claude Opus 4.6 via CLIProxyAPI Copilot (short alias)",
+    "updateArgs": {
+      "context_window": 200000,
+      "max_output_tokens": 64000
+    }
+  },
+  {
     "id": "cliproxy-copilot-claude-haiku-4.5",
     "handle": "cliproxy/copilot-claude-haiku-4.5",
     "label": "Claude Haiku 4.5 (CLIProxy/Copilot)",

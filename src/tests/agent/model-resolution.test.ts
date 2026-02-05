@@ -160,7 +160,7 @@ describe("getModelUpdateArgs", () => {
   test("should return defaults for dynamic model", () => {
     mockGetModelContextWindow = spyOn(
       availableModelsModule,
-      "getModelContextWindow",
+      "getModelContextWindowSync",
     ).mockReturnValue(undefined);
 
     // Use a fictional model that's not in static list
@@ -173,7 +173,7 @@ describe("getModelUpdateArgs", () => {
   test("should use cached context window for dynamic model", () => {
     mockGetModelContextWindow = spyOn(
       availableModelsModule,
-      "getModelContextWindow",
+      "getModelContextWindowSync",
     ).mockReturnValue(256000);
 
     // Use a fictional model that's not in static list

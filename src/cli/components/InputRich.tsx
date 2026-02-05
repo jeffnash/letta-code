@@ -1028,6 +1028,7 @@ export function Input({
           <InputFooter
             ctrlCPressed={ctrlCPressed}
             escapePressed={escapePressed}
+            pendingApprovalsCount={pendingApprovalsCount}
             isBashMode={isBashMode}
             modeName={modeInfo?.name ?? null}
             modeColor={modeInfo?.color ?? null}

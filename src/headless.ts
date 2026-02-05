@@ -9,6 +9,7 @@ import type { ApprovalCreate } from "@letta-ai/letta-client/resources/agents/mes
 import type { StopReasonType } from "@letta-ai/letta-client/resources/runs/runs";
 import type { ApprovalResult } from "./agent/approval-execution";
 import {
+  buildApprovalRecoveryMessage,
   fetchRunErrorDetail,
   isApprovalPendingError,
   isConversationBusyError,

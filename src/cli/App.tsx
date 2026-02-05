@@ -248,6 +248,10 @@ const TOOL_CALL_COMMIT_DEFER_MS = 50;
 // When false, wait for backend to send "cancelled" stop_reason (useful for testing backend behavior)
 const EAGER_CANCEL = true;
 
+// Message shown when user interrupts the stream
+const INTERRUPT_MESSAGE =
+  "Interrupted – tell the agent what to do differently. Something went wrong? Use /feedback to report issues.";
+
 // Maximum retries for transient LLM API errors (matches headless.ts)
 const LLM_API_ERROR_MAX_RETRIES = 3;
 
@@ -3513,7 +3517,7 @@ export default function App({
                 setMessageQueue([]);
 
                 // Concatenate the snapshot
-                const concatenatedMessage = queueSnapshotRef.current.join("\n");
+                const concatenatedMessage = queueSnapshotRef.current.map((item) => item.text).join("\n");
 
                 if (concatenatedMessage.trim()) {
                   onSubmitRef.current(concatenatedMessage);
@@ -3556,7 +3560,7 @@ export default function App({
                 setMessageQueue([]);
 
                 // Concatenate the snapshot
-                const concatenatedMessage = queueSnapshotRef.current.join("\n");
+                const concatenatedMessage = queueSnapshotRef.current.map((item) => item.text).join("\n");
 
                 if (concatenatedMessage.trim()) {
                   onSubmitRef.current(concatenatedMessage);
@@ -3653,7 +3657,7 @@ export default function App({
                 queueApprovalResults(denialResults);
 
                 // Get queued messages and clear queue
-                const concatenatedMessage = queueSnapshotRef.current.join("\n");
+                const concatenatedMessage = queueSnapshotRef.current.map((item) => item.text).join("\n");
                 setMessageQueue([]);
 
                 // Send via onSubmit which will combine queuedApprovalResults + message
@@ -3953,7 +3957,7 @@ export default function App({
 
                     // Get queued messages and clear queue
                     const concatenatedMessage =
-                      queueSnapshotRef.current.join("\n");
+                      queueSnapshotRef.current.map((item) => item.text).join("\n");
                     setMessageQueue([]);
 
                     // Send via onSubmit
@@ -4023,7 +4027,7 @@ export default function App({
 
                   // Get queued messages and clear queue
                   const concatenatedMessage =
-                    queueSnapshotRef.current.join("\n");
+                    queueSnapshotRef.current.map((item) => item.text).join("\n");
                   setMessageQueue([]);
 
                   // Send via onSubmit
@@ -4757,8 +4761,19 @@ export default function App({
       setIsExecutingTool(false);
       toolResultsInFlightRef.current = false;
 
-      // Capture pending approvals BEFORE clearing - needed for fallback if cancel fails
+      // Capture pending approvals and enqueue denial results BEFORE clearing,
+      // so the next outbound message will clear the server-side approvals
+      // even if the cancel API call fails.
       const pendingApprovalsSnapshot = [...pendingApprovals];
+      if (pendingApprovalsSnapshot.length > 0) {
+        const denialResults = pendingApprovalsSnapshot.map((approval) => ({
+          type: "approval" as const,
+          tool_call_id: approval.toolCallId,
+          approve: false,
+          reason: "User interrupted the stream",
+        }));
+        queueApprovalResults(denialResults);
+      }
 
       // Clear any pending approvals since we're cancelling
       setPendingApprovals([]);
@@ -4769,27 +4784,24 @@ export default function App({
 
       refreshDerived();
 
-      // Send cancel request to backend with retry and fallback denial queueing
+      // Send cancel request to backend with retry on failure.
+      // If the cancel fails, the enqueued denial results above will clear
+      // server-side approvals on the next outbound message.
       const capturedAgentId = agentIdRef.current;
-      cancelWithFallbackDenials(
-        (client) => client.agents.messages.cancel(capturedAgentId),
-        pendingApprovalsSnapshot,
-        capturedAgentId,
-        () => agentIdRef.current,
-        queueApprovalResults,
-      );
+      getClient()
+        .then((client) => {
+          return client.agents.messages.cancel(capturedAgentId);
+        })
+        .catch(() => {
+          // Cancel failed - denial results already enqueued as fallback
+          debugLog("cancel", "Cancel API call failed, denials already enqueued as fallback");
+        });
 
       // Delay flag reset to ensure React has flushed state updates before dequeue can fire.
       // Use setTimeout(50) instead of setTimeout(0) - the longer delay ensures React's
       // batched state updates have been fully processed before we allow the dequeue effect.
       setTimeout(() => {
         userCancelledRef.current = false;
-        // Bump dequeueEpoch to trigger dequeue effect now that cancellation flag is cleared.
-        // Without this, queued messages would be stuck because the effect already ran
-        // (when streaming=false was set) but saw userCancelledRef.current=true and bailed.
-        if (messageQueueRef.current.length > 0) {
-          setDequeueEpoch((e) => e + 1);
-        }
       }, 50);
 
       return;
@@ -4849,24 +4861,35 @@ export default function App({
       }
       refreshDerived();
 
-      // Queue any auto-handled tool results (client-side tool executions that completed).
-      // Note: We do NOT queue approval denials here - the server-side cancel already
-      // handles creating denial messages for any pending approvals.
-      const autoHandledSnapshot = [...autoHandledResults];
-      const toolResults = autoHandledSnapshot.map((ar) => ({
-        type: "tool" as const,
-        tool_call_id: ar.toolCallId,
-        tool_return: ar.result.toolReturn,
-        status: ar.result.status,
-        stdout: ar.result.stdout,
-        stderr: ar.result.stderr,
+      // Cache pending approvals, plus any auto-handled results and auto-denied approvals, for the next message.
+      const denialResults = pendingApprovals.map((approval) => ({
+        type: "approval" as const,
+        tool_call_id: approval.toolCallId,
+        approve: false,
+        reason: "User interrupted the stream",
       }));
-      if (toolResults.length > 0) {
-        queueApprovalResults(toolResults);
+      const autoHandledSnapshot = [...autoHandledResults];
+      const autoDeniedSnapshot = [...autoDeniedApprovals];
+      const queuedResults = [
+        ...autoHandledSnapshot.map((ar) => ({
+          type: "tool" as const,
+          tool_call_id: ar.toolCallId,
+          tool_return: ar.result.toolReturn,
+          status: ar.result.status,
+          stdout: ar.result.stdout,
+          stderr: ar.result.stderr,
+        })),
+        ...autoDeniedSnapshot.map((ad) => ({
+          type: "approval" as const,
+          tool_call_id: ad.approval.toolCallId,
+          approve: false,
+          reason: ad.reason,
+        })),
+        ...denialResults,
+      ];
+      if (queuedResults.length > 0) {
+        queueApprovalResults(queuedResults);
       }
-
-      // Capture pending approvals BEFORE clearing - needed for fallback if cancel fails
-      const pendingApprovalsSnapshot = [...pendingApprovals];
 
       // Clear local approval state
       setPendingApprovals([]);
@@ -4875,16 +4898,21 @@ export default function App({
       setAutoHandledResults([]);
       setAutoDeniedApprovals([]);
 
-      // Send cancel request to backend with retry and fallback denial queueing
-      const capturedConversationId = conversationIdRef.current;
-      const capturedAgentId = agentIdRef.current;
-      cancelWithFallbackDenials(
-        (client) => client.conversations.cancel(capturedConversationId),
-        pendingApprovalsSnapshot,
-        capturedAgentId,
-        () => agentIdRef.current,
-        queueApprovalResults,
-      );
+      // Send cancel request to backend with retry on failure.
+      // If the cancel fails, the enqueued denial results above will clear
+      // server-side approvals on the next outbound message.
+      getClient()
+        .then((client) => {
+          // Use agents API for "default" conversation (primary message history)
+          if (conversationIdRef.current === "default") {
+            return client.agents.messages.cancel(agentIdRef.current);
+          }
+          return client.conversations.cancel(conversationIdRef.current);
+        })
+        .catch(() => {
+          // Cancel failed - denial results already enqueued as fallback
+          debugLog("cancel", "Cancel API call failed, denials already enqueued as fallback");
+        });
 
       // Reset cancellation flags after cleanup is complete.
       // Use setTimeout(50) instead of setTimeout(0) to ensure React has fully processed
@@ -4893,12 +4921,6 @@ export default function App({
       setTimeout(() => {
         userCancelledRef.current = false;
         setInterruptRequested(false);
-        // Bump dequeueEpoch to trigger dequeue effect now that cancellation flag is cleared.
-        // Without this, queued messages would be stuck because the effect already ran
-        // (when streaming=false was set) but saw userCancelledRef.current=true and bailed.
-        if (messageQueueRef.current.length > 0) {
-          setDequeueEpoch((e) => e + 1);
-        }
       }, 50);
 
       return;

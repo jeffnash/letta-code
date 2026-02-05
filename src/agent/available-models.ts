@@ -143,3 +143,14 @@ export async function getModelContextWindow(
   }
   return cache?.contextWindows.get(handle);
 }
+
+/**
+ * Synchronous version of getModelContextWindow.
+ * Reads from the in-memory cache without triggering a network fetch.
+ * Returns undefined if the cache hasn't been populated yet or handle not found.
+ */
+export function getModelContextWindowSync(
+  handle: string,
+): number | undefined {
+  return cache?.contextWindows.get(handle);
+}

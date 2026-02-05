@@ -1,4 +1,6 @@
+import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
 import { getClient } from "./client";
+import { APPROVAL_RECOVERY_PROMPT } from "./promptAssets";
 
 // Error when approval tool call IDs don't match what server expects
 // Format: "Invalid tool call IDs: Expected [...], got [...]"
@@ -84,5 +86,13 @@ export async function fetchRunErrorDetail(
   } catch {
     return null;
   }
+}
+
+export function buildApprovalRecoveryMessage(): MessageCreate {
+  return {
+    type: "message",
+    role: "user",
+    content: [{ type: "text", text: APPROVAL_RECOVERY_PROMPT }],
+  };
 }
 

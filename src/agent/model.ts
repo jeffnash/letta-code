@@ -4,7 +4,7 @@
 import modelsData from "../models.json";
 import {
   getAvailableModelHandles,
-  getModelContextWindow,
+  getModelContextWindowSync,
 } from "./available-models";
 
 export const models = modelsData;
@@ -230,8 +230,8 @@ export function getModelUpdateArgs(
   }
 
   // For dynamic models (not in static list), return sensible defaults
-  // Try to get context window from cached server response
-  const contextWindow = getModelContextWindow(modelIdentifier);
+  // Try to get context window from cached server response (synchronous cache read)
+  const contextWindow = getModelContextWindowSync(modelIdentifier);
 
   return applySafetyToUpdateArgs({
     context_window:
