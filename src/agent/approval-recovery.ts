@@ -1,10 +1,4 @@
-import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
 import { getClient } from "./client";
-import { APPROVAL_RECOVERY_PROMPT } from "./promptAssets";
-
-// Error when trying to SEND approval but server has no pending approval
-const APPROVAL_RECOVERY_DETAIL_FRAGMENT =
-  "no tool call is currently awaiting approval";
 
 // Error when approval tool call IDs don't match what server expects
 // Format: "Invalid tool call IDs: Expected [...], got [...]"
@@ -29,15 +23,6 @@ type RunErrorMetadata =
     }
   | undefined
   | null;
-
-export function isApprovalStateDesyncError(detail: unknown): boolean {
-  if (typeof detail !== "string") return false;
-  const lower = detail.toLowerCase();
-  return (
-    lower.includes(APPROVAL_RECOVERY_DETAIL_FRAGMENT) ||
-    lower.includes(INVALID_TOOL_CALL_IDS_FRAGMENT)
-  );
-}
 
 /**
  * Check if error specifically indicates tool call ID mismatch.
@@ -101,96 +86,3 @@ export async function fetchRunErrorDetail(
   }
 }
 
-export function buildApprovalRecoveryMessage(): MessageCreate {
-  return {
-    type: "message",
-    role: "user",
-    content: [{ type: "text", text: APPROVAL_RECOVERY_PROMPT }],
-  };
-}
-
-/**
- * Pending approval info needed for fallback denial queueing
- */
-export interface PendingApprovalInfo {
-  toolCallId: string;
-}
-
-/**
- * Approval denial result format for queueing
- */
-export interface ApprovalDenialResult {
-  type: "approval";
-  tool_call_id: string;
-  approve: false;
-  reason: string;
-}
-
-/**
- * Send a cancel request to the backend with retry and fallback denial queueing.
- *
- * - Tries the cancel request with one retry (100ms delay between attempts)
- * - If cancel fails and there were pending approvals, queues denial results as fallback
- * - Guards against agent changes during async operations
- *
- * @param cancelFn - Function that performs the actual cancel (called with client)
- * @param pendingApprovals - Snapshot of pending approvals to deny if cancel fails
- * @param currentAgentId - Agent ID at time of interrupt (for stale check)
- * @param getAgentId - Function to get current agent ID (for stale check)
- * @param queueDenials - Function to queue denial results
- */
-export async function cancelWithFallbackDenials(
-  cancelFn: (
-    client: Awaited<ReturnType<typeof getClient>>,
-  ) => Promise<{ [key: string]: unknown }>,
-  pendingApprovals: PendingApprovalInfo[],
-  currentAgentId: string,
-  getAgentId: () => string,
-  queueDenials: (denials: ApprovalDenialResult[]) => void,
-): Promise<void> {
-  const queueFallbackDenials = () => {
-    if (pendingApprovals.length > 0 && currentAgentId === getAgentId()) {
-      const fallbackDenials: ApprovalDenialResult[] = pendingApprovals.map(
-        (a) => ({
-          type: "approval" as const,
-          tool_call_id: a.toolCallId,
-          approve: false as const,
-          reason: "User cancelled (cancel request failed)",
-        }),
-      );
-      queueDenials(fallbackDenials);
-    }
-  };
-
-  try {
-    const client = await getClient();
-
-    // Bail if agent changed during getClient
-    if (currentAgentId !== getAgentId()) {
-      return;
-    }
-
-    // Try cancel with one retry on failure
-    let cancelSucceeded = false;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        await cancelFn(client);
-        cancelSucceeded = true;
-        break;
-      } catch {
-        if (attempt === 0) {
-          // Brief pause before retry
-          await new Promise((r) => setTimeout(r, 100));
-        }
-      }
-    }
-
-    // If cancel failed, queue fallback denials
-    if (!cancelSucceeded) {
-      queueFallbackDenials();
-    }
-  } catch {
-    // getClient failed - queue fallback denials
-    queueFallbackDenials();
-  }
-}

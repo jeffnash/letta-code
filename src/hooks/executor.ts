@@ -29,13 +29,21 @@ function trySpawnWithLauncher(
     throw new Error("Empty launcher");
   }
 
+  // Extract agent_id if present (available on many hook input types)
+  const agentId = "agent_id" in input ? input.agent_id : undefined;
+
+  // Build environment: start with parent env but exclude LETTA_AGENT_ID to prevent inheritance
+  // We only want to pass the agent ID that's explicitly provided in the hook input
+  const { LETTA_AGENT_ID: _, ...parentEnv } = process.env;
+
   return spawn(executable, args, {
     cwd: workingDirectory,
     env: {
-      ...process.env,
+      ...parentEnv,
       // Add hook-specific environment variables
       LETTA_HOOK_EVENT: input.event_type,
       LETTA_WORKING_DIR: workingDirectory,
+      ...(agentId && { LETTA_AGENT_ID: agentId }),
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -144,13 +152,23 @@ function executeWithLauncher(
       if (!resolved) {
         resolved = true;
         // Log hook completion with command for context
-        const exitLabel =
+        // Show exit code with color: green for 0, red for 2, yellow for errors
+        const exitCode =
           result.exitCode === HookExitCode.ALLOW
-            ? "\x1b[32m✓ allowed\x1b[0m"
+            ? 0
             : result.exitCode === HookExitCode.BLOCK
-              ? "\x1b[31m✗ blocked\x1b[0m"
-              : "\x1b[33m⚠ error\x1b[0m";
-        console.log(`\x1b[90m[hook] ${command}\x1b[0m`);
+              ? 2
+              : 1;
+        const exitColor =
+          result.exitCode === HookExitCode.ALLOW
+            ? "\x1b[32m"
+            : result.exitCode === HookExitCode.BLOCK
+              ? "\x1b[31m"
+              : "\x1b[33m";
+        const exitLabel = result.timedOut
+          ? `${exitColor}timeout\x1b[0m`
+          : `${exitColor}exit ${exitCode}\x1b[0m`;
+        console.log(`\x1b[90m[hook:${input.event_type}] ${command}\x1b[0m`);
         console.log(
           `\x1b[90m  \u23BF ${exitLabel} (${result.durationMs}ms)\x1b[0m`,
         );
@@ -353,6 +371,21 @@ export async function executeHooksParallel(
     const result = results[i];
     const hook = hooks[i];
     if (!result || !hook) continue;
+
+    // For exit 0, try to parse JSON for additionalContext (matching Claude Code behavior)
+    if (result.exitCode === HookExitCode.ALLOW && result.stdout?.trim()) {
+      try {
+        const json = JSON.parse(result.stdout.trim());
+        const additionalContext =
+          json?.hookSpecificOutput?.additionalContext ||
+          json?.additionalContext;
+        if (additionalContext) {
+          feedback.push(additionalContext);
+        }
+      } catch {
+        // Not JSON, ignore
+      }
+    }
 
     // Format: [command]: {stderr} per spec
     if (result.exitCode === HookExitCode.BLOCK) {

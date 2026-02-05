@@ -1,6 +1,6 @@
 import type { Letta } from "@letta-ai/letta-client";
 import type { AgentState } from "@letta-ai/letta-client/resources/agents/agents";
-import { Box, Text, useInput } from "ink";
+import { Box, useInput } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getClient } from "../../agent/client";
 import { getModelDisplayName } from "../../agent/model";
@@ -12,6 +12,7 @@ import {
 } from "./agentSelectorKeyboard";
 import { colors } from "./colors";
 import { MarkdownDisplay } from "./MarkdownDisplay";
+import { Text } from "./Text";
 
 // Horizontal line character (matches approval dialogs)
 const SOLID_LINE = "─";

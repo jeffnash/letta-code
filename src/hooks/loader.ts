@@ -2,6 +2,7 @@
 // Loads and matches hooks from settings-manager
 
 import { settingsManager } from "../settings-manager";
+import { debugLog } from "../utils/debug";
 import {
   type HookCommand,
   type HookEvent,
@@ -27,8 +28,9 @@ export function clearHooksCache(): void {
 export function loadGlobalHooks(): HooksConfig {
   try {
     return settingsManager.getSettings().hooks || {};
-  } catch {
+  } catch (error) {
     // Settings not initialized yet
+    debugLog("hooks", "loadGlobalHooks: Settings not initialized yet", error);
     return {};
   }
 }
@@ -48,8 +50,9 @@ export async function loadProjectHooks(
       await settingsManager.loadProjectSettings(workingDirectory);
     }
     return settingsManager.getProjectSettings(workingDirectory)?.hooks || {};
-  } catch {
+  } catch (error) {
     // Settings not available
+    debugLog("hooks", "loadProjectHooks: Settings not available", error);
     return {};
   }
 }
@@ -71,8 +74,9 @@ export async function loadProjectLocalHooks(
     return (
       settingsManager.getLocalProjectSettings(workingDirectory)?.hooks || {}
     );
-  } catch {
+  } catch (error) {
     // Settings not available
+    debugLog("hooks", "loadProjectLocalHooks: Settings not available", error);
     return {};
   }
 }
@@ -162,8 +166,13 @@ export function matchesTool(pattern: string, toolName: string): boolean {
   try {
     const regex = new RegExp(`^(?:${pattern})$`);
     return regex.test(toolName);
-  } catch {
+  } catch (error) {
     // Invalid regex, fall back to exact match
+    debugLog(
+      "hooks",
+      `matchesTool: Invalid regex pattern "${pattern}", falling back to exact match`,
+      error,
+    );
     return pattern === toolName;
   }
 }
@@ -240,6 +249,74 @@ export function hasHooksForEvent(
 }
 
 /**
+ * Check if all hooks are disabled via hooks.disabled across settings levels.
+ *
+ * Precedence:
+ * 1. If user has disabled: false → ENABLED (explicit user override)
+ * 2. If user has disabled: true → DISABLED
+ * 3. If project OR project-local has disabled: true → DISABLED
+ * 4. Default → ENABLED
+ */
+export function areHooksDisabled(
+  workingDirectory: string = process.cwd(),
+): boolean {
+  try {
+    // Check user-level settings first (highest precedence)
+    const userDisabled = settingsManager.getSettings().hooks?.disabled;
+    if (userDisabled === false) {
+      // User explicitly enabled - overrides project settings
+      return false;
+    }
+    if (userDisabled === true) {
+      // User explicitly disabled
+      return true;
+    }
+
+    // User setting is undefined, check project-level settings
+    try {
+      const projectDisabled =
+        settingsManager.getProjectSettings(workingDirectory)?.hooks?.disabled;
+      if (projectDisabled === true) {
+        return true;
+      }
+    } catch (error) {
+      // Project settings not loaded, skip
+      debugLog(
+        "hooks",
+        "areHooksDisabled: Project settings not loaded, skipping",
+        error,
+      );
+    }
+
+    // Check project-local settings
+    try {
+      const localDisabled =
+        settingsManager.getLocalProjectSettings(workingDirectory)?.hooks
+          ?.disabled;
+      if (localDisabled === true) {
+        return true;
+      }
+    } catch (error) {
+      // Local project settings not loaded, skip
+      debugLog(
+        "hooks",
+        "areHooksDisabled: Local project settings not loaded, skipping",
+        error,
+      );
+    }
+
+    return false;
+  } catch (error) {
+    debugLog(
+      "hooks",
+      "areHooksDisabled: Failed to check hooks disabled status",
+      error,
+    );
+    return false;
+  }
+}
+
+/**
  * Convenience function to load hooks and get matching ones for an event
  */
 export async function getHooksForEvent(
@@ -247,6 +324,11 @@ export async function getHooksForEvent(
   toolName?: string,
   workingDirectory: string = process.cwd(),
 ): Promise<HookCommand[]> {
+  // Check if all hooks are disabled
+  if (areHooksDisabled(workingDirectory)) {
+    return [];
+  }
+
   const config = await loadHooks(workingDirectory);
   return getMatchingHooks(config, event, toolName);
 }

@@ -5,7 +5,9 @@ import type {
   Message,
   TextContent,
 } from "@letta-ai/letta-client/resources/agents/messages";
+import { SYSTEM_REMINDER_CLOSE, SYSTEM_REMINDER_OPEN } from "../../constants";
 import type { Buffers } from "./accumulator";
+import { extractTaskNotificationsForDisplay } from "./taskNotifications";
 
 /**
  * Extract displayable text from tool return content.
@@ -25,14 +27,7 @@ function getDisplayableToolReturn(
     .join("\n");
 }
 
-// const PASTE_LINE_THRESHOLD = 5;
-// const PASTE_CHAR_THRESHOLD = 500;
 const CLIP_CHAR_LIMIT_TEXT = 500;
-// const CLIP_CHAR_LIMIT_JSON = 1000;
-
-// function countLines(text: string): number {
-//   return (text.match(/\r\n|\r|\n/g) || []).length + 1;
-// }
 
 function clip(s: string, limit: number): string {
   if (!s) return "";
@@ -40,10 +35,54 @@ function clip(s: string, limit: number): string {
 }
 
 /**
+ * Normalize line endings: convert \r\n and \r to \n
+ */
+function normalizeLineEndings(s: string): string {
+  return s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+/**
+ * Truncate system-reminder content while preserving opening/closing tags.
+ * Removes the middle content and replaces with [...] to keep the message compact
+ * but with proper tag structure.
+ */
+function truncateSystemReminder(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+
+  const openIdx = text.indexOf(SYSTEM_REMINDER_OPEN);
+  const closeIdx = text.lastIndexOf(SYSTEM_REMINDER_CLOSE);
+
+  if (openIdx === -1 || closeIdx === -1 || closeIdx <= openIdx) {
+    // Malformed, just use regular clip
+    return clip(text, maxLength);
+  }
+
+  const openEnd = openIdx + SYSTEM_REMINDER_OPEN.length;
+  const ellipsis = "\n...\n";
+
+  // Calculate available space for content (split between start and end)
+  const overhead =
+    SYSTEM_REMINDER_OPEN.length +
+    SYSTEM_REMINDER_CLOSE.length +
+    ellipsis.length;
+  const availableContent = maxLength - overhead;
+  if (availableContent <= 0) {
+    // Not enough space, just show tags with ellipsis
+    return `${SYSTEM_REMINDER_OPEN}${ellipsis}${SYSTEM_REMINDER_CLOSE}`;
+  }
+
+  const halfContent = Math.floor(availableContent / 2);
+  const contentStart = text.slice(openEnd, openEnd + halfContent);
+  const contentEnd = text.slice(closeIdx - halfContent, closeIdx);
+
+  return `${SYSTEM_REMINDER_OPEN}${contentStart}${ellipsis}${contentEnd}${SYSTEM_REMINDER_CLOSE}`;
+}
+
+/**
  * Check if a user message is a compaction summary (system_alert with summary content).
  * Returns the summary text if found, null otherwise.
  */
-function extractCompactionSummary(text: string): string | null {
+export function extractCompactionSummary(text: string): string | null {
   try {
     const parsed = JSON.parse(text);
     if (
@@ -80,24 +119,45 @@ function renderAssistantContentParts(
   return out;
 }
 
+/**
+ * Check if text is purely a system-reminder block (no user content before/after).
+ */
+function isOnlySystemReminder(text: string): boolean {
+  const trimmed = text.trim();
+  return (
+    trimmed.startsWith(SYSTEM_REMINDER_OPEN) &&
+    trimmed.endsWith(SYSTEM_REMINDER_CLOSE)
+  );
+}
+
 function renderUserContentParts(
   parts: string | LettaUserMessageContentUnion[],
 ): string {
   // UserContent can be a string or an array of text OR image parts
-  // for text parts, we clip them if they're too big (eg copy-pasted chunks)
-  // for image parts, we just show a placeholder
+  // Pure system-reminder parts are truncated (middle) to preserve tags
+  // Mixed content or user text uses simple end truncation
+  // Parts are joined with newlines so each appears as a separate line
   if (typeof parts === "string") return parts;
 
-  let out = "";
+  const rendered: string[] = [];
   for (const p of parts) {
     if (p.type === "text") {
       const text = p.text || "";
-      out += clip(text, CLIP_CHAR_LIMIT_TEXT);
+      // Normalize line endings (\r\n and \r -> \n) to prevent terminal garbling
+      const normalized = normalizeLineEndings(text);
+      if (isOnlySystemReminder(normalized)) {
+        // Pure system-reminder: truncate middle to preserve tags
+        rendered.push(truncateSystemReminder(normalized, CLIP_CHAR_LIMIT_TEXT));
+      } else {
+        // User content or mixed: simple end truncation
+        rendered.push(clip(normalized, CLIP_CHAR_LIMIT_TEXT));
+      }
     } else if (p.type === "image") {
-      out += `[Image]`;
+      rendered.push("[Image]");
     }
   }
-  return out;
+  // Join with double-newline so each part starts a new paragraph (gets "> " prefix)
+  return rendered.join("\n\n");
 }
 
 export function backfillBuffers(buffers: Buffers, history: Message[]): void {
@@ -119,33 +179,52 @@ export function backfillBuffers(buffers: Buffers, history: Message[]): void {
       // user message - content parts may include text and image parts
       case "user_message": {
         const rawText = renderUserContentParts(msg.content);
+        const { notifications, cleanedText } =
+          extractTaskNotificationsForDisplay(rawText);
 
-        // Check if this is a compaction summary message (system_alert with summary)
-        const compactionSummary = extractCompactionSummary(rawText);
+        if (notifications.length > 0) {
+          let notifIndex = 0;
+          for (const summary of notifications) {
+            const notifId = `${lineId}-task-${notifIndex++}`;
+            const exists = buffers.byId.has(notifId);
+            buffers.byId.set(notifId, {
+              kind: "event",
+              id: notifId,
+              eventType: "task_notification",
+              eventData: {},
+              phase: "finished",
+              summary,
+            });
+            if (!exists) buffers.order.push(notifId);
+          }
+        }
+
+        // Check if this is a compaction summary message (old format embedded in user_message)
+        const compactionSummary = extractCompactionSummary(cleanedText);
         if (compactionSummary) {
-          // Render as a synthetic tool call showing the compaction
+          // Render as a finished compaction event
           const exists = buffers.byId.has(lineId);
           buffers.byId.set(lineId, {
-            kind: "tool_call",
+            kind: "event",
             id: lineId,
-            toolCallId: `compaction-${lineId}`,
-            name: "Compact",
-            argsText: "messages[...]",
-            resultText: compactionSummary,
-            resultOk: true,
+            eventType: "compaction",
+            eventData: {},
             phase: "finished",
+            summary: compactionSummary,
           });
           if (!exists) buffers.order.push(lineId);
           break;
         }
 
-        const exists = buffers.byId.has(lineId);
-        buffers.byId.set(lineId, {
-          kind: "user",
-          id: lineId,
-          text: rawText,
-        });
-        if (!exists) buffers.order.push(lineId);
+        if (cleanedText) {
+          const exists = buffers.byId.has(lineId);
+          buffers.byId.set(lineId, {
+            kind: "user",
+            id: lineId,
+            text: cleanedText,
+          });
+          if (!exists) buffers.order.push(lineId);
+        }
         break;
       }
 
@@ -278,8 +357,74 @@ export function backfillBuffers(buffers: Buffers, history: Message[]): void {
         break;
       }
 
-      default:
-        break; // ignore other message types
+      default: {
+        // Handle new compaction message types (when include_compaction_messages=true)
+        // These are not yet in the SDK types, so we handle them via string comparison
+        const msgType = msg.message_type as string | undefined;
+
+        if (msgType === "summary_message") {
+          // SummaryMessage has: summary (str), compaction_stats (optional)
+          const summaryMsg = msg as Message & {
+            summary?: string;
+            compaction_stats?: {
+              trigger?: string;
+              context_tokens_before?: number;
+              context_tokens_after?: number;
+              context_window?: number;
+              messages_count_before?: number;
+              messages_count_after?: number;
+            };
+          };
+
+          const summaryText = summaryMsg.summary || "";
+          const stats = summaryMsg.compaction_stats;
+
+          // Find the most recent compaction event line and update it with summary and stats
+          for (let i = buffers.order.length - 1; i >= 0; i--) {
+            const orderId = buffers.order[i];
+            if (!orderId) continue;
+            const line = buffers.byId.get(orderId);
+            if (line?.kind === "event" && line.eventType === "compaction") {
+              line.phase = "finished";
+              line.summary = summaryText;
+              if (stats) {
+                line.stats = {
+                  trigger: stats.trigger,
+                  contextTokensBefore: stats.context_tokens_before,
+                  contextTokensAfter: stats.context_tokens_after,
+                  contextWindow: stats.context_window,
+                  messagesCountBefore: stats.messages_count_before,
+                  messagesCountAfter: stats.messages_count_after,
+                };
+              }
+              break;
+            }
+          }
+          break;
+        }
+
+        if (msgType === "event_message") {
+          // EventMessage has: event_type (str), event_data (dict)
+          const eventMsg = msg as Message & {
+            event_type?: string;
+            event_data?: Record<string, unknown>;
+          };
+
+          const exists = buffers.byId.has(lineId);
+          buffers.byId.set(lineId, {
+            kind: "event",
+            id: lineId,
+            eventType: eventMsg.event_type || "unknown",
+            eventData: eventMsg.event_data || {},
+            phase: "finished", // In backfill, events are always finished (summary already processed)
+          });
+          if (!exists) buffers.order.push(lineId);
+          break;
+        }
+
+        // ignore other message types
+        break;
+      }
     }
   }
 

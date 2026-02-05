@@ -24,6 +24,7 @@ import { sessionPermissions } from "../../permissions/session";
 import { settingsManager } from "../../settings-manager";
 import { preloadSkillsContent } from "../../tools/impl/Skill";
 import { getErrorMessage } from "../../utils/error";
+import { getAvailableModelHandles } from "../available-models";
 import { getClient } from "../client";
 import { getCurrentAgentId } from "../context";
 import { getDefaultModel, resolveModel, resolveModelAsync } from "../model";
@@ -75,6 +76,17 @@ interface ExecutionState {
  * Get the primary agent's model handle.
  * Fetches from API and resolves to a concrete handle when possible.
  */
+function getModelHandleFromAgent(agent: {
+  llm_config?: { model_endpoint_type?: string | null; model?: string | null };
+}): string | null {
+  const endpoint = agent.llm_config?.model_endpoint_type;
+  const model = agent.llm_config?.model;
+  if (endpoint && model) {
+    return `${endpoint}/${model}`;
+  }
+  return model || null;
+}
+
 export async function getPrimaryAgentModelHandle(): Promise<
   string | undefined
 > {
@@ -82,20 +94,7 @@ export async function getPrimaryAgentModelHandle(): Promise<
     const agentId = getCurrentAgentId();
     const client = await getClient();
     const agent = await client.agents.retrieve(agentId);
-    const llmConfig = agent.llm_config as
-      | { model?: string; handle?: string }
-      | undefined;
-    if (llmConfig?.handle) {
-      return llmConfig.handle;
-    }
-
-    const model = llmConfig?.model;
-    if (!model) {
-      return undefined;
-    }
-
-    const resolved = await resolveModelAsync(model);
-    return resolved ?? undefined;
+    return getModelHandleFromAgent(agent) ?? undefined;
   } catch {
     return undefined;
   }
@@ -110,6 +109,111 @@ function isProviderNotSupportedError(errorOutput: string): boolean {
     errorOutput.includes("is not supported") &&
     errorOutput.includes("supported providers:")
   );
+}
+
+const BYOK_PROVIDER_TO_BASE: Record<string, string> = {
+  "lc-anthropic": "anthropic",
+  "lc-openai": "openai",
+  "lc-zai": "zai",
+  "lc-gemini": "google_ai",
+  "lc-openrouter": "openrouter",
+  "lc-minimax": "minimax",
+  "lc-bedrock": "bedrock",
+  "chatgpt-plus-pro": "chatgpt-plus-pro",
+};
+
+function getProviderPrefix(handle: string): string | null {
+  const slashIndex = handle.indexOf("/");
+  if (slashIndex === -1) return null;
+  return handle.slice(0, slashIndex);
+}
+
+function swapProviderPrefix(
+  parentHandle: string,
+  recommendedHandle: string,
+): string | null {
+  const parentProvider = getProviderPrefix(parentHandle);
+  if (!parentProvider) return null;
+
+  const baseProvider = BYOK_PROVIDER_TO_BASE[parentProvider];
+  if (!baseProvider) return null;
+
+  const recommendedProvider = getProviderPrefix(recommendedHandle);
+  if (!recommendedProvider || recommendedProvider !== baseProvider) return null;
+
+  const modelPortion = recommendedHandle.slice(recommendedProvider.length + 1);
+  return `${parentProvider}/${modelPortion}`;
+}
+
+export async function resolveSubagentModel(options: {
+  userModel?: string;
+  recommendedModel?: string;
+  parentModelHandle?: string | null;
+  availableHandles?: Set<string>;
+}): Promise<string | null> {
+  const { userModel, recommendedModel, parentModelHandle } = options;
+
+  if (userModel) return userModel;
+
+  let recommendedHandle: string | null = null;
+  if (recommendedModel && recommendedModel !== "inherit") {
+    recommendedHandle = resolveModel(recommendedModel);
+  }
+
+  let availableHandles: Set<string> | null = options.availableHandles ?? null;
+  const isAvailable = async (handle: string): Promise<boolean> => {
+    try {
+      if (!availableHandles) {
+        const result = await getAvailableModelHandles();
+        availableHandles = result.handles;
+      }
+      return availableHandles.has(handle);
+    } catch {
+      return false;
+    }
+  };
+
+  if (parentModelHandle) {
+    const parentProvider = getProviderPrefix(parentModelHandle);
+    const parentBaseProvider = parentProvider
+      ? BYOK_PROVIDER_TO_BASE[parentProvider]
+      : null;
+    const parentIsByok = !!parentBaseProvider;
+
+    if (recommendedHandle) {
+      const recommendedProvider = getProviderPrefix(recommendedHandle);
+
+      if (parentIsByok) {
+        if (recommendedProvider === parentProvider) {
+          if (await isAvailable(recommendedHandle)) {
+            return recommendedHandle;
+          }
+        } else {
+          const swapped = swapProviderPrefix(
+            parentModelHandle,
+            recommendedHandle,
+          );
+          if (swapped && (await isAvailable(swapped))) {
+            return swapped;
+          }
+        }
+
+        return parentModelHandle;
+      }
+
+      if (await isAvailable(recommendedHandle)) {
+        return recommendedHandle;
+      }
+    }
+
+    return parentModelHandle;
+  }
+
+  if (recommendedHandle && (await isAvailable(recommendedHandle))) {
+    return recommendedHandle;
+  }
+
+  return recommendedHandle;
 }
 
 /**
@@ -368,6 +472,7 @@ function buildSubagentArgs(
   existingAgentId?: string,
   existingConversationId?: string,
   preloadedSkillsContent?: string,
+  maxTurns?: number,
 ): string[] {
   const args: string[] = [];
   const isDeployingExisting = Boolean(
@@ -454,6 +559,11 @@ function buildSubagentArgs(
     args.push("--block-value", `loaded_skills=${preloadedSkillsContent}`);
   }
 
+  // Add max turns limit if specified
+  if (maxTurns !== undefined && maxTurns > 0) {
+    args.push("--max-turns", String(maxTurns));
+  }
+
   return args;
 }
 
@@ -482,6 +592,7 @@ async function executeSubagent(
   signal?: AbortSignal,
   existingAgentId?: string,
   existingConversationId?: string,
+  maxTurns?: number,
 ): Promise<SubagentResult> {
   // Check if already aborted before starting
   if (signal?.aborted) {
@@ -516,6 +627,7 @@ async function executeSubagent(
       existingAgentId,
       existingConversationId,
       preloadedSkillsContent,
+      maxTurns,
     );
 
     // Spawn Letta Code in headless mode.
@@ -610,29 +722,6 @@ async function executeSubagent(
 
     // Handle non-zero exit code
     if (exitCode !== 0) {
-      // Check for rate limit errors - try next model in expansion chain
-      if (isRateLimitError(stderr) && expansionChain.length > 0) {
-        // Find next available model in the chain after current one
-        const nextIndex = chainIndex + 1;
-        const nextModel = expansionChain[nextIndex];
-        if (nextIndex < expansionChain.length && nextModel) {
-          console.warn(
-            `[subagent] Rate limit error on ${model}, trying next model in chain: ${nextModel}`,
-          );
-          return executeSubagent(
-            type,
-            config,
-            nextModel,
-            userPrompt,
-            agentDisplayURL,
-            subagentId,
-            expansionChain,
-            nextIndex,
-            signal,
-          );
-        }
-      }
-
       // Check if this is a recoverable model error
       const isRecoverableError =
         isProviderNotSupportedError(stderr) || isUnknownModelError(stderr);
@@ -672,6 +761,9 @@ async function executeSubagent(
             [], // No chain for fallback
             0,
             signal,
+            undefined, // existingAgentId
+            undefined, // existingConversationId
+            maxTurns,
           );
         }
       }
@@ -901,6 +993,7 @@ export async function spawnSubagent(
   signal?: AbortSignal,
   existingAgentId?: string,
   existingConversationId?: string,
+  maxTurns?: number,
 ): Promise<SubagentResult> {
   const allConfigs = await getAllSubagentConfigs();
   const config = allConfigs[type];
@@ -918,14 +1011,13 @@ export async function spawnSubagent(
     existingAgentId || existingConversationId,
   );
 
+  const parentModelHandle = await getPrimaryAgentModelHandle();
+
   // For existing agents, don't override model; for new agents, resolve using our selector logic
   let model: string | null = null;
   let expansionChain: string[] = [];
 
   if (!isDeployingExisting) {
-    // Get parent agent's model for 'inherit' resolution
-    const parentModelHandle = await getPrimaryAgentModelHandle();
-
     // Resolve model using the server's selector resolver
     // We get both the resolved model AND the expansion chain for rate limit fallback
     if (userModel) {
@@ -1020,6 +1112,7 @@ export async function spawnSubagent(
     signal,
     existingAgentId,
     existingConversationId,
+    maxTurns,
   );
 
   return result;
