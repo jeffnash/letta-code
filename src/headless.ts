@@ -770,7 +770,6 @@ export async function handleHeadlessCommand(
   // Set conversation ID in context for tools (e.g., Skill tool) to access
   setConversationId(conversationId);
   clearSkillBlockCache();
-  clearSkillBlockCache();
 
   // Save session (agent + conversation) to both project and global settings
   // Skip for subagents - they shouldn't pollute the LRU settings

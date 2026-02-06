@@ -4790,7 +4790,10 @@ export default function App({
       const capturedAgentId = agentIdRef.current;
       getClient()
         .then((client) => {
-          return client.agents.messages.cancel(capturedAgentId);
+          if (conversationIdRef.current === "default") {
+            return client.agents.messages.cancel(capturedAgentId);
+          }
+          return client.conversations.cancel(conversationIdRef.current);
         })
         .catch(() => {
           // Cancel failed - denial results already enqueued as fallback
@@ -6313,11 +6316,39 @@ export default function App({
               conversationId: conversation.id,
             });
 
+            // Clear current transcript, static items, and streaming state
+            buffersRef.current.byId.clear();
+            buffersRef.current.order = [];
+            buffersRef.current.tokenCount = 0;
+            buffersRef.current.usage = {
+              promptTokens: 0,
+              completionTokens: 0,
+              totalTokens: 0,
+              cachedTokens: 0,
+              reasoningTokens: 0,
+              stepCount: 0,
+            };
+            emittedIdsRef.current.clear();
+            resetDeferredToolCallCommits();
+            setStaticItems([]);
+            setStaticRenderEpoch((e) => e + 1);
+            resetTrajectoryBases();
+            setTokenCount(0);
+
             // Reset context tokens for new conversation
             buffersRef.current.lastContextTokens = 0;
 
             // Reset turn counter for memory reminders
             turnCountRef.current = 0;
+
+            // Clear queued-message state to avoid cross-session leakage
+            setMessageQueue([]);
+            messageQueueRef.current = [];
+            queueSnapshotRef.current = [];
+            waitingForQueueCancelRef.current = false;
+            setRestoreQueueOnCancel(false);
+            lastDequeuedMessageRef.current = null;
+            overrideContentPartsRef.current = null;
 
             // Re-run SessionStart hooks for new conversation
             sessionHooksRanRef.current = false;
@@ -8850,7 +8881,11 @@ ${SYSTEM_REMINDER_CLOSE}
         `Dequeuing ${messageQueue.length} message(s): "${concatenatedMessage.slice(0, 50)}${concatenatedMessage.length > 50 ? "..." : ""}"`,
       );
 
-      // Submit the first message using the normal submit flow
+      // Store the message before clearing queue - allows restoration on error
+      lastDequeuedMessageRef.current = concatenatedMessage;
+      setMessageQueue([]);
+
+      // Submit the concatenated message using the normal submit flow
       // This ensures all setup (reminders, UI updates, etc.) happens correctly
       overrideContentPartsRef.current = queuedContentParts;
       onSubmitRef.current(concatenatedMessage);

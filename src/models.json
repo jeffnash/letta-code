@@ -108,6 +108,42 @@
     }
   },
   {
+    "id": "gpt-5.3-codex-plus-pro-medium",
+    "handle": "chatgpt-plus-pro/gpt-5.3-codex",
+    "label": "GPT-5.3 Codex",
+    "description": "GPT-5.3 Codex (med reasoning) via ChatGPT Plus/Pro",
+    "updateArgs": {
+      "reasoning_effort": "medium",
+      "verbosity": "medium",
+      "context_window": 272000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "gpt-5.3-codex-plus-pro-high",
+    "handle": "chatgpt-plus-pro/gpt-5.3-codex",
+    "label": "GPT-5.3 Codex",
+    "description": "GPT-5.3 Codex (high reasoning) via ChatGPT Plus/Pro",
+    "updateArgs": {
+      "reasoning_effort": "high",
+      "verbosity": "medium",
+      "context_window": 272000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "gpt-5.3-codex-plus-pro-xhigh",
+    "handle": "chatgpt-plus-pro/gpt-5.3-codex",
+    "label": "GPT-5.3 Codex",
+    "description": "GPT-5.3 Codex (extra-high reasoning) via ChatGPT Plus/Pro",
+    "updateArgs": {
+      "reasoning_effort": "xhigh",
+      "verbosity": "medium",
+      "context_window": 272000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
     "id": "gpt-5.1-codex-plus-pro-medium",
     "handle": "chatgpt-plus-pro/gpt-5.1-codex",
     "label": "GPT-5.1 Codex",
@@ -294,6 +330,55 @@
     "handle": "openai/gpt-5.2-codex",
     "label": "GPT-5.2-Codex",
     "description": "GPT-5.2 variant (max reasoning) optimized for coding",
+    "updateArgs": {
+      "reasoning_effort": "xhigh",
+      "verbosity": "medium",
+      "context_window": 272000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "gpt-5.3-codex-low",
+    "handle": "openai/gpt-5.3-codex",
+    "label": "GPT-5.3-Codex",
+    "description": "GPT-5.3 variant (low reasoning) optimized for coding",
+    "updateArgs": {
+      "reasoning_effort": "low",
+      "verbosity": "medium",
+      "context_window": 272000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "gpt-5.3-codex-medium",
+    "handle": "openai/gpt-5.3-codex",
+    "label": "GPT-5.3-Codex",
+    "description": "GPT-5.3 variant (med reasoning) optimized for coding",
+    "isFeatured": true,
+    "updateArgs": {
+      "reasoning_effort": "medium",
+      "verbosity": "medium",
+      "context_window": 272000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "gpt-5.3-codex-high",
+    "handle": "openai/gpt-5.3-codex",
+    "label": "GPT-5.3-Codex",
+    "description": "GPT-5.3 variant (high reasoning) optimized for coding",
+    "updateArgs": {
+      "reasoning_effort": "high",
+      "verbosity": "medium",
+      "context_window": 272000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "gpt-5.3-codex-xhigh",
+    "handle": "openai/gpt-5.3-codex",
+    "label": "GPT-5.3-Codex",
+    "description": "GPT-5.3 variant (max reasoning) optimized for coding",
     "updateArgs": {
       "reasoning_effort": "xhigh",
       "verbosity": "medium",
@@ -775,6 +860,56 @@
     "handle": "cliproxy/gpt-5.2-codex",
     "label": "GPT-5.2 Codex (CLIProxy)",
     "description": "GPT-5.2 Codex via CLIProxyAPI",
+    "updateArgs": {
+      "context_window": 400000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "cliproxy-gpt-5.3-codex-xhigh",
+    "handle": "cliproxy/gpt-5.3-codex-xhigh",
+    "label": "GPT-5.3 Codex XHigh (CLIProxy)",
+    "description": "GPT-5.3 Codex extra-high reasoning via CLIProxyAPI",
+    "updateArgs": {
+      "context_window": 400000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "cliproxy-gpt-5.3-codex-high",
+    "handle": "cliproxy/gpt-5.3-codex-high",
+    "label": "GPT-5.3 Codex High (CLIProxy)",
+    "description": "GPT-5.3 Codex high reasoning via CLIProxyAPI",
+    "updateArgs": {
+      "context_window": 400000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "cliproxy-gpt-5.3-codex-medium",
+    "handle": "cliproxy/gpt-5.3-codex-medium",
+    "label": "GPT-5.3 Codex Medium (CLIProxy)",
+    "description": "GPT-5.3 Codex medium reasoning via CLIProxyAPI",
+    "updateArgs": {
+      "context_window": 400000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "cliproxy-gpt-5.3-codex-low",
+    "handle": "cliproxy/gpt-5.3-codex-low",
+    "label": "GPT-5.3 Codex Low (CLIProxy)",
+    "description": "GPT-5.3 Codex low reasoning via CLIProxyAPI",
+    "updateArgs": {
+      "context_window": 400000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "cliproxy-gpt-5.3-codex",
+    "handle": "cliproxy/gpt-5.3-codex",
+    "label": "GPT-5.3 Codex (CLIProxy)",
+    "description": "GPT-5.3 Codex via CLIProxyAPI",
     "updateArgs": {
       "context_window": 400000,
       "max_output_tokens": 128000
@@ -1365,6 +1500,56 @@
     "handle": "cliproxy/copilot-gpt-5.2-codex-xhigh",
     "label": "GPT-5.2 Codex XHigh (CLIProxy/Copilot)",
     "description": "GPT-5.2 Codex extra-high reasoning via CLIProxyAPI Copilot",
+    "updateArgs": {
+      "context_window": 128000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "cliproxy-copilot-gpt-5.3-codex",
+    "handle": "cliproxy/copilot-gpt-5.3-codex",
+    "label": "GPT-5.3 Codex (CLIProxy/Copilot)",
+    "description": "GPT-5.3 Codex via CLIProxyAPI Copilot",
+    "updateArgs": {
+      "context_window": 128000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "cliproxy-copilot-gpt-5.3-codex-low",
+    "handle": "cliproxy/copilot-gpt-5.3-codex-low",
+    "label": "GPT-5.3 Codex Low (CLIProxy/Copilot)",
+    "description": "GPT-5.3 Codex low reasoning via CLIProxyAPI Copilot",
+    "updateArgs": {
+      "context_window": 128000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "cliproxy-copilot-gpt-5.3-codex-medium",
+    "handle": "cliproxy/copilot-gpt-5.3-codex-medium",
+    "label": "GPT-5.3 Codex Medium (CLIProxy/Copilot)",
+    "description": "GPT-5.3 Codex medium reasoning via CLIProxyAPI Copilot",
+    "updateArgs": {
+      "context_window": 128000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "cliproxy-copilot-gpt-5.3-codex-high",
+    "handle": "cliproxy/copilot-gpt-5.3-codex-high",
+    "label": "GPT-5.3 Codex High (CLIProxy/Copilot)",
+    "description": "GPT-5.3 Codex high reasoning via CLIProxyAPI Copilot",
+    "updateArgs": {
+      "context_window": 128000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "cliproxy-copilot-gpt-5.3-codex-xhigh",
+    "handle": "cliproxy/copilot-gpt-5.3-codex-xhigh",
+    "label": "GPT-5.3 Codex XHigh (CLIProxy/Copilot)",
+    "description": "GPT-5.3 Codex extra-high reasoning via CLIProxyAPI Copilot",
     "updateArgs": {
       "context_window": 128000,
       "max_output_tokens": 128000
