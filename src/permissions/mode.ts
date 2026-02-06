@@ -2,9 +2,66 @@
 // Permission mode management (default, acceptEdits, plan, bypassPermissions)
 
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { isReadOnlyShellCommand } from "./readOnlyShell";
+
+function expandHomePath(inputPath: string): string {
+  const trimmed = inputPath.trim();
+  if (trimmed === "~") {
+    return homedir();
+  }
+  if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    return join(homedir(), trimmed.slice(2));
+  }
+  return trimmed;
+}
+
+function resolveToolTargetPath(targetPath: string): string {
+  const expanded = expandHomePath(targetPath);
+  if (isAbsolute(expanded)) {
+    return resolve(expanded);
+  }
+  const userCwd = process.env.USER_CWD || process.cwd();
+  return resolve(userCwd, expanded);
+}
+
+function isPathInsideDirectory(targetPath: string, directoryPath: string): boolean {
+  const rel = relative(directoryPath, targetPath);
+  return (
+    rel === "" ||
+    (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel))
+  );
+}
+
+function isPlanMarkdownPath(targetPath: string): boolean {
+  const plansDir = resolve(homedir(), ".letta", "plans");
+  const resolvedTarget = resolveToolTargetPath(targetPath);
+  return (
+    resolvedTarget.toLowerCase().endsWith(".md") &&
+    isPathInsideDirectory(resolvedTarget, plansDir)
+  );
+}
+
+function extractApplyPatchPaths(input: string): string[] {
+  const paths: string[] = [];
+
+  for (const match of input.matchAll(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/gm)) {
+    const path = match[1]?.trim();
+    if (path) {
+      paths.push(path);
+    }
+  }
+
+  for (const match of input.matchAll(/^\*\*\* Move to:\s*(.+)$/gm)) {
+    const path = match[1]?.trim();
+    if (path) {
+      paths.push(path);
+    }
+  }
+
+  return paths;
+}
 
 export type PermissionMode =
   | "default"
@@ -156,13 +213,21 @@ class PermissionModeManager {
           "ReadManyFiles",
         ];
         const writeTools = [
-          // Anthropic toolset (PascalCase only)
+          // Anthropic toolset
           "Write",
+          "write",
           "Edit",
+          "edit",
           "MultiEdit",
+          "multi_edit",
+          "NotebookEdit",
+          "notebook_edit",
           // Codex toolset (snake_case and PascalCase)
           "apply_patch",
           "ApplyPatch",
+          // write_file appears as a server-facing alias in some toolsets
+          "write_file",
+          "WriteFile",
           // Gemini toolset (snake_case and PascalCase)
           "write_file_gemini",
           "WriteFileGemini",
@@ -179,27 +244,28 @@ class PermissionModeManager {
         // This is intentional - it allows the agent to "resume" planning after
         // plan mode was exited/reset by simply writing to any plan file.
         if (writeTools.includes(toolName)) {
-          const plansDir = join(homedir(), ".letta", "plans");
-          let targetPath =
-            (toolArgs?.file_path as string) || (toolArgs?.path as string);
-
-          // ApplyPatch/apply_patch: extract file path from patch input
           if (
             (toolName === "ApplyPatch" || toolName === "apply_patch") &&
-            toolArgs?.input
+            typeof toolArgs?.input === "string"
           ) {
-            const input = toolArgs.input as string;
-            // Extract path from "*** Add File: path", "*** Update File: path", or "*** Delete File: path"
-            const match = input.match(
-              /\*\*\* (?:Add|Update|Delete) File:\s*(.+)/,
-            );
-            if (match?.[1]) {
-              targetPath = match[1].trim();
+            const patchPaths = extractApplyPatchPaths(toolArgs.input);
+            if (
+              patchPaths.length > 0 &&
+              patchPaths.every((path) => isPlanMarkdownPath(path))
+            ) {
+              return "allow";
             }
           }
 
+          const targetPath =
+            typeof toolArgs?.file_path === "string"
+              ? toolArgs.file_path
+              : typeof toolArgs?.path === "string"
+                ? toolArgs.path
+                : undefined;
+
           // Allow if target is any .md file in the plans directory
-          if (targetPath?.startsWith(plansDir) && targetPath.endsWith(".md")) {
+          if (targetPath && isPlanMarkdownPath(targetPath)) {
             return "allow";
           }
         }

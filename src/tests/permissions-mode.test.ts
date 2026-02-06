@@ -1,4 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { checkPermission } from "../permissions/checker";
 import { permissionMode } from "../permissions/mode";
 import type { PermissionRules } from "../permissions/types";
@@ -195,6 +197,80 @@ test("plan mode - allows Read", () => {
   expect(result.matchedRule).toBe("plan mode");
 });
 
+test("plan mode - allows relative plan paths when USER_CWD is set", () => {
+  permissionMode.setMode("plan");
+
+  const permissions: PermissionRules = {
+    allow: [],
+    deny: [],
+    ask: [],
+  };
+
+  const prevUserCwd = process.env.USER_CWD;
+  const simulatedCwd = join(homedir(), "letta");
+  process.env.USER_CWD = simulatedCwd;
+  try {
+    const result = checkPermission(
+      "Write",
+      { file_path: "../.letta/plans/draft-plan.md" },
+      permissions,
+      simulatedCwd,
+    );
+
+    expect(result.decision).toBe("allow");
+    expect(result.matchedRule).toBe("plan mode");
+  } finally {
+    if (prevUserCwd === undefined) {
+      delete process.env.USER_CWD;
+    } else {
+      process.env.USER_CWD = prevUserCwd;
+    }
+  }
+});
+
+test("plan mode - allows write_file for markdown files in ~/.letta/plans", () => {
+  permissionMode.setMode("plan");
+
+  const permissions: PermissionRules = {
+    allow: [],
+    deny: [],
+    ask: [],
+  };
+
+  const result = checkPermission(
+    "write_file",
+    { file_path: join(homedir(), ".letta", "plans", "draft-plan.md") },
+    permissions,
+    "/Users/test/project",
+  );
+
+  expect(result.decision).toBe("allow");
+  expect(result.matchedRule).toBe("plan mode");
+});
+
+test("plan mode - allows apply_patch to ~/.letta/plans markdown files", () => {
+  permissionMode.setMode("plan");
+
+  const permissions: PermissionRules = {
+    allow: [],
+    deny: [],
+    ask: [],
+  };
+
+  const result = checkPermission(
+    "apply_patch",
+    {
+      input:
+        "*** Begin Patch\n*** Add File: ~/.letta/plans/test-plan.md\n+hello\n*** End Patch",
+    },
+    permissions,
+    "/Users/test/project",
+  );
+
+  expect(result.decision).toBe("allow");
+  expect(result.matchedRule).toBe("plan mode");
+});
+
 test("plan mode - allows Glob", () => {
   permissionMode.setMode("plan");
 
@@ -295,6 +371,28 @@ test("plan mode - denies non-read-only Bash", () => {
 
   expect(result.decision).toBe("deny");
   expect(result.matchedRule).toBe("plan mode");
+});
+
+test("plan mode - shell redirection denial suggests Write/apply_patch", () => {
+  permissionMode.setMode("plan");
+
+  const permissions: PermissionRules = {
+    allow: [],
+    deny: [],
+    ask: [],
+  };
+
+  const result = checkPermission(
+    "Bash",
+    { command: "cat <<'EOF' > /tmp/plan.md" },
+    permissions,
+    "/Users/test/project",
+  );
+
+  expect(result.decision).toBe("deny");
+  expect(result.reason).toContain(
+    "Shell redirection is blocked in plan mode; use Write/apply_patch instead.",
+  );
 });
 
 test("plan mode - allows read-only Bash commands", () => {

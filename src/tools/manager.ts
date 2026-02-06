@@ -666,12 +666,30 @@ export async function loadTools(modelIdentifier?: string): Promise<void> {
  * Check if a model identifier is an OpenAI/GPT-5 model (uses memory_apply_patch, codex toolset)
  */
 function isOpenAIModelHandle(handle: string): boolean {
-  return (
-    handle.startsWith("openai/") ||
-    handle.startsWith("cliproxy/gpt-5") ||
-    handle.startsWith("cliproxy/copilot-gpt-5") ||
-    handle.startsWith("cliproxy/copilot-gpt-4")
-  );
+  const normalized = handle.toLowerCase();
+  const slash = normalized.indexOf("/");
+  const provider = slash === -1 ? normalized : normalized.slice(0, slash);
+  const modelPart = slash === -1 ? "" : normalized.slice(slash + 1);
+
+  // Known OpenAI/Codex providers
+  if (
+    provider === "openai" ||
+    provider === "chatgpt-plus-pro" ||
+    provider === "lc-openai"
+  ) {
+    return true;
+  }
+
+  // Known CLIProxy OpenAI/Codex families
+  if (
+    normalized.startsWith("cliproxy/gpt-") ||
+    normalized.startsWith("cliproxy/copilot-gpt-")
+  ) {
+    return true;
+  }
+
+  // Provider-agnostic fallback for dynamic handles (e.g., openrouter/openai/gpt-5.3-codex)
+  return modelPart.includes("codex") || /(^|\/)gpt-[\w.-]*/.test(modelPart);
 }
 
 export function isOpenAIModel(modelIdentifier: string): boolean {
@@ -687,15 +705,38 @@ export function isOpenAIModel(modelIdentifier: string): boolean {
  * Check if a model identifier is a Gemini model (uses gemini toolset)
  */
 function isGeminiModelHandle(handle: string): boolean {
-  // Exclude Claude models hosted on Gemini infrastructure (cliproxy/gemini-claude-*)
-  if (handle.startsWith("cliproxy/gemini-claude-")) {
+  const normalized = handle.toLowerCase();
+  const slash = normalized.indexOf("/");
+  const provider = slash === -1 ? normalized : normalized.slice(0, slash);
+  const modelPart = slash === -1 ? "" : normalized.slice(slash + 1);
+
+  // Exclude Claude models hosted on Gemini infrastructure
+  if (modelPart.includes("claude") || modelPart.includes("sonnet")) {
     return false;
   }
+
+  // Known Gemini providers
+  if (
+    provider === "google" ||
+    provider === "google_ai" ||
+    provider === "google_vertex" ||
+    provider === "lc-gemini"
+  ) {
+    return true;
+  }
+
+  // Known CLIProxy Gemini families
+  if (
+    normalized.startsWith("cliproxy/gemini-") ||
+    normalized.startsWith("cliproxy/copilot-gemini-")
+  ) {
+    return true;
+  }
+
+  // Provider-agnostic fallback for dynamic handles
   return (
-    handle.startsWith("google/") ||
-    handle.startsWith("google_ai/") ||
-    handle.startsWith("cliproxy/gemini-") ||
-    handle.startsWith("cliproxy/copilot-gemini-")
+    modelPart.includes("gemini") ||
+    modelPart.startsWith("google/gemini-")
   );
 }
 

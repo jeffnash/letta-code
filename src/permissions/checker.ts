@@ -121,11 +121,19 @@ export function checkPermission(
     let reason = `Permission mode: ${currentMode}`;
     if (currentMode === "plan" && modeOverride === "deny") {
       const planFilePath = permissionMode.getPlanFilePath();
+      const shellCommand = extractShellCommand(toolArgs);
+      const shellRedirectionHint =
+        READ_ONLY_SHELL_TOOLS.has(toolName) &&
+        shellCommand &&
+        hasShellRedirection(shellCommand)
+          ? " Shell redirection is blocked in plan mode; use Write/apply_patch instead."
+          : "";
       // planFilePath should always be set when in plan mode - they're set together
       reason =
         `Plan mode is active. You can only use read-only tools (Read, Grep, Glob, etc.) and write to the plan file. ` +
         `Write your plan to: ${planFilePath || "(error: plan file path not configured)"}. ` +
-        `Use ExitPlanMode when your plan is ready for user approval.`;
+        `Use ExitPlanMode when your plan is ready for user approval.` +
+        shellRedirectionHint;
     }
     return {
       decision: modeOverride,
@@ -337,6 +345,11 @@ function extractShellCommand(toolArgs: ToolArgs): string | string[] | null {
     return command;
   }
   return null;
+}
+
+function hasShellRedirection(command: string | string[]): boolean {
+  const commandText = Array.isArray(command) ? command.join(" ") : command;
+  return /(^|\s)(>>?|<<?)\s*\S/.test(commandText) || /\|\s*tee\b/.test(commandText);
 }
 
 /**

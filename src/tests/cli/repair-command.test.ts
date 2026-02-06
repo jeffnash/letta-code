@@ -68,18 +68,23 @@ describe("RepairMessageHistoryResponse format", () => {
       status: "ok" as const,
       message: "No orphaned tool_use blocks found",
       orphaned_tool_calls: [],
-      removed_message_ids: [],
+      injected_message_ids: [],
+      injected_tool_call_ids: [],
+      pruned_message_ids: [],
     };
 
     expect(okResponse.status).toBe("ok");
     expect(Array.isArray(okResponse.orphaned_tool_calls)).toBe(true);
-    expect(Array.isArray(okResponse.removed_message_ids)).toBe(true);
+    expect(Array.isArray(okResponse.injected_message_ids)).toBe(true);
+    expect(Array.isArray(okResponse.injected_tool_call_ids)).toBe(true);
+    expect(Array.isArray(okResponse.pruned_message_ids)).toBe(true);
   });
 
   test("repaired response structure", () => {
     const repairedResponse = {
       status: "repaired" as const,
-      message: "Removed 1 message(s) with 2 orphaned tool_use block(s)",
+      message:
+        "Injected 1 synthetic tool result message(s) for 1 orphaned tool_call(s); pruned 1 orphan function_call_output-only message(s)",
       orphaned_tool_calls: [
         {
           message_id: "msg-123",
@@ -88,7 +93,9 @@ describe("RepairMessageHistoryResponse format", () => {
           reason: "no_following_message",
         },
       ],
-      removed_message_ids: ["msg-123"],
+      injected_message_ids: ["message-synth-1"],
+      injected_tool_call_ids: ["toolu_456"],
+      pruned_message_ids: ["message-orphan-output-1"],
     };
 
     expect(repairedResponse.status).toBe("repaired");
@@ -108,7 +115,9 @@ describe("RepairMessageHistoryResponse format", () => {
       status: "error" as const,
       message: "Failed to repair message history",
       orphaned_tool_calls: [],
-      removed_message_ids: [],
+      injected_message_ids: [],
+      injected_tool_call_ids: [],
+      pruned_message_ids: [],
     };
 
     expect(errorResponse.status).toBe("error");
@@ -126,7 +135,9 @@ describe("output formatting", () => {
         tool_name: string;
         reason: string;
       }>,
-      removed_message_ids: [] as string[],
+      injected_message_ids: [] as string[],
+      injected_tool_call_ids: [] as string[],
+      pruned_message_ids: [] as string[],
     };
 
     // Simulate the output formatting logic from App.tsx
@@ -142,7 +153,8 @@ describe("output formatting", () => {
   test("formats repaired status with tool call details", () => {
     const response = {
       status: "repaired" as const,
-      message: "Removed 1 message(s) with 2 orphaned tool_use block(s)",
+      message:
+        "Injected 2 synthetic tool result message(s) for 2 orphaned tool_call(s); pruned 1 orphan function_call_output-only message(s)",
       orphaned_tool_calls: [
         {
           message_id: "msg-1",
@@ -157,7 +169,9 @@ describe("output formatting", () => {
           reason: "no_following_message",
         },
       ],
-      removed_message_ids: ["msg-1"],
+      injected_message_ids: ["msg-syn-1", "msg-syn-2"],
+      injected_tool_call_ids: ["toolu_1", "toolu_2"],
+      pruned_message_ids: ["msg-orphan-output-1"],
     };
 
     // Simulate the output formatting logic from App.tsx
@@ -170,12 +184,20 @@ describe("output formatting", () => {
           outputMsg += `\n  • ${tc.tool_name} (${tc.reason})`;
         }
       }
+      if ((response.pruned_message_ids?.length || 0) > 0) {
+        outputMsg += "\n\nOrphaned output-only messages pruned:";
+        for (const msgId of response.pruned_message_ids) {
+          outputMsg += `\n  • ${msgId}`;
+        }
+      }
     }
 
     expect(outputMsg).toContain("✓ Repaired");
     expect(outputMsg).toContain("web_search");
     expect(outputMsg).toContain("calculator");
     expect(outputMsg).toContain("no_following_message");
+    expect(outputMsg).toContain("Orphaned output-only messages pruned");
+    expect(outputMsg).toContain("msg-orphan-output-1");
   });
 
   test("formats error status with warning", () => {
@@ -188,7 +210,9 @@ describe("output formatting", () => {
         tool_name: string;
         reason: string;
       }>,
-      removed_message_ids: [] as string[],
+      injected_message_ids: [] as string[],
+      injected_tool_call_ids: [] as string[],
+      pruned_message_ids: [] as string[],
     };
 
     // Simulate the output formatting logic from App.tsx

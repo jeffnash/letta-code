@@ -6541,7 +6541,9 @@ export default function App({
                 tool_name: string;
                 reason: string;
               }>;
-              removed_message_ids: string[];
+              injected_message_ids?: string[];
+              injected_tool_call_ids?: string[];
+              pruned_message_ids?: string[];
             };
 
             let outputMsg = "";
@@ -6553,6 +6555,13 @@ export default function App({
                 outputMsg += "\n\nOrphaned tool calls fixed:";
                 for (const tc of result.orphaned_tool_calls) {
                   outputMsg += `\n  • ${tc.tool_name} (${tc.reason})`;
+                }
+              }
+
+              if ((result.pruned_message_ids?.length || 0) > 0) {
+                outputMsg += "\n\nOrphaned output-only messages pruned:";
+                for (const msgId of result.pruned_message_ids || []) {
+                  outputMsg += `\n  • ${msgId}`;
                 }
               }
             } else {
@@ -9543,7 +9552,9 @@ ${SYSTEM_REMINDER_CLOSE}
           refreshDerived();
 
           // Update the agent with new model and config args
-          const { updateAgentLLMConfig } = await import("../agent/modify");
+          const { updateAgentLLMConfig, updateAgentSystemPrompt } = await import(
+            "../agent/modify"
+          );
 
           const updatedConfig = await updateAgentLLMConfig(
             agentId,
@@ -9599,6 +9610,28 @@ ${SYSTEM_REMINDER_CLOSE}
               ? "letta-gemini"
               : "letta-claude";
 
+          const standardPrompts = [
+            "default",
+            "letta-claude",
+            "letta-codex",
+            "letta-gemini",
+          ];
+          const isStandardPrompt =
+            !!currentSystemPromptId &&
+            standardPrompts.includes(currentSystemPromptId);
+
+          let didSwitchSystemPrompt = false;
+          if (isStandardPrompt && currentSystemPromptId !== targetSystemPrompt) {
+            const promptResult = await updateAgentSystemPrompt(
+              agentId,
+              targetSystemPrompt,
+            );
+            if (promptResult.success) {
+              setCurrentSystemPromptId(targetSystemPrompt);
+              didSwitchSystemPrompt = true;
+            }
+          }
+
           // Update the same command with final result
           const outputLines = [`Switched to ${selectedModel.label}`];
           if (toolsetName) {
@@ -9606,15 +9639,14 @@ ${SYSTEM_REMINDER_CLOSE}
               `Automatically switched toolset to ${toolsetName}.`,
             );
           }
-          // Only suggest switching system prompt if current prompt is known and different,
-          // or if current prompt is null (unknown state). Skip hint if already matching
-          // or if user has a custom prompt set (indicated by currentSystemPromptId not
-          // being one of the standard presets).
-          const standardPrompts = ["default", "letta-claude", "letta-codex", "letta-gemini"];
-          const isStandardPrompt = currentSystemPromptId && standardPrompts.includes(currentSystemPromptId);
-          const needsPromptSwitch = currentSystemPromptId === null || 
-            (isStandardPrompt && currentSystemPromptId !== targetSystemPrompt);
-          if (needsPromptSwitch) {
+          if (didSwitchSystemPrompt) {
+            outputLines.push(
+              `Automatically switched system prompt to ${targetSystemPrompt}.`,
+            );
+          }
+
+          // If we don't know the active prompt ID, avoid auto-switching and provide guidance.
+          if (currentSystemPromptId === null) {
             outputLines.push(
               `Consider switching system prompt to ${targetSystemPrompt} using /system to match.`,
             );
