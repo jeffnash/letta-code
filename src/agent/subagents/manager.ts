@@ -11,6 +11,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import {
   addToolCall,
+  updateToolCall,
   updateSubagent,
 } from "../../cli/helpers/subagentState.js";
 import {
@@ -97,6 +98,58 @@ export async function getPrimaryAgentModelHandle(): Promise<
     return getModelHandleFromAgent(agent) ?? undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Handle tool_call_message chunks so tool usage is visible even when
+ * approvals are bypassed/auto-handled by permissions.
+ */
+function handleToolCallMessageEvent(
+  event: { tool_calls?: unknown[]; tool_call?: unknown },
+  state: ExecutionState,
+  subagentId: string,
+): void {
+  const toolCalls = Array.isArray(event.tool_calls)
+    ? event.tool_calls
+    : event.tool_call
+      ? [event.tool_call]
+      : [];
+
+  for (const toolCall of toolCalls) {
+    const tc = toolCall as {
+      tool_call_id?: string;
+      name?: string;
+      arguments?: string;
+    };
+    const id = tc.tool_call_id;
+    if (!id) continue;
+
+    const prev = state.pendingToolCalls.get(id) || { name: "", args: "" };
+    const name = tc.name || prev.name;
+    const args = prev.args + (tc.arguments || "");
+    state.pendingToolCalls.set(id, { name, args });
+
+    const normalizedArgs = args || "{}";
+
+    // Tool call args may stream in multiple chunks; refresh already-recorded calls.
+    if (state.displayedToolCalls.has(id)) {
+      updateToolCall(subagentId, id, {
+        ...(name ? { name } : {}),
+        args: normalizedArgs,
+      });
+      continue;
+    }
+
+    if (name) {
+      recordToolCall(
+        subagentId,
+        id,
+        name,
+        normalizedArgs,
+        state.displayedToolCalls,
+      );
+    }
   }
 }
 
@@ -385,7 +438,12 @@ function processStreamEvent(
   subagentId: string,
 ): void {
   try {
-    const event = JSON.parse(line);
+    let event = JSON.parse(line);
+
+    // stream-json can optionally emit wrappers: { type: "stream_event", event: {...} }
+    if (event?.type === "stream_event" && event.event) {
+      event = event.event;
+    }
 
     switch (event.type) {
       case "init":
@@ -399,6 +457,8 @@ function processStreamEvent(
       case "message":
         if (event.message_type === "approval_request_message") {
           handleApprovalRequestEvent(event, state);
+        } else if (event.message_type === "tool_call_message") {
+          handleToolCallMessageEvent(event, state, subagentId);
         }
         break;
 

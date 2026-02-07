@@ -179,6 +179,40 @@ export function addToolCall(
 }
 
 /**
+ * Update an existing tool call on a subagent.
+ * Used when tool call arguments arrive in streamed chunks.
+ */
+export function updateToolCall(
+  subagentId: string,
+  toolCallId: string,
+  updates: Partial<Pick<ToolCall, "name" | "args">>,
+): void {
+  const agent = store.agents.get(subagentId);
+  if (!agent) return;
+
+  const index = agent.toolCalls.findIndex((tc) => tc.id === toolCallId);
+  if (index === -1) return;
+
+  const current = agent.toolCalls[index];
+  if (!current) return;
+
+  const updatedToolCall: ToolCall = {
+    ...current,
+    ...updates,
+  };
+
+  const updatedToolCalls = [...agent.toolCalls];
+  updatedToolCalls[index] = updatedToolCall;
+
+  const updatedAgent = {
+    ...agent,
+    toolCalls: updatedToolCalls,
+  };
+  store.agents.set(subagentId, updatedAgent);
+  notifyListeners();
+}
+
+/**
  * Mark a subagent as completed
  */
 export function completeSubagent(

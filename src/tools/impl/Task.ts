@@ -44,6 +44,14 @@ interface TaskArgs {
   signal?: AbortSignal; // Injected by executeTool for interruption handling
 }
 
+function parseRunInBackground(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    return value.trim().toLowerCase() === "true";
+  }
+  return false;
+}
+
 // Valid subagent_types when deploying an existing agent
 const VALID_DEPLOY_TYPES = new Set(["explore", "general-purpose"]);
 
@@ -120,7 +128,7 @@ export async function task(args: TaskArgs): Promise<string> {
 
   // Register subagent with state store for UI display
   const subagentId = generateSubagentId();
-  const isBackground = args.run_in_background ?? false;
+  const isBackground = parseRunInBackground(args.run_in_background);
   registerSubagent(
     subagentId,
     subagent_type,
