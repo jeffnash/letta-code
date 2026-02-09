@@ -1101,7 +1101,17 @@
     "label": "Claude Opus 4.6 (CLIProxy/Copilot)",
     "description": "Claude Opus 4.6 via CLIProxyAPI Copilot",
     "updateArgs": {
-      "context_window": 200000,
+      "context_window": 128000,
+      "max_output_tokens": 64000
+    }
+  },
+  {
+    "id": "cliproxy-copilot-claude-opus-4.6-fast",
+    "handle": "cliproxy/copilot-claude-opus-4.6-fast",
+    "label": "Claude Opus 4.6 Fast (Preview) (CLIProxy/Copilot)",
+    "description": "Claude Opus 4.6 fast mode preview via CLIProxyAPI Copilot",
+    "updateArgs": {
+      "context_window": 128000,
       "max_output_tokens": 64000
     }
   },
@@ -1111,7 +1121,17 @@
     "label": "Opus 4.6",
     "description": "Claude Opus 4.6 via CLIProxyAPI Copilot (short alias)",
     "updateArgs": {
-      "context_window": 200000,
+      "context_window": 128000,
+      "max_output_tokens": 64000
+    }
+  },
+  {
+    "id": "opus-4.6-fast",
+    "handle": "cliproxy/copilot-claude-opus-4.6-fast",
+    "label": "Opus 4.6 Fast (Preview)",
+    "description": "Claude Opus 4.6 fast mode preview via CLIProxyAPI Copilot (short alias)",
+    "updateArgs": {
+      "context_window": 128000,
       "max_output_tokens": 64000
     }
   },
