@@ -35,6 +35,9 @@ export interface StaticSubagent {
   error?: string;
   model?: string;
   isBackground?: boolean;
+  taskId?: string;
+  agentId?: string;
+  conversationId?: string;
 }
 
 interface SubagentGroupStaticProps {
@@ -59,10 +62,15 @@ const AgentRow = memo(({ agent, isLast }: AgentRowProps) => {
   const isRunning = agent.status === "running";
   const shouldDim = isRunning && !agent.isBackground;
   const stats = formatStats(agent.toolCount, agent.totalTokens, isRunning);
+  const ids = [agent.taskId, agent.agentId, agent.conversationId].filter(
+    Boolean,
+  ) as string[];
+  const modelLabel = agent.model ? `Model: ${agent.model}` : "";
+  const subagentLabel = `Subagent: ${agent.type.toLowerCase()}`;
 
   return (
     <Box flexDirection="column">
-      {/* Main row: tree char + description + type + model + stats */}
+      {/* Main row: tree char + description + type + stats */}
       <Box flexDirection="row">
         <Text>
           <Text color={colors.subagent.treeChar}>
@@ -74,13 +82,28 @@ const AgentRow = memo(({ agent, isLast }: AgentRowProps) => {
           </Text>
           <Text dimColor>
             {" · "}
-            {agent.type.toLowerCase()}
-            {agent.model ? ` · ${agent.model}` : ""}
-            {" · "}
             {stats}
           </Text>
         </Text>
       </Box>
+
+      <Box flexDirection="row">
+        <Text color={colors.subagent.treeChar}>
+          {"   "}
+          {continueChar} ⎿{" "}
+        </Text>
+        <Text dimColor>{subagentLabel}</Text>
+      </Box>
+
+      {modelLabel && (
+        <Box flexDirection="row">
+          <Text color={colors.subagent.treeChar}>
+            {"   "}
+            {continueChar} ⎿{" "}
+          </Text>
+          <Text dimColor>{modelLabel}</Text>
+        </Box>
+      )}
 
       {/* Subagent URL */}
       {agent.agentURL && (
@@ -89,8 +112,19 @@ const AgentRow = memo(({ agent, isLast }: AgentRowProps) => {
             {"   "}
             {continueChar} ⎿{" "}
           </Text>
-          <Text dimColor>{"Subagent: "}</Text>
+          <Text dimColor>{"Agent URL: "}</Text>
           <Text dimColor>{agent.agentURL}</Text>
+        </Box>
+      )}
+
+      {ids.length > 0 && (
+        <Box flexDirection="row">
+          <Text color={colors.subagent.treeChar}>
+            {"   "}
+            {continueChar} ⎿{" "}
+          </Text>
+          <Text dimColor>{"IDs: "}</Text>
+          <Text dimColor>{ids.join(" · ")}</Text>
         </Box>
       )}
 

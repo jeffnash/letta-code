@@ -139,6 +139,9 @@ export function createSubagentGroupItem(
         error: subagent.error,
         model: subagent.model,
         isBackground: subagent.isBackground,
+        taskId: subagent.taskId,
+        agentId: subagent.agentId,
+        conversationId: subagent.conversationId,
       });
     }
   }

@@ -56,6 +56,14 @@ export interface SubagentResult {
   totalTokens?: number;
 }
 
+export interface SubagentProgressUpdate {
+  message: string;
+  agentId?: string;
+  conversationId?: string;
+  toolCallId?: string;
+  toolName?: string;
+}
+
 /**
  * State tracked during subagent execution
  */
@@ -109,6 +117,7 @@ function handleToolCallMessageEvent(
   event: { tool_calls?: unknown[]; tool_call?: unknown },
   state: ExecutionState,
   subagentId: string,
+  onProgress?: (update: SubagentProgressUpdate) => void,
 ): void {
   const toolCalls = Array.isArray(event.tool_calls)
     ? event.tool_calls
@@ -148,6 +157,7 @@ function handleToolCallMessageEvent(
         name,
         normalizedArgs,
         state.displayedToolCalls,
+        onProgress,
       );
     }
   }
@@ -162,6 +172,70 @@ function isProviderNotSupportedError(errorOutput: string): boolean {
     errorOutput.includes("is not supported") &&
     errorOutput.includes("supported providers:")
   );
+}
+
+/**
+ * Check if an error likely came from transient transport/network instability.
+ */
+function isTransientTransportError(errorOutput: string): boolean {
+  const lowerError = errorOutput.toLowerCase();
+  return (
+    lowerError.includes("readerror") ||
+    lowerError.includes("httpx.readerror") ||
+    lowerError.includes("httpcore.readerror") ||
+    lowerError.includes("connection reset") ||
+    lowerError.includes("connection aborted") ||
+    lowerError.includes("broken pipe") ||
+    lowerError.includes("timed out") ||
+    lowerError.includes("timeout") ||
+    lowerError.includes("failed to connect") ||
+    lowerError.includes("econnreset") ||
+    lowerError.includes("econnrefused") ||
+    lowerError.includes("socket hang up") ||
+    lowerError.includes("stream was cancelled") ||
+    lowerError.includes("stream ended")
+  );
+}
+
+const MAX_TRANSIENT_RETRIES = 2;
+const RETRY_BASE_DELAY_MS = 800;
+const RETRY_MAX_DELAY_MS = 8_000;
+
+function computeRetryDelayMs(attempt: number): number {
+  const base = Math.min(
+    RETRY_MAX_DELAY_MS,
+    RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1),
+  );
+  // Add bounded jitter to avoid synchronized retry bursts.
+  const jitter = Math.floor(Math.random() * 300);
+  return Math.min(RETRY_MAX_DELAY_MS, base + jitter);
+}
+
+async function waitForRetryDelay(
+  delayMs: number,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (signal?.aborted) {
+    return false;
+  }
+
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, delayMs);
+    if (signal) {
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+
+  return !signal?.aborted;
+}
+
+function isRetryableSubagentError(errorMessage: string | undefined): boolean {
+  if (!errorMessage) return false;
+  return isRateLimitError(errorMessage) || isTransientTransportError(errorMessage);
 }
 
 const BYOK_PROVIDER_TO_BASE: Record<string, string> = {
@@ -307,10 +381,16 @@ function recordToolCall(
   toolName: string,
   toolArgs: string,
   displayedToolCalls: Set<string>,
+  onProgress?: (update: SubagentProgressUpdate) => void,
 ): void {
   if (!toolCallId || !toolName || displayedToolCalls.has(toolCallId)) return;
   displayedToolCalls.add(toolCallId);
   addToolCall(subagentId, toolCallId, toolName, toolArgs);
+  onProgress?.({
+    message: `[tool] ${toolName}`,
+    toolCallId,
+    toolName,
+  });
 }
 
 /**
@@ -321,14 +401,34 @@ function handleInitEvent(
   state: ExecutionState,
   agentDisplayURL: string,
   subagentId: string,
+  onProgress?: (update: SubagentProgressUpdate) => void,
 ): void {
   if (event.agent_id) {
     state.agentId = event.agent_id;
     const agentURL = `${agentDisplayURL}/agents/${event.agent_id}`;
-    updateSubagent(subagentId, { agentURL });
+    updateSubagent(subagentId, { agentURL, agentId: event.agent_id });
   }
   if (event.conversation_id) {
     state.conversationId = event.conversation_id;
+    updateSubagent(subagentId, { conversationId: event.conversation_id });
+  }
+
+  if (event.agent_id || event.conversation_id) {
+    const parts = [
+      event.agent_id ? `agent_id=${event.agent_id}` : undefined,
+      event.conversation_id
+        ? `conversation_id=${event.conversation_id}`
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    if (parts) {
+      onProgress?.({
+        message: `[ids] ${parts}`,
+        agentId: event.agent_id,
+        conversationId: event.conversation_id,
+      });
+    }
   }
 }
 
@@ -370,6 +470,7 @@ function handleAutoApprovalEvent(
   },
   state: ExecutionState,
   subagentId: string,
+  onProgress?: (update: SubagentProgressUpdate) => void,
 ): void {
   const tc = event.tool_call;
   if (!tc) return;
@@ -381,6 +482,7 @@ function handleAutoApprovalEvent(
       name,
       tool_args,
       state.displayedToolCalls,
+      onProgress,
     );
   }
 }
@@ -397,6 +499,7 @@ function handleResultEvent(
   },
   state: ExecutionState,
   subagentId: string,
+  onProgress?: (update: SubagentProgressUpdate) => void,
 ): void {
   state.finalResult = event.result || "";
   state.resultStats = {
@@ -416,6 +519,7 @@ function handleResultEvent(
           name,
           args || "{}",
           state.displayedToolCalls,
+          onProgress,
         );
       }
     }
@@ -436,6 +540,7 @@ function processStreamEvent(
   state: ExecutionState,
   agentDisplayURL: string,
   subagentId: string,
+  onProgress?: (update: SubagentProgressUpdate) => void,
 ): void {
   try {
     let event = JSON.parse(line);
@@ -450,7 +555,7 @@ function processStreamEvent(
       case "system":
         // Handle both legacy "init" type and new "system" type with subtype "init"
         if (event.type === "init" || event.subtype === "init") {
-          handleInitEvent(event, state, agentDisplayURL, subagentId);
+          handleInitEvent(event, state, agentDisplayURL, subagentId, onProgress);
         }
         break;
 
@@ -458,16 +563,16 @@ function processStreamEvent(
         if (event.message_type === "approval_request_message") {
           handleApprovalRequestEvent(event, state);
         } else if (event.message_type === "tool_call_message") {
-          handleToolCallMessageEvent(event, state, subagentId);
+          handleToolCallMessageEvent(event, state, subagentId, onProgress);
         }
         break;
 
       case "auto_approval":
-        handleAutoApprovalEvent(event, state, subagentId);
+        handleAutoApprovalEvent(event, state, subagentId, onProgress);
         break;
 
       case "result":
-        handleResultEvent(event, state, subagentId);
+        handleResultEvent(event, state, subagentId, onProgress);
         break;
 
       case "error":
@@ -653,6 +758,7 @@ async function executeSubagent(
   existingAgentId?: string,
   existingConversationId?: string,
   maxTurns?: number,
+  onProgress?: (update: SubagentProgressUpdate) => void,
 ): Promise<SubagentResult> {
   // Check if already aborted before starting
   if (signal?.aborted) {
@@ -667,6 +773,7 @@ async function executeSubagent(
   // Update the state with the model being used (may differ on retry/fallback)
   if (model) {
     updateSubagent(subagentId, { model });
+    onProgress?.({ message: `[model] ${model}` });
   }
 
   try {
@@ -751,7 +858,7 @@ async function executeSubagent(
 
     rl.on("line", (line: string) => {
       stdoutChunks.push(Buffer.from(`${line}\n`));
-      processStreamEvent(line, state, agentDisplayURL, subagentId);
+      processStreamEvent(line, state, agentDisplayURL, subagentId, onProgress);
     });
 
     proc.stderr.on("data", (data: Buffer) => {
@@ -802,6 +909,10 @@ async function executeSubagent(
             expansionChain,
             1,
             signal,
+            existingAgentId,
+            existingConversationId,
+            maxTurns,
+            onProgress,
           );
         }
 
@@ -824,6 +935,7 @@ async function executeSubagent(
             undefined, // existingAgentId
             undefined, // existingConversationId
             maxTurns,
+            onProgress,
           );
         }
       }
@@ -1054,6 +1166,7 @@ export async function spawnSubagent(
   existingAgentId?: string,
   existingConversationId?: string,
   maxTurns?: number,
+  onProgress?: (update: SubagentProgressUpdate) => void,
 ): Promise<SubagentResult> {
   const allConfigs = await getAllSubagentConfigs();
   const config = allConfigs[type];
@@ -1136,6 +1249,15 @@ export async function spawnSubagent(
       model = resolution.resolved_handle;
       expansionChain = resolution.expansion_chain;
     }
+  } else if (existingAgentId) {
+    // For deployed existing agents, surface the agent's configured model in the UI.
+    try {
+      const client = await getClient();
+      const existingAgent = await client.agents.retrieve(existingAgentId);
+      model = getModelHandleFromAgent(existingAgent);
+    } catch {
+      // Best effort only - subagent can still run without this metadata.
+    }
   }
 
   const agentDisplayURL = getAgentDisplayURL();
@@ -1158,22 +1280,89 @@ export async function spawnSubagent(
     }
   }
 
-  // Execute subagent - state updates are handled via the state store
-  // Pass expansion chain for rate limit fallback
-  const result = await executeSubagent(
-    type,
-    config,
-    model,
-    finalPrompt,
-    agentDisplayURL,
-    subagentId,
-    expansionChain,
-    0, // Start at beginning of chain
-    signal,
-    existingAgentId,
-    existingConversationId,
-    maxTurns,
-  );
+  // Execute subagent with retry policy for transient failures.
+  let retryAgentId = existingAgentId;
+  let retryConversationId = existingConversationId;
+  let attempt = 0;
+  let lastResult: SubagentResult | null = null;
 
-  return result;
+  while (attempt <= MAX_TRANSIENT_RETRIES) {
+    const result = await executeSubagent(
+      type,
+      config,
+      model,
+      finalPrompt,
+      agentDisplayURL,
+      subagentId,
+      expansionChain,
+      0,
+      signal,
+      retryAgentId,
+      retryConversationId,
+      maxTurns,
+      onProgress,
+    );
+
+    lastResult = result;
+    if (result.success) {
+      return result;
+    }
+
+    if (result.error === INTERRUPTED_BY_USER || signal?.aborted) {
+      return result;
+    }
+
+    const retryable = isRetryableSubagentError(result.error);
+    if (!retryable || attempt >= MAX_TRANSIENT_RETRIES) {
+      break;
+    }
+
+    // Reuse discovered IDs so retries can continue the same agent session.
+    if (result.agentId) {
+      retryAgentId = result.agentId;
+    }
+    if (result.conversationId) {
+      retryConversationId = result.conversationId;
+    }
+
+    const delayMs = computeRetryDelayMs(attempt + 1);
+    onProgress?.({
+      message:
+        `[retry] attempt ${attempt + 1}/${MAX_TRANSIENT_RETRIES + 1} failed with transient error; retrying in ${delayMs}ms`,
+      agentId: retryAgentId,
+      conversationId: retryConversationId,
+    });
+
+    const shouldContinue = await waitForRetryDelay(delayMs, signal);
+    if (!shouldContinue) {
+      return {
+        agentId: retryAgentId || "",
+        conversationId: retryConversationId || undefined,
+        report: "",
+        success: false,
+        error: INTERRUPTED_BY_USER,
+      };
+    }
+
+    attempt += 1;
+  }
+
+  if (lastResult && attempt > 0) {
+    onProgress?.({
+      message:
+        `[retry-exhausted] subagent failed after ${attempt + 1} attempts`,
+      agentId: lastResult.agentId || retryAgentId,
+      conversationId: lastResult.conversationId || retryConversationId,
+    });
+  }
+
+  return (
+    lastResult || {
+      agentId: retryAgentId || "",
+      conversationId: retryConversationId || undefined,
+      report: "",
+      success: false,
+      error: "Subagent execution failed",
+    }
+  );
 }

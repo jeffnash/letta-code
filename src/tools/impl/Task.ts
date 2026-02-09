@@ -44,6 +44,11 @@ interface TaskArgs {
   signal?: AbortSignal; // Injected by executeTool for interruption handling
 }
 
+function getSubagentModel(subagentId: string): string | undefined {
+  const snapshot = getSubagentSnapshot();
+  return snapshot.agents.find((agent) => agent.id === subagentId)?.model;
+}
+
 function parseRunInBackground(value: unknown): boolean {
   if (typeof value === "boolean") return value;
   if (typeof value === "string") {
@@ -129,17 +134,21 @@ export async function task(args: TaskArgs): Promise<string> {
   // Register subagent with state store for UI display
   const subagentId = generateSubagentId();
   const isBackground = parseRunInBackground(args.run_in_background);
+  const taskId = isBackground ? getNextTaskId() : undefined;
   registerSubagent(
     subagentId,
     subagent_type,
     description,
     toolCallId,
     isBackground,
+    taskId,
   );
 
   // Handle background execution
   if (isBackground) {
-    const taskId = getNextTaskId();
+    if (!taskId) {
+      return "Error: Failed to initialize background task ID";
+    }
     const outputFile = createBackgroundOutputFile(taskId);
 
     // Create abort controller for potential cancellation
@@ -158,13 +167,25 @@ export async function task(args: TaskArgs): Promise<string> {
     };
     backgroundTasks.set(taskId, bgTask);
 
+    const appendBackgroundProgress = (line: string): void => {
+      const text = line.endsWith("\n") ? line : `${line}\n`;
+      appendToOutputFile(outputFile, text);
+      bgTask.output.push(line);
+    };
+
     // Write initial status to output file
     appendToOutputFile(
       outputFile,
-      `[Task started: ${description}]\n[subagent_type: ${subagent_type}]\n\n`,
+      `[Task started: ${description}]\n[subagent_type: ${subagent_type}]\n[task_id: ${taskId}]\n\n`,
+    );
+    bgTask.output.push(
+      `[Task started: ${description}]`,
+      `[subagent_type: ${subagent_type}]`,
+      `[task_id: ${taskId}]`,
     );
 
-    // Fire-and-forget: run subagent without awaiting
+    // Fire-and-forget: spawnSubagent already has transient retries; avoid
+    // task-level retries to prevent full end-to-end replays.
     spawnSubagent(
       subagent_type,
       prompt,
@@ -174,6 +195,7 @@ export async function task(args: TaskArgs): Promise<string> {
       args.agent_id,
       args.conversation_id,
       args.max_turns,
+      (update) => appendBackgroundProgress(update.message),
     )
       .then((result) => {
         // Update background task state
@@ -183,8 +205,10 @@ export async function task(args: TaskArgs): Promise<string> {
         }
 
         // Build output header
+        const modelHandle = getSubagentModel(subagentId);
         const header = [
           `subagent_type=${subagent_type}`,
+          modelHandle ? `model=${modelHandle}` : undefined,
           result.agentId ? `agent_id=${result.agentId}` : undefined,
           result.conversationId
             ? `conversation_id=${result.conversationId}`
@@ -344,8 +368,10 @@ export async function task(args: TaskArgs): Promise<string> {
 
     // Include stable subagent metadata so orchestrators can attribute results.
     // Keep the tool return type as a string for compatibility.
+    const modelHandle = getSubagentModel(subagentId);
     const header = [
       `subagent_type=${subagent_type}`,
+      modelHandle ? `model=${modelHandle}` : undefined,
       result.agentId ? `agent_id=${result.agentId}` : undefined,
       result.conversationId
         ? `conversation_id=${result.conversationId}`
