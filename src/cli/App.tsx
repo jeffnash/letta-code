@@ -4467,6 +4467,12 @@ export default function App({
               typeof (e.error as { detail?: unknown }).detail === "string" &&
               (e.error as { detail: string }).detail.includes(
                 "waiting for approval on a tool call",
+              )) ||
+            // Fallback: error string matching (server may return message in "error" field instead of "detail")
+            ("error" in e.error &&
+              typeof (e.error as { error?: unknown }).error === "string" &&
+              (e.error as { error: string }).error.includes(
+                "waiting for approval on a tool call",
               )));
 
         if (isPendingApprovalError) {
