@@ -6550,6 +6550,8 @@ export default function App({
               injected_message_ids?: string[];
               injected_tool_call_ids?: string[];
               pruned_message_ids?: string[];
+              sanitized_message_ids?: string[];
+              sanitized_tool_call_ids?: string[];
             };
 
             let outputMsg = "";
@@ -6569,6 +6571,10 @@ export default function App({
                 for (const msgId of result.pruned_message_ids || []) {
                   outputMsg += `\n  • ${msgId}`;
                 }
+              }
+
+              if ((result.sanitized_tool_call_ids?.length || 0) > 0) {
+                outputMsg += `\n\nMalformed tool-call JSON sanitized: ${result.sanitized_tool_call_ids?.length || 0} tool_call(s) across ${result.sanitized_message_ids?.length || 0} message(s)`;
               }
             } else {
               outputMsg = `⚠ ${result.message}`;

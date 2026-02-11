@@ -71,6 +71,8 @@ describe("RepairMessageHistoryResponse format", () => {
       injected_message_ids: [],
       injected_tool_call_ids: [],
       pruned_message_ids: [],
+      sanitized_message_ids: [],
+      sanitized_tool_call_ids: [],
     };
 
     expect(okResponse.status).toBe("ok");
@@ -118,6 +120,8 @@ describe("RepairMessageHistoryResponse format", () => {
       injected_message_ids: [],
       injected_tool_call_ids: [],
       pruned_message_ids: [],
+      sanitized_message_ids: [],
+      sanitized_tool_call_ids: [],
     };
 
     expect(errorResponse.status).toBe("error");
@@ -137,7 +141,9 @@ describe("output formatting", () => {
       }>,
       injected_message_ids: [] as string[],
       injected_tool_call_ids: [] as string[],
-      pruned_message_ids: [] as string[],
+      pruned_message_ids: [],
+      sanitized_message_ids: [],
+      sanitized_tool_call_ids: [] as string[],
     };
 
     // Simulate the output formatting logic from App.tsx
@@ -200,6 +206,36 @@ describe("output formatting", () => {
     expect(outputMsg).toContain("msg-orphan-output-1");
   });
 
+  test("formats repaired status with sanitization summary", () => {
+    const response = {
+      status: "repaired" as const,
+      message: "Sanitized malformed tool-call JSON in 2 message(s)",
+      orphaned_tool_calls: [] as Array<{
+        message_id: string;
+        tool_call_id: string;
+        tool_name: string;
+        reason: string;
+      }>,
+      injected_message_ids: [] as string[],
+      injected_tool_call_ids: [] as string[],
+      pruned_message_ids: [] as string[],
+      sanitized_message_ids: ["msg-1", "msg-2"] as string[],
+      sanitized_tool_call_ids: ["toolu-1", "toolu-2", "toolu-3"] as string[],
+    };
+
+    let outputMsg = "";
+    if (response.status === "repaired") {
+      outputMsg = `✓ Repaired: ${response.message}`;
+      if ((response.sanitized_tool_call_ids?.length || 0) > 0) {
+        outputMsg += `\n\nMalformed tool-call JSON sanitized: ${response.sanitized_tool_call_ids?.length || 0} tool_call(s) across ${response.sanitized_message_ids?.length || 0} message(s)`;
+      }
+    }
+
+    expect(outputMsg).toContain("✓ Repaired");
+    expect(outputMsg).toContain("Malformed tool-call JSON sanitized");
+    expect(outputMsg).toContain("3 tool_call(s) across 2 message(s)");
+  });
+
   test("formats error status with warning", () => {
     const response = {
       status: "error" as const,
@@ -212,7 +248,9 @@ describe("output formatting", () => {
       }>,
       injected_message_ids: [] as string[],
       injected_tool_call_ids: [] as string[],
-      pruned_message_ids: [] as string[],
+      pruned_message_ids: [],
+      sanitized_message_ids: [],
+      sanitized_tool_call_ids: [] as string[],
     };
 
     // Simulate the output formatting logic from App.tsx
