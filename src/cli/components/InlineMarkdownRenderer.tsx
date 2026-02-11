@@ -1,4 +1,5 @@
 import type React from "react";
+import Link from "ink-link";
 import { colors } from "./colors.js";
 import { Text } from "./Text";
 
@@ -110,15 +111,13 @@ export const InlineMarkdown: React.FC<InlineMarkdownProps> = ({
       const linkMatch = fullMatch.match(/\[(.*?)\]\((.*?)\)/);
       if (linkMatch) {
         const linkText = linkMatch[1];
-        const url = linkMatch[2];
+        const url = linkMatch[2] ?? "";
         nodes.push(
-          <Text key={key} backgroundColor={backgroundColor}>
-            {linkText}
-            <Text color={colors.link.url} backgroundColor={backgroundColor}>
-              {" "}
-              ({url})
+          <Link key={key} url={url}>
+            <Text backgroundColor={backgroundColor}>
+              {linkText} ↗
             </Text>
-          </Text>,
+          </Link>,
         );
       } else {
         // Fallback if link parsing fails
