@@ -1,4 +1,5 @@
 import { Box, useInput } from "ink";
+import Link from "ink-link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getVersion } from "../../version";
 import { commands } from "../commands/registry";
@@ -251,8 +252,11 @@ export function HelpDialog({ onClose }: HelpDialogProps) {
           • Press <Text bold>/</Text> at any time to see command autocomplete
         </Text>
         <Text dimColor>
-          • Visit <Text bold>https://docs.letta.com/letta-code</Text> for more
-          help
+          • Visit{" "}
+          <Link url="https://docs.letta.com/letta-code">
+            <Text bold>docs ↗</Text>
+          </Link>
+          {" "}for more help
         </Text>
       </Box>
     </Box>
