@@ -5,6 +5,7 @@
  */
 
 import { Box, useInput } from "ink";
+import Link from "ink-link";
 import { memo, useSyncExternalStore } from "react";
 import { useAnimation } from "../contexts/AnimationContext.js";
 import { formatStats, getTreeChars } from "../helpers/subagentDisplay.js";
@@ -18,6 +19,8 @@ import { useTerminalWidth } from "../hooks/useTerminalWidth.js";
 import { BlinkDot } from "./BlinkDot.js";
 import { colors } from "./colors.js";
 import { Text } from "./Text";
+
+const isTmux = Boolean(process.env.TMUX);
 
 function formatToolArgs(argsStr: string): string {
   try {
@@ -115,6 +118,22 @@ const AgentRow = memo(
             </Box>
           )}
 
+          {agent.agentURL && (
+            <Box flexDirection="row">
+              <Text color={colors.subagent.treeChar}>
+                {"   "}
+                {continueChar} ⎿{" "}
+              </Text>
+              {!isTmux ? (
+                <Link url={agent.agentURL}>
+                  <Text dimColor>Agent ↗</Text>
+                </Link>
+              ) : (
+                <Text dimColor>{agent.agentURL}</Text>
+              )}
+            </Box>
+          )}
+
           {ids && (
             <Box flexDirection="row">
               <Text color={colors.subagent.treeChar}>
@@ -188,8 +207,13 @@ const AgentRow = memo(
               {"   "}
               {continueChar} ⎿{" "}
             </Text>
-            <Text dimColor>{"Agent URL: "}</Text>
-            <Text dimColor>{agent.agentURL}</Text>
+            {!isTmux ? (
+              <Link url={agent.agentURL}>
+                <Text dimColor>Agent ↗</Text>
+              </Link>
+            ) : (
+              <Text dimColor>{agent.agentURL}</Text>
+            )}
           </Box>
         )}
 
