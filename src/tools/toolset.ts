@@ -285,6 +285,9 @@ export async function switchToolsetForModel(
   // Ensure base memory tool is correct for the model
   await ensureCorrectMemoryTool(agentId, resolvedModel);
 
+  // Remove old toolset tools before re-linking the new set
+  await unlinkToolsFromAgent(agentId);
+
   // Re-link the new toolset to the agent
   await linkToolsToAgent(agentId);
 
