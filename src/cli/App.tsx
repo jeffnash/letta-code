@@ -6805,7 +6805,7 @@ export default function App({
 
           try {
             const client = await getClient();
-            await client.agents.update(agentId, { name: newValue });
+            await client.agents.update(agentId, { name: newValue, hidden: false });
             updateAgentName(newValue);
 
             buffersRef.current.byId.set(cmdId, {
@@ -11824,7 +11824,7 @@ Plan file path: ${planFilePath}`;
 
                     // Rename if new name provided
                     if (newName && newName !== agentName) {
-                      await client.agents.update(agentId, { name: newName });
+                      await client.agents.update(agentId, { name: newName, hidden: false });
                       updateAgentName(newName);
                     }
 
