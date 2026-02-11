@@ -127,6 +127,8 @@ export async function handleHeadlessCommand(
       memfs: { type: "boolean" },
       "no-memfs": { type: "boolean" },
       "max-turns": { type: "string" }, // Maximum number of agentic turns
+      "no-subagent-max-turns": { type: "boolean" }, // Ignore max-turns limit for subagents
+      "show-subagents": { type: "boolean" }, // Don't hide subagents
     },
     strict: false,
     allowPositionals: true,
@@ -267,9 +269,9 @@ export async function handleHeadlessCommand(
   const fromAfFile = values["from-af"] as string | undefined;
   const maxTurnsRaw = values["max-turns"] as string | undefined;
 
-  // Parse and validate max-turns if provided
+  // Parse and validate max-turns if provided (skip if LETTA_NO_MAX_TURNS is set)
   let maxTurns: number | undefined;
-  if (maxTurnsRaw !== undefined) {
+  if (maxTurnsRaw !== undefined && process.env.LETTA_NO_SUBAGENT_MAX_TURNS !== "1") {
     const parsed = parseInt(maxTurnsRaw, 10);
     if (Number.isNaN(parsed) || parsed <= 0) {
       console.error(
