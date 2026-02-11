@@ -363,6 +363,7 @@ export async function createAgent(
   // - memory_blocks: new blocks to create inline
   // - block_ids: references to existing blocks (for shared memory)
   const isSubagent = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
+  const showSubagents = process.env.LETTA_SHOW_SUBAGENTS === "1";
   const tags = ["origin:letta-code"];
   if (isSubagent) {
     tags.push("role:subagent");
@@ -386,7 +387,7 @@ export async function createAgent(
     // Referenced block IDs (existing blocks to attach)
     block_ids: referencedBlockIds.length > 0 ? referencedBlockIds : undefined,
     tags,
-    ...(isSubagent && { hidden: true }),
+    ...(isSubagent && !showSubagents && { hidden: true }),
     // should be default off, but just in case
     include_base_tools: false,
     include_base_tool_rules: false,
