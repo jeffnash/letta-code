@@ -23,6 +23,18 @@ export interface ApprovalContext {
   safetyLevel: "safe" | "moderate" | "dangerous";
 }
 
+function normalizeCommandString(command: unknown): string {
+  if (Array.isArray(command)) {
+    // Prefer the script following -c/-lc if present.
+    const idx = command.findIndex((t) => t === "-c" || t === "-lc");
+    const script = idx >= 0 ? command[idx + 1] : undefined;
+    if (typeof script === "string") return script;
+    return command.join(" ");
+  }
+  if (typeof command === "string") return command;
+  return "";
+}
+
 /**
  * Analyze a tool execution and determine appropriate approval context
  */
@@ -227,15 +239,16 @@ function containsDangerousCommand(command: string): boolean {
 }
 
 function analyzeBashApproval(
-  command: string,
+  command: unknown,
   _workingDir: string,
 ): ApprovalContext {
-  const parts = command.trim().split(/\s+/);
+  const normalized = normalizeCommandString(command);
+  const parts = normalized.trim().split(/\s+/);
   const baseCommand = parts[0] || "";
   const firstArg = parts[1] || "";
 
   // Check if command contains ANY dangerous commands (including in pipelines)
-  if (containsDangerousCommand(command)) {
+  if (containsDangerousCommand(normalized)) {
     return {
       recommendedRule: "",
       ruleDescription: "",
@@ -248,9 +261,9 @@ function analyzeBashApproval(
 
   // Check for dangerous flags
   if (
-    command.includes("--force") ||
-    command.includes("-f") ||
-    command.includes("--hard")
+    normalized.includes("--force") ||
+    normalized.includes("-f") ||
+    normalized.includes("--hard")
   ) {
     return {
       recommendedRule: "",
@@ -352,13 +365,13 @@ function analyzeBashApproval(
   // For pipes (|), the FIRST command is the main one
   // For && and ;, we skip cd prefixes and use the actual command
   if (
-    command.includes("&&") ||
-    command.includes("|") ||
-    command.includes(";")
+    normalized.includes("&&") ||
+    normalized.includes("|") ||
+    normalized.includes(";")
   ) {
     // First, strip everything after the first pipe - the piped-to command is secondary
     // e.g., "curl --version | head -1" -> analyze "curl --version"
-    const beforePipe = (command.split("|")[0] ?? command).trim();
+    const beforePipe = (normalized.split("|")[0] ?? normalized).trim();
 
     // Now split on && and ; to handle cd prefixes
     const segments = beforePipe.split(/\s*(?:&&|;)\s*/);
@@ -442,10 +455,10 @@ function analyzeBashApproval(
 
   // Default: allow this specific command only
   const displayCommand =
-    command.length > 40 ? `${command.slice(0, 40)}...` : command;
+    normalized.length > 40 ? `${normalized.slice(0, 40)}...` : normalized;
 
   return {
-    recommendedRule: `Bash(${command})`,
+    recommendedRule: `Bash(${normalized})`,
     ruleDescription: `'${displayCommand}'`,
     approveAlwaysText: `Yes, and don't ask again for '${displayCommand}' in this project`,
     defaultScope: "project",
