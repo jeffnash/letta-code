@@ -82,6 +82,8 @@ OPTIONS
   --from-af <path>      Create agent from an AgentFile (.af) template
   --memfs               Enable memory filesystem for this agent
   --no-memfs            Disable memory filesystem for this agent
+  --show-subagents      Don't hide subagents created by the Task tool
+  --no-subagent-max-turns  Ignore --max-turns limit for subagents
 
 SUBCOMMANDS (JSON-only)
   letta memfs status --agent <id>
@@ -442,6 +444,9 @@ async function main(): Promise<void> {
         "no-skills": { type: "boolean" },
         memfs: { type: "boolean" },
         "no-memfs": { type: "boolean" },
+        "show-subagents": { type: "boolean" },
+        "no-subagent-max-turns": { type: "boolean" },
+        "max-turns": { type: "string" },
       },
       strict: true,
       allowPositionals: true,
@@ -553,6 +558,8 @@ async function main(): Promise<void> {
   const sleeptimeFlag = (values.sleeptime as boolean | undefined) ?? undefined;
   const memfsFlag = values.memfs as boolean | undefined;
   const noMemfsFlag = values["no-memfs"] as boolean | undefined;
+  const showSubagentsFlag = values["show-subagents"] as boolean | undefined;
+  const noSubagentMaxTurnsFlag = values["no-subagent-max-turns"] as boolean | undefined;
   const fromAfFile = values["from-af"] as string | undefined;
   const isHeadless = values.prompt || values.run || !process.stdin.isTTY;
 
@@ -913,6 +920,16 @@ async function main(): Promise<void> {
         process.exit(1);
       }
     }
+  }
+
+  // Set show-subagents flag via env var so it propagates to child processes
+  if (showSubagentsFlag) {
+    process.env.LETTA_SHOW_SUBAGENTS = "1";
+  }
+
+  // Set no-subagent-max-turns flag via env var so subagents ignore --max-turns
+  if (noSubagentMaxTurnsFlag) {
+    process.env.LETTA_NO_SUBAGENT_MAX_TURNS = "1";
   }
 
   if (isHeadless) {
@@ -1620,8 +1637,11 @@ async function main(): Promise<void> {
 
         // Ensure Letta Code tools are attached to the agent
         // For new agents, linkToolsToAgent is already called in createAgent
-        // For resumed agents, we need to ensure tools are attached in case they're missing
-        const { linkToolsToAgent } = await import("./agent/modify");
+        // For resumed agents, unlink old tools first to clean up stale toolsets
+        const { linkToolsToAgent, unlinkToolsFromAgent } = await import(
+          "./agent/modify"
+        );
+        await unlinkToolsFromAgent(agent.id);
         await linkToolsToAgent(agent.id);
 
         // Ensure local project settings are loaded before updating
@@ -1753,7 +1773,10 @@ async function main(): Promise<void> {
 
         // Re-link tools after model/system prompt updates for resumed agents
         if (resuming) {
-          const { linkToolsToAgent } = await import("./agent/modify");
+          const { linkToolsToAgent, unlinkToolsFromAgent } = await import(
+            "./agent/modify"
+          );
+          await unlinkToolsFromAgent(agent.id);
           await linkToolsToAgent(agent.id);
         }
 
