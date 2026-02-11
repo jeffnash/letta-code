@@ -18,6 +18,14 @@ describe("Shell Launchers", () => {
     expect(launchers).toEqual([]);
   });
 
+  test("accepts argv-style arrays defensively", () => {
+    const launchers = buildShellLaunchers(["bash", "-lc", "echo test"]);
+    expect(launchers.length).toBeGreaterThan(0);
+    // Should still end up passing the script to a launcher.
+    const joined = launchers.map((l) => l.join(" ")).join("\n");
+    expect(joined).toContain("echo test");
+  });
+
   if (process.platform === "win32") {
     describe("Windows-specific", () => {
       test("PowerShell is tried before cmd.exe", () => {
