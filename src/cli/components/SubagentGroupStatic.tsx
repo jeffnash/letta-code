@@ -14,11 +14,14 @@
  */
 
 import { Box } from "ink";
+import Link from "ink-link";
 import { memo } from "react";
 import { formatStats, getTreeChars } from "../helpers/subagentDisplay.js";
 import { useTerminalWidth } from "../hooks/useTerminalWidth.js";
 import { colors } from "./colors.js";
 import { Text } from "./Text";
+
+const isTmux = Boolean(process.env.TMUX);
 
 // ============================================================================
 // Types
@@ -112,8 +115,13 @@ const AgentRow = memo(({ agent, isLast }: AgentRowProps) => {
             {"   "}
             {continueChar} ⎿{" "}
           </Text>
-          <Text dimColor>{"Agent URL: "}</Text>
-          <Text dimColor>{agent.agentURL}</Text>
+          {!isTmux ? (
+            <Link url={agent.agentURL}>
+              <Text dimColor>Agent ↗</Text>
+            </Link>
+          ) : (
+            <Text dimColor>{agent.agentURL}</Text>
+          )}
         </Box>
       )}
 
