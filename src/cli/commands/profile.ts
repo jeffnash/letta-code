@@ -162,7 +162,7 @@ export async function handleProfileSave(
   try {
     const client = await getClient();
     // Update agent name via API
-    await client.agents.update(ctx.agentId, { name: profileName });
+    await client.agents.update(ctx.agentId, { name: profileName, hidden: false });
     ctx.updateAgentName(profileName);
 
     // Save profile to BOTH local and global settings
@@ -331,7 +331,7 @@ export async function handlePin(
     try {
       const { getClient } = await import("../../agent/client");
       const client = await getClient();
-      await client.agents.update(ctx.agentId, { name });
+      await client.agents.update(ctx.agentId, { name, hidden: false });
       ctx.updateAgentName(name);
     } catch (error) {
       addCommandResult(
