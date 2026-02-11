@@ -12,8 +12,8 @@ function pushUnique(
   list.push(entry);
 }
 
-function windowsLaunchers(command: string): string[][] {
-  const trimmed = command.trim();
+function windowsLaunchers(command: unknown): string[][] {
+  const trimmed = normalizeShellScript(command);
   if (!trimmed) return [];
   const launchers: string[][] = [];
   const seen = new Set<string>();
@@ -53,8 +53,8 @@ function windowsLaunchers(command: string): string[][] {
   return launchers;
 }
 
-function unixLaunchers(command: string): string[][] {
-  const trimmed = command.trim();
+function unixLaunchers(command: unknown): string[][] {
+  const trimmed = normalizeShellScript(command);
   if (!trimmed) return [];
   const launchers: string[][] = [];
   const seen = new Set<string>();
@@ -105,8 +105,22 @@ function unixLaunchers(command: string): string[][] {
   return launchers;
 }
 
-export function buildShellLaunchers(command: string): string[][] {
+export function buildShellLaunchers(command: unknown): string[][] {
   return process.platform === "win32"
     ? windowsLaunchers(command)
     : unixLaunchers(command);
+}
+
+function normalizeShellScript(command: unknown): string {
+  // Some call sites (or tool plumbing) may accidentally pass an argv-style
+  // array like ["bash", "-lc", "echo hi"]. Be defensive to avoid crashing
+  // the UI on a .trim() call.
+  if (Array.isArray(command)) {
+    const idx = command.findIndex((t) => t === "-c" || t === "-lc");
+    const script = idx >= 0 ? command[idx + 1] : undefined;
+    if (typeof script === "string") return script.trim();
+    return command.join(" ").trim();
+  }
+  if (typeof command === "string") return command.trim();
+  return "";
 }
