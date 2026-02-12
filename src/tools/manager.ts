@@ -76,11 +76,9 @@ export const ANTHROPIC_DEFAULT_TOOLS: ToolName[] = [
   "Glob",
   "Grep",
   "TaskStop",
-  // Re-enabled: Claude models know about LS and MultiEdit from training and will
-  // attempt to call them even when not in the registry, causing "Tool not found"
-  // errors. Both tools are fully implemented with proper validation, error handling,
-  // and approval gating (LS is read-only, MultiEdit requires approval like Edit).
-  "MultiEdit",
+  // Keep MultiEdit out of Anthropic defaults for now: large payload edits can
+  // produce oversized/truncated tool args in some streaming paths.
+  // "MultiEdit",
   "LS",
   "Read",
   "Skill",
