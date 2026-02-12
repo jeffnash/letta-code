@@ -583,9 +583,9 @@
     }
   },
   {
-    "id": "glm-4.7",
-    "handle": "zai/glm-4.7",
-    "label": "GLM-4.7",
+    "id": "glm-5",
+    "handle": "zai/glm-5",
+    "label": "GLM-5",
     "description": "zAI's latest coding model",
     "isFeatured": true,
     "free": true,
@@ -594,10 +594,10 @@
     }
   },
   {
-    "id": "zai-glm-4.7",
-    "handle": "cliproxy/zai-glm-4.7",
-    "label": "GLM-4.7 (CLIProxy)",
-    "description": "Zai GLM-4.7 via CLIProxyAPI passthru",
+    "id": "zai-glm-5",
+    "handle": "cliproxy/zai-glm-5",
+    "label": "GLM-5 (CLIProxy)",
+    "description": "Zai GLM-5 via CLIProxyAPI passthru",
     "isFeatured": true,
     "updateArgs": {
       "context_window": 204800,
@@ -1766,10 +1766,10 @@
     }
   },
   {
-    "id": "chutes-glm-4.7",
-    "handle": "cliproxy/chutes-zai-org/GLM-4.7",
-    "label": "GLM-4.7 (Chutes)",
-    "description": "GLM-4.7 via Chutes",
+    "id": "chutes-glm-5",
+    "handle": "cliproxy/chutes-zai-org/GLM-5-TEE",
+    "label": "GLM-5 (Chutes)",
+    "description": "GLM-5 via Chutes",
     "updateArgs": {
       "context_window": 128000,
       "max_output_tokens": 32000
