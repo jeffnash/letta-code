@@ -15,6 +15,8 @@ import {
   type ToolReturnContent,
 } from "../tools/manager";
 
+const MALFORMED_TOOL_ARGS_KEY = "__letta_malformed_tool_args";
+
 /**
  * Extract displayable text from tool return content (for UI display).
  * Multimodal content returns the text parts concatenated.
@@ -240,6 +242,33 @@ async function executeSingleDecision(
         parsedArgs = decision.approval.toolArgs || {};
       }
 
+      if (
+        parsedArgs &&
+        typeof parsedArgs === "object" &&
+        (parsedArgs as Record<string, unknown>)[MALFORMED_TOOL_ARGS_KEY] === true
+      ) {
+        const errorMessage =
+          "Error: Tool execution skipped because the model returned malformed tool arguments. Please retry.";
+
+        if (onChunk) {
+          onChunk({
+            message_type: "tool_return_message",
+            id: "dummy",
+            date: new Date().toISOString(),
+            tool_call_id: decision.approval.toolCallId,
+            tool_return: errorMessage,
+            status: "error",
+          });
+        }
+
+        return {
+          type: "tool",
+          tool_call_id: decision.approval.toolCallId,
+          tool_return: errorMessage,
+          status: "error",
+        };
+      }
+
       const toolResult = await executeTool(
         decision.approval.toolName,
         parsedArgs,
@@ -397,6 +426,13 @@ export async function executeApprovalBatch(
         }
       } else {
         args = decision.approval.toolArgs || {};
+      }
+      if (
+        args &&
+        typeof args === "object" &&
+        (args as Record<string, unknown>)[MALFORMED_TOOL_ARGS_KEY] === true
+      ) {
+        args = {};
       }
       const resourceKey = getResourceKey(toolName, args);
 
