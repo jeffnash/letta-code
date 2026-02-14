@@ -387,6 +387,67 @@
     }
   },
   {
+    "id": "gpt-5.3-codex-spark",
+    "handle": "openai/gpt-5.3-codex-spark",
+    "label": "GPT-5.3-Codex-Spark",
+    "description": "GPT-5.3 Spark variant optimized for coding",
+    "updateArgs": {
+      "reasoning_effort": "medium",
+      "verbosity": "medium",
+      "context_window": 128000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "gpt-5.3-codex-spark-low",
+    "handle": "openai/gpt-5.3-codex-spark",
+    "label": "GPT-5.3-Codex-Spark Low",
+    "description": "GPT-5.3 Spark variant (low reasoning) optimized for coding",
+    "updateArgs": {
+      "reasoning_effort": "low",
+      "verbosity": "medium",
+      "context_window": 128000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "gpt-5.3-codex-spark-medium",
+    "handle": "openai/gpt-5.3-codex-spark",
+    "label": "GPT-5.3-Codex-Spark Medium",
+    "description": "GPT-5.3 Spark variant (med reasoning) optimized for coding",
+    "isFeatured": true,
+    "updateArgs": {
+      "reasoning_effort": "medium",
+      "verbosity": "medium",
+      "context_window": 128000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "gpt-5.3-codex-spark-high",
+    "handle": "openai/gpt-5.3-codex-spark",
+    "label": "GPT-5.3-Codex-Spark High",
+    "description": "GPT-5.3 Spark variant (high reasoning) optimized for coding",
+    "updateArgs": {
+      "reasoning_effort": "high",
+      "verbosity": "medium",
+      "context_window": 128000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
+    "id": "gpt-5.3-codex-spark-xhigh",
+    "handle": "openai/gpt-5.3-codex-spark",
+    "label": "GPT-5.3-Codex-Spark XHigh",
+    "description": "GPT-5.3 Spark variant (max reasoning) optimized for coding",
+    "updateArgs": {
+      "reasoning_effort": "xhigh",
+      "verbosity": "medium",
+      "context_window": 128000,
+      "max_output_tokens": 128000
+    }
+  },
+  {
     "id": "gpt-5.1-none",
     "handle": "openai/gpt-5.1",
     "label": "GPT-5.1",
