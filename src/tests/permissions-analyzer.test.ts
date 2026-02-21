@@ -417,6 +417,60 @@ test("Grep outside working directory suggests directory pattern", () => {
   expect(context.approveAlwaysText).toContain("/Users/test/docs/");
 });
 
+test("Read outside Windows working directory emits canonical Windows absolute rule", () => {
+  const context = analyzeApprovalContext(
+    "Read",
+    { file_path: "C:\\Users\\Test\\docs\\api.md" },
+    "C:\\Users\\Test\\project",
+  );
+
+  expect(context.recommendedRule).toBe("Read(C:/Users/Test/docs/**)");
+  expect(context.approveAlwaysText).toContain("C:/Users/Test/docs/");
+});
+
+test("Edit outside Windows working directory emits canonical Windows absolute rule", () => {
+  const context = analyzeApprovalContext(
+    "Edit",
+    { file_path: "C:\\Users\\Test\\docs\\note.md" },
+    "C:\\Users\\Test\\project",
+  );
+
+  expect(context.recommendedRule).toBe("Edit(C:/Users/Test/docs/**)");
+  expect(context.approveAlwaysText).toContain("C:/Users/Test/docs/");
+});
+
+test("Read inside Windows working directory handles drive-letter case differences", () => {
+  const context = analyzeApprovalContext(
+    "Read",
+    { file_path: "c:\\users\\test\\project\\src\\index.ts" },
+    "C:\\Users\\Test\\project",
+  );
+
+  expect(context.recommendedRule).toBe("Read(src/**)");
+});
+
+test("Glob outside Windows working directory emits canonical Windows absolute rule", () => {
+  const context = analyzeApprovalContext(
+    "Glob",
+    { path: "C:\\Users\\Test\\docs" },
+    "C:\\Users\\Test\\project",
+  );
+
+  expect(context.recommendedRule).toBe("Glob(C:/Users/Test/docs/**)");
+  expect(context.approveAlwaysText).toContain("C:/Users/Test/docs/");
+});
+
+test("Grep outside Windows working directory emits canonical Windows absolute rule", () => {
+  const context = analyzeApprovalContext(
+    "Grep",
+    { path: "C:\\Users\\Test\\docs" },
+    "C:\\Users\\Test\\project",
+  );
+
+  expect(context.recommendedRule).toBe("Grep(C:/Users/Test/docs/**)");
+  expect(context.approveAlwaysText).toContain("C:/Users/Test/docs/");
+});
+
 // ============================================================================
 // WebFetch Analysis Tests
 // ============================================================================
@@ -509,4 +563,25 @@ test("Very long non-git commands should generate prefix-based wildcards", () => 
   // Should generate wildcard for "npm run lint"
   expect(context.recommendedRule).toBe("Bash(npm run lint:*)");
   expect(context.approveAlwaysText).toContain("npm run lint");
+});
+
+test("WriteFileGemini uses write-family wildcard rule", () => {
+  const context = analyzeApprovalContext(
+    "WriteFileGemini",
+    { file_path: "src/main.ts", content: "console.log('hi');" },
+    "/Users/test/project",
+  );
+
+  expect(context.recommendedRule).toBe("Write(**)");
+  expect(context.defaultScope).toBe("session");
+});
+
+test("run_shell_command is analyzed as Bash", () => {
+  const context = analyzeApprovalContext(
+    "run_shell_command",
+    { command: "curl -s http://localhost:4321/intro" },
+    "/Users/test/project",
+  );
+
+  expect(context.recommendedRule).toBe("Bash(curl:*)");
 });

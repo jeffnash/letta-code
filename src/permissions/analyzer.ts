@@ -2,7 +2,8 @@
 // Analyze tool executions and recommend appropriate permission rules
 
 import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { dirname, relative, resolve, win32 } from "node:path";
+import { canonicalToolName, isFileToolName } from "./canonical";
 
 export interface ApprovalContext {
   // What rule should be saved if user clicks "approve always"
@@ -41,34 +42,99 @@ function normalizeCommandString(command: unknown): string {
  */
 type ToolArgs = Record<string, unknown>;
 
+function normalizeOsPath(path: string): string {
+  return path.replace(/\\/g, "/");
+}
+
+function isWindowsPath(path: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(path) || /^\\\\/.test(path);
+}
+
+function resolvePathForContext(basePath: string, targetPath: string): string {
+  const windows = isWindowsPath(basePath) || isWindowsPath(targetPath);
+  return windows
+    ? win32.resolve(basePath, targetPath)
+    : resolve(basePath, targetPath);
+}
+
+function relativePathForContext(basePath: string, targetPath: string): string {
+  const windows = isWindowsPath(basePath) || isWindowsPath(targetPath);
+  return windows
+    ? win32.relative(basePath, targetPath)
+    : relative(basePath, targetPath);
+}
+
+function isPathWithinDirectory(path: string, directory: string): boolean {
+  const windows = isWindowsPath(path) || isWindowsPath(directory);
+  const normalizedPath = normalizeOsPath(path);
+  const normalizedDirectory = normalizeOsPath(directory);
+
+  const relativePath = normalizeOsPath(
+    windows
+      ? win32.relative(
+          normalizedDirectory.toLowerCase(),
+          normalizedPath.toLowerCase(),
+        )
+      : relativePathForContext(normalizedDirectory, normalizedPath),
+  );
+
+  if (relativePath === "") {
+    return true;
+  }
+
+  return (
+    !relativePath.startsWith("../") &&
+    relativePath !== ".." &&
+    !relativePath.startsWith("/") &&
+    !/^[a-zA-Z]:\//.test(relativePath)
+  );
+}
+
+function dirnameForContext(path: string): string {
+  return isWindowsPath(path) ? win32.dirname(path) : dirname(path);
+}
+
+function formatAbsoluteRulePath(path: string): string {
+  const normalized = normalizeOsPath(path).replace(/\/+$/, "");
+  if (/^[a-zA-Z]:\//.test(normalized) || normalized.startsWith("//")) {
+    return normalized;
+  }
+  return `//${normalized.replace(/^\/+/, "")}`;
+}
+
+function formatDisplayPath(path: string): string {
+  return normalizeOsPath(path).replace(normalizeOsPath(homedir()), "~");
+}
+
 export function analyzeApprovalContext(
   toolName: string,
   toolArgs: ToolArgs,
   workingDirectory: string,
 ): ApprovalContext {
+  const canonicalTool = canonicalToolName(toolName);
   const resolveFilePath = () => {
     const candidate =
       toolArgs.file_path ?? toolArgs.path ?? toolArgs.notebook_path ?? "";
     return typeof candidate === "string" ? candidate : "";
   };
 
-  switch (toolName) {
+  switch (canonicalTool) {
     case "Read":
-    case "read_file":
       return analyzeReadApproval(resolveFilePath(), workingDirectory);
 
     case "Write":
       return analyzeWriteApproval(resolveFilePath(), workingDirectory);
 
     case "Edit":
-    case "MultiEdit":
       return analyzeEditApproval(resolveFilePath(), workingDirectory);
 
     case "Bash":
-    case "shell":
-    case "shell_command":
       return analyzeBashApproval(
-        typeof toolArgs.command === "string" ? toolArgs.command : "",
+        typeof toolArgs.command === "string"
+          ? toolArgs.command
+          : Array.isArray(toolArgs.command)
+            ? toolArgs.command.join(" ")
+            : "",
         workingDirectory,
       );
 
@@ -79,9 +145,8 @@ export function analyzeApprovalContext(
 
     case "Glob":
     case "Grep":
-    case "grep_files":
       return analyzeSearchApproval(
-        toolName,
+        canonicalTool,
         typeof toolArgs.path === "string" ? toolArgs.path : workingDirectory,
         workingDirectory,
       );
@@ -98,7 +163,7 @@ export function analyzeApprovalContext(
       };
 
     default:
-      return analyzeDefaultApproval(toolName);
+      return analyzeDefaultApproval(canonicalTool, toolArgs, workingDirectory);
   }
 }
 
@@ -109,15 +174,15 @@ function analyzeReadApproval(
   filePath: string,
   workingDir: string,
 ): ApprovalContext {
-  const absolutePath = resolve(workingDir, filePath);
+  const absolutePath = resolvePathForContext(workingDir, filePath);
 
   // If outside working directory, generalize to parent directory
-  if (!absolutePath.startsWith(workingDir)) {
-    const dirPath = dirname(absolutePath);
-    const displayPath = dirPath.replace(require("node:os").homedir(), "~");
+  if (!isPathWithinDirectory(absolutePath, workingDir)) {
+    const dirPath = dirnameForContext(absolutePath);
+    const displayPath = formatDisplayPath(dirPath);
 
     return {
-      recommendedRule: `Read(/${dirPath}/**)`,
+      recommendedRule: `Read(${formatAbsoluteRulePath(dirPath)}/**)`,
       ruleDescription: `reading from ${displayPath}/`,
       approveAlwaysText: `Yes, allow reading from ${displayPath}/ in this project`,
       defaultScope: "project",
@@ -127,9 +192,12 @@ function analyzeReadApproval(
   }
 
   // Inside working directory - use relative path
-  const relativePath = absolutePath.slice(workingDir.length + 1);
+  const relativePath = normalizeOsPath(
+    relativePathForContext(workingDir, absolutePath),
+  );
   const relativeDir = dirname(relativePath);
-  const pattern = relativeDir === "." ? "**" : `${relativeDir}/**`;
+  const pattern =
+    relativeDir === "." || relativeDir === "" ? "**" : `${relativeDir}/**`;
 
   return {
     recommendedRule: `Read(${pattern})`,
@@ -169,14 +237,14 @@ function analyzeEditApproval(
 ): ApprovalContext {
   // Edit is safer than Write (file must exist)
   // Can offer project-level for specific directories
-  const absolutePath = resolve(workingDir, filePath);
-  const dirPath = dirname(absolutePath);
+  const absolutePath = resolvePathForContext(workingDir, filePath);
+  const dirPath = dirnameForContext(absolutePath);
 
-  // If outside working directory, use absolute path with // prefix
-  if (!dirPath.startsWith(workingDir)) {
-    const displayPath = dirPath.replace(require("node:os").homedir(), "~");
+  // If outside working directory, use canonical absolute path pattern
+  if (!isPathWithinDirectory(dirPath, workingDir)) {
+    const displayPath = formatDisplayPath(dirPath);
     return {
-      recommendedRule: `Edit(/${dirPath}/**)`,
+      recommendedRule: `Edit(${formatAbsoluteRulePath(dirPath)}/**)`,
       ruleDescription: `editing files in ${displayPath}/`,
       approveAlwaysText: `Yes, allow editing files in ${displayPath}/ in this project`,
       defaultScope: "project",
@@ -186,8 +254,13 @@ function analyzeEditApproval(
   }
 
   // Inside working directory, use relative path
-  const relativeDirPath = dirPath.slice(workingDir.length + 1);
-  const pattern = relativeDirPath === "" ? "**" : `${relativeDirPath}/**`;
+  const relativeDirPath = normalizeOsPath(
+    relativePathForContext(workingDir, dirPath),
+  );
+  const pattern =
+    relativeDirPath === "" || relativeDirPath === "."
+      ? "**"
+      : `${relativeDirPath}/**`;
 
   return {
     recommendedRule: `Edit(${pattern})`,
@@ -220,6 +293,7 @@ const SAFE_READONLY_COMMANDS = [
   "diff",
   "file",
   "stat",
+  "curl",
 ];
 
 // Commands that should never be auto-approved
@@ -664,13 +738,13 @@ function analyzeSearchApproval(
   searchPath: string,
   workingDir: string,
 ): ApprovalContext {
-  const absolutePath = resolve(workingDir, searchPath);
+  const absolutePath = resolvePathForContext(workingDir, searchPath);
 
-  if (!absolutePath.startsWith(workingDir)) {
-    const displayPath = absolutePath.replace(require("node:os").homedir(), "~");
+  if (!isPathWithinDirectory(absolutePath, workingDir)) {
+    const displayPath = formatDisplayPath(absolutePath);
 
     return {
-      recommendedRule: `${toolName}(/${absolutePath}/**)`,
+      recommendedRule: `${toolName}(${formatAbsoluteRulePath(absolutePath)}/**)`,
       ruleDescription: `searching in ${displayPath}/`,
       approveAlwaysText: `Yes, allow searching in ${displayPath}/ in this project`,
       defaultScope: "project",
@@ -692,7 +766,41 @@ function analyzeSearchApproval(
 /**
  * Default approval for unknown tools
  */
-function analyzeDefaultApproval(toolName: string): ApprovalContext {
+function analyzeDefaultApproval(
+  toolName: string,
+  toolArgs: ToolArgs,
+  workingDir: string,
+): ApprovalContext {
+  if (isFileToolName(toolName)) {
+    const candidate =
+      toolArgs.file_path ?? toolArgs.path ?? toolArgs.notebook_path ?? "";
+    const filePath = typeof candidate === "string" ? candidate : "";
+    if (filePath.trim().length > 0) {
+      const absolutePath = resolvePathForContext(workingDir, filePath);
+      if (!isPathWithinDirectory(absolutePath, workingDir)) {
+        const dirPath = dirnameForContext(absolutePath);
+        const displayPath = formatDisplayPath(dirPath);
+        return {
+          recommendedRule: `${toolName}(${formatAbsoluteRulePath(dirPath)}/**)`,
+          ruleDescription: `${toolName} in ${displayPath}/`,
+          approveAlwaysText: `Yes, allow ${toolName} in ${displayPath}/ in this project`,
+          defaultScope: "project",
+          allowPersistence: true,
+          safetyLevel: "moderate",
+        };
+      }
+    }
+
+    return {
+      recommendedRule: `${toolName}(**)`,
+      ruleDescription: `${toolName} operations`,
+      approveAlwaysText: `Yes, allow ${toolName} operations during this session`,
+      defaultScope: "session",
+      allowPersistence: true,
+      safetyLevel: "moderate",
+    };
+  }
+
   return {
     recommendedRule: toolName,
     ruleDescription: `${toolName} operations`,

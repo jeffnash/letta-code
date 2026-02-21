@@ -4,8 +4,10 @@
 import { resolve } from "node:path";
 import { getCurrentAgentId } from "../agent/context";
 import { runPermissionRequestHooks } from "../hooks";
+import { canonicalToolName, isShellToolName } from "./canonical";
 import { cliPermissions } from "./cli";
 import {
+  type MatcherOptions,
   matchesBashPattern,
   matchesFilePattern,
   matchesToolPattern,
@@ -15,26 +17,27 @@ import { isMemoryDirCommand, isReadOnlyShellCommand } from "./readOnlyShell";
 import { sessionPermissions } from "./session";
 import type {
   PermissionCheckResult,
+  PermissionCheckTrace,
   PermissionDecision,
+  PermissionEngine,
   PermissionRules,
+  PermissionTraceEvent,
 } from "./types";
 
 /**
  * Tools that don't require approval within working directory
  */
-const WORKING_DIRECTORY_TOOLS = [
-  // Default/Anthropic toolset
+const WORKING_DIRECTORY_TOOLS_V2 = ["Read", "Glob", "Grep", "ListDir"];
+const WORKING_DIRECTORY_TOOLS_V1 = [
   "Read",
   "Glob",
   "Grep",
-  // Codex toolset
   "read_file",
   "ReadFile",
   "list_dir",
   "ListDir",
   "grep_files",
   "GrepFiles",
-  // Gemini toolset
   "read_file_gemini",
   "ReadFileGemini",
   "glob_gemini",
@@ -55,6 +58,56 @@ const READ_ONLY_SHELL_TOOLS = new Set([
   "run_shell_command",
   "RunShellCommand",
 ]);
+const FILE_TOOLS_V2 = ["Read", "Write", "Edit", "Glob", "Grep", "ListDir"];
+const FILE_TOOLS_V1 = [
+  "Read",
+  "Write",
+  "Edit",
+  "Glob",
+  "Grep",
+  "read_file",
+  "ReadFile",
+  "list_dir",
+  "ListDir",
+  "grep_files",
+  "GrepFiles",
+  "read_file_gemini",
+  "ReadFileGemini",
+  "write_file_gemini",
+  "WriteFileGemini",
+  "glob_gemini",
+  "GlobGemini",
+  "list_directory",
+  "ListDirectory",
+  "search_file_content",
+  "SearchFileContent",
+  "read_many_files",
+  "ReadManyFiles",
+];
+
+type ToolArgs = Record<string, unknown>;
+
+function envFlagEnabled(name: string): boolean {
+  const value = process.env[name];
+  if (!value) return false;
+  return value === "1" || value.toLowerCase() === "true";
+}
+
+function isPermissionsV2Enabled(): boolean {
+  const value = process.env.LETTA_PERMISSIONS_V2;
+  if (!value) return true;
+  return !(value === "0" || value.toLowerCase() === "false");
+}
+
+function shouldAttachTrace(result: PermissionCheckResult): boolean {
+  if (envFlagEnabled("LETTA_PERMISSION_TRACE_ALL")) {
+    return true;
+  }
+  if (!envFlagEnabled("LETTA_PERMISSION_TRACE")) {
+    return false;
+  }
+  return result.decision === "ask" || result.decision === "deny";
+}
 
 /**
  * Check permission for a tool execution.
@@ -75,50 +128,183 @@ const READ_ONLY_SHELL_TOOLS = new Set([
  * @param permissions - Loaded permission rules
  * @param workingDirectory - Current working directory
  */
-type ToolArgs = Record<string, unknown>;
-
 export function checkPermission(
   toolName: string,
   toolArgs: ToolArgs,
   permissions: PermissionRules,
   workingDirectory: string = process.cwd(),
 ): PermissionCheckResult {
-  // Build permission query string
-  const query = buildPermissionQuery(toolName, toolArgs);
+  const engine: PermissionEngine = isPermissionsV2Enabled() ? "v2" : "v1";
+  const primary = checkPermissionForEngine(
+    engine,
+    toolName,
+    toolArgs,
+    permissions,
+    workingDirectory,
+  );
 
-  // Get session rules
+  let result: PermissionCheckResult = primary.result;
+  const includeTrace = shouldAttachTrace(primary.result);
+  if (includeTrace) {
+    result = {
+      ...result,
+      trace: primary.trace,
+    };
+    console.error(
+      `[permissions] trace ${JSON.stringify({
+        toolName,
+        engine,
+        decision: primary.result.decision,
+        matchedRule: primary.result.matchedRule,
+        query: primary.trace.query,
+        events: primary.trace.events,
+      })}`,
+    );
+  }
+
+  if (envFlagEnabled("LETTA_PERMISSIONS_DUAL_EVAL")) {
+    const shadowEngine: PermissionEngine = engine === "v2" ? "v1" : "v2";
+    const shadow = checkPermissionForEngine(
+      shadowEngine,
+      toolName,
+      toolArgs,
+      permissions,
+      workingDirectory,
+    );
+
+    const mismatch =
+      primary.result.decision !== shadow.result.decision ||
+      primary.result.matchedRule !== shadow.result.matchedRule;
+
+    if (mismatch) {
+      console.error(
+        `[permissions] dual-eval mismatch ${JSON.stringify({
+          toolName,
+          primary: {
+            engine,
+            decision: primary.result.decision,
+            matchedRule: primary.result.matchedRule,
+          },
+          shadow: {
+            engine: shadowEngine,
+            decision: shadow.result.decision,
+            matchedRule: shadow.result.matchedRule,
+          },
+        })}`,
+      );
+    }
+
+    if (includeTrace && result.trace) {
+      result.trace = {
+        ...result.trace,
+        shadow: {
+          engine: shadowEngine,
+          decision: shadow.result.decision,
+          matchedRule: shadow.result.matchedRule,
+        },
+      };
+    }
+  }
+
+  return result;
+}
+
+function createTrace(
+  engine: PermissionEngine,
+  toolName: string,
+  canonicalTool: string,
+  query: string,
+): PermissionCheckTrace {
+  return {
+    engine,
+    toolName,
+    canonicalToolName: canonicalTool,
+    query,
+    events: [],
+  };
+}
+
+function traceEvent(
+  trace: PermissionCheckTrace,
+  stage: string,
+  message?: string,
+  pattern?: string,
+  matched?: boolean,
+): void {
+  const event: PermissionTraceEvent = { stage };
+  if (message) event.message = message;
+  if (pattern) event.pattern = pattern;
+  if (matched !== undefined) event.matched = matched;
+  trace.events.push(event);
+}
+
+function checkPermissionForEngine(
+  engine: PermissionEngine,
+  toolName: string,
+  toolArgs: ToolArgs,
+  permissions: PermissionRules,
+  workingDirectory: string,
+): { result: PermissionCheckResult; trace: PermissionCheckTrace } {
+  const canonicalTool = canonicalToolName(toolName);
+  const queryTool = engine === "v2" ? canonicalTool : toolName;
+  const query = buildPermissionQuery(queryTool, toolArgs, engine);
+  const trace = createTrace(engine, toolName, canonicalTool, query);
   const sessionRules = sessionPermissions.getRules();
+  const workingDirectoryTools =
+    engine === "v2" ? WORKING_DIRECTORY_TOOLS_V2 : WORKING_DIRECTORY_TOOLS_V1;
 
-  // Check deny rules FIRST (highest priority - overrides everything including working directory)
   if (permissions.deny) {
     for (const pattern of permissions.deny) {
-      if (matchesPattern(toolName, query, pattern, workingDirectory)) {
+      const matched = matchesPattern(
+        toolName,
+        query,
+        pattern,
+        workingDirectory,
+        engine,
+      );
+      traceEvent(trace, "deny-rule", undefined, pattern, matched);
+      if (matched) {
         return {
-          decision: "deny",
-          matchedRule: pattern,
-          reason: "Matched deny rule",
+          result: {
+            decision: "deny",
+            matchedRule: pattern,
+            reason: "Matched deny rule",
+          },
+          trace,
         };
       }
     }
   }
 
-  // Check CLI disallowedTools (second highest priority - overrides all allow rules)
   const disallowedTools = cliPermissions.getDisallowedTools();
   for (const pattern of disallowedTools) {
-    if (matchesPattern(toolName, query, pattern, workingDirectory)) {
+    const matched = matchesPattern(
+      toolName,
+      query,
+      pattern,
+      workingDirectory,
+      engine,
+    );
+    traceEvent(trace, "cli-disallow-rule", undefined, pattern, matched);
+    if (matched) {
       return {
-        decision: "deny",
-        matchedRule: `${pattern} (CLI)`,
-        reason: "Matched --disallowedTools flag",
+        result: {
+          decision: "deny",
+          matchedRule: `${pattern} (CLI)`,
+          reason: "Matched --disallowedTools flag",
+        },
+        trace,
       };
     }
   }
 
-  // Check permission mode (applies before CLI allow rules but after deny rules)
-  const modeOverride = permissionMode.checkModeOverride(toolName, toolArgs);
+  const modeOverride = permissionMode.checkModeOverride(
+    toolName,
+    toolArgs,
+    workingDirectory,
+  );
   if (modeOverride) {
     const currentMode = permissionMode.getMode();
-    // Include plan file path and guidance in denial message for plan mode
     let reason = `Permission mode: ${currentMode}`;
     if (currentMode === "plan" && modeOverride === "deny") {
       const planFilePath = permissionMode.getPlanFilePath();
@@ -136,114 +322,183 @@ export function checkPermission(
         `Use ExitPlanMode when your plan is ready for user approval.` +
         shellRedirectionHint;
     }
+    traceEvent(trace, "mode-override", reason);
     return {
-      decision: modeOverride,
-      matchedRule: `${currentMode} mode`,
-      reason,
+      result: {
+        decision: modeOverride,
+        matchedRule: `${currentMode} mode`,
+        reason,
+      },
+      trace,
     };
   }
 
-  // Check CLI allowedTools (third priority - overrides settings but not deny rules)
   const allowedTools = cliPermissions.getAllowedTools();
   for (const pattern of allowedTools) {
-    if (matchesPattern(toolName, query, pattern, workingDirectory)) {
+    const matched = matchesPattern(
+      toolName,
+      query,
+      pattern,
+      workingDirectory,
+      engine,
+    );
+    traceEvent(trace, "cli-allow-rule", undefined, pattern, matched);
+    if (matched) {
       return {
-        decision: "allow",
-        matchedRule: `${pattern} (CLI)`,
-        reason: "Matched --allowedTools flag",
+        result: {
+          decision: "allow",
+          matchedRule: `${pattern} (CLI)`,
+          reason: "Matched --allowedTools flag",
+        },
+        trace,
       };
     }
   }
 
-  // Always allow Skill tool (read-only operation that loads skills from potentially external directories)
   if (toolName === "Skill") {
+    traceEvent(trace, "skill-auto-allow", "Skill tool is always allowed");
     return {
-      decision: "allow",
-      reason: "Skill tool is always allowed (read-only)",
+      result: {
+        decision: "allow",
+        reason: "Skill tool is always allowed (read-only)",
+      },
+      trace,
     };
   }
 
-  if (READ_ONLY_SHELL_TOOLS.has(toolName)) {
+  if (READ_ONLY_SHELL_TOOLS.has(toolName) || isShellToolName(canonicalTool)) {
     const shellCommand = extractShellCommand(toolArgs);
     if (shellCommand && isReadOnlyShellCommand(shellCommand)) {
+      traceEvent(trace, "readonly-shell-auto-allow", "Read-only shell command");
       return {
-        decision: "allow",
-        reason: "Read-only shell command",
+        result: {
+          decision: "allow",
+          reason: "Read-only shell command",
+        },
+        trace,
       };
     }
-    // Auto-approve commands that exclusively target the agent's memory directory
     if (shellCommand) {
       try {
         const agentId = getCurrentAgentId();
         if (isMemoryDirCommand(shellCommand, agentId)) {
+          traceEvent(
+            trace,
+            "memory-dir-auto-allow",
+            "Agent memory directory operation",
+          );
           return {
-            decision: "allow",
-            reason: "Agent memory directory operation",
+            result: {
+              decision: "allow",
+              reason: "Agent memory directory operation",
+            },
+            trace,
           };
         }
       } catch {
-        // No agent context set — skip memory dir check
+        traceEvent(trace, "memory-dir-check", "No agent context; skipped");
       }
     }
   }
 
-  // After checking CLI overrides, check if Read/Glob/Grep within working directory
-  if (WORKING_DIRECTORY_TOOLS.includes(toolName)) {
+  if (workingDirectoryTools.includes(queryTool)) {
     const filePath = extractFilePath(toolArgs);
     if (
       filePath &&
       isWithinAllowedDirectories(filePath, permissions, workingDirectory)
     ) {
+      traceEvent(
+        trace,
+        "working-directory-auto-allow",
+        `Allowed path: ${filePath}`,
+      );
       return {
-        decision: "allow",
-        reason: "Within working directory",
+        result: {
+          decision: "allow",
+          reason: "Within working directory",
+        },
+        trace,
       };
     }
   }
 
-  // Check session allow rules (higher precedence than persisted allow)
   if (sessionRules.allow) {
     for (const pattern of sessionRules.allow) {
-      if (matchesPattern(toolName, query, pattern, workingDirectory)) {
+      const matched = matchesPattern(
+        toolName,
+        query,
+        pattern,
+        workingDirectory,
+        engine,
+      );
+      traceEvent(trace, "session-allow-rule", undefined, pattern, matched);
+      if (matched) {
         return {
-          decision: "allow",
-          matchedRule: `${pattern} (session)`,
-          reason: "Matched session allow rule",
+          result: {
+            decision: "allow",
+            matchedRule: `${pattern} (session)`,
+            reason: "Matched session allow rule",
+          },
+          trace,
         };
       }
     }
   }
 
-  // Check persisted allow rules
   if (permissions.allow) {
     for (const pattern of permissions.allow) {
-      if (matchesPattern(toolName, query, pattern, workingDirectory)) {
+      const matched = matchesPattern(
+        toolName,
+        query,
+        pattern,
+        workingDirectory,
+        engine,
+      );
+      traceEvent(trace, "allow-rule", undefined, pattern, matched);
+      if (matched) {
         return {
-          decision: "allow",
-          matchedRule: pattern,
-          reason: "Matched allow rule",
+          result: {
+            decision: "allow",
+            matchedRule: pattern,
+            reason: "Matched allow rule",
+          },
+          trace,
         };
       }
     }
   }
 
-  // Check ask rules
   if (permissions.ask) {
     for (const pattern of permissions.ask) {
-      if (matchesPattern(toolName, query, pattern, workingDirectory)) {
+      const matched = matchesPattern(
+        toolName,
+        query,
+        pattern,
+        workingDirectory,
+        engine,
+      );
+      traceEvent(trace, "ask-rule", undefined, pattern, matched);
+      if (matched) {
         return {
-          decision: "ask",
-          matchedRule: pattern,
-          reason: "Matched ask rule",
+          result: {
+            decision: "ask",
+            matchedRule: pattern,
+            reason: "Matched ask rule",
+          },
+          trace,
         };
       }
     }
   }
 
-  // Fall back to tool defaults
+  const defaultDecision = getDefaultDecision(toolName, toolArgs);
+  traceEvent(trace, "default-decision", `Default: ${defaultDecision}`);
   return {
-    decision: getDefaultDecision(toolName, toolArgs),
-    reason: "Default behavior for tool",
+    result: {
+      decision: defaultDecision,
+      reason: "Default behavior for tool",
+    },
+    trace,
   };
 }
 
@@ -299,7 +554,11 @@ function isWithinAllowedDirectories(
 /**
  * Build permission query string for a tool execution
  */
-function buildPermissionQuery(toolName: string, toolArgs: ToolArgs): string {
+function buildPermissionQuery(
+  toolName: string,
+  toolArgs: ToolArgs,
+  engine: PermissionEngine,
+): string {
   switch (toolName) {
     // File tools: "ToolName(path/to/file)"
     case "Read":
@@ -307,14 +566,12 @@ function buildPermissionQuery(toolName: string, toolArgs: ToolArgs): string {
     case "Edit":
     case "Glob":
     case "Grep":
-    // Codex file tools
+    case "ListDir":
     case "read_file":
     case "ReadFile":
     case "list_dir":
-    case "ListDir":
     case "grep_files":
     case "GrepFiles":
-    // Gemini file tools
     case "read_file_gemini":
     case "ReadFileGemini":
     case "write_file_gemini":
@@ -334,11 +591,29 @@ function buildPermissionQuery(toolName: string, toolArgs: ToolArgs): string {
     case "Bash": {
       // Bash: "Bash(command with args)"
       const command =
-        typeof toolArgs.command === "string" ? toolArgs.command : "";
+        typeof toolArgs.command === "string"
+          ? toolArgs.command
+          : Array.isArray(toolArgs.command)
+            ? toolArgs.command.join(" ")
+            : "";
       return `Bash(${command})`;
     }
     case "shell":
     case "shell_command": {
+      const command =
+        typeof toolArgs.command === "string"
+          ? toolArgs.command
+          : Array.isArray(toolArgs.command)
+            ? toolArgs.command.join(" ")
+            : "";
+      return `Bash(${command})`;
+    }
+    case "run_shell_command":
+    case "RunShellCommand": {
+      if (engine === "v1") {
+        // Legacy behavior did not normalize this alias into Bash queries.
+        return toolName;
+      }
       const command =
         typeof toolArgs.command === "string"
           ? toolArgs.command
@@ -368,38 +643,6 @@ function hasShellRedirection(command: string | string[]): boolean {
 }
 
 /**
- * File tools that use glob matching for permissions
- */
-const FILE_TOOLS = [
-  // Default/Anthropic toolset
-  "Read",
-  "Write",
-  "Edit",
-  "Glob",
-  "Grep",
-  // Codex toolset
-  "read_file",
-  "ReadFile",
-  "list_dir",
-  "ListDir",
-  "grep_files",
-  "GrepFiles",
-  // Gemini toolset
-  "read_file_gemini",
-  "ReadFileGemini",
-  "write_file_gemini",
-  "WriteFileGemini",
-  "glob_gemini",
-  "GlobGemini",
-  "list_directory",
-  "ListDirectory",
-  "search_file_content",
-  "SearchFileContent",
-  "read_many_files",
-  "ReadManyFiles",
-];
-
-/**
  * Check if query matches a permission pattern
  */
 function matchesPattern(
@@ -407,23 +650,32 @@ function matchesPattern(
   query: string,
   pattern: string,
   workingDirectory: string,
+  engine: PermissionEngine,
 ): boolean {
+  const matcherOptions: MatcherOptions =
+    engine === "v2"
+      ? { canonicalizeToolNames: true, allowBareToolFallback: true }
+      : { canonicalizeToolNames: false, allowBareToolFallback: false };
+  const toolForMatch = engine === "v2" ? canonicalToolName(toolName) : toolName;
+  const fileTools = engine === "v2" ? FILE_TOOLS_V2 : FILE_TOOLS_V1;
   // File tools use glob matching
-  if (FILE_TOOLS.includes(toolName)) {
-    return matchesFilePattern(query, pattern, workingDirectory);
+  if (fileTools.includes(toolForMatch)) {
+    return matchesFilePattern(query, pattern, workingDirectory, matcherOptions);
   }
 
   // Bash uses prefix matching
-  if (
-    toolName === "Bash" ||
-    toolName === "shell" ||
-    toolName === "shell_command"
-  ) {
-    return matchesBashPattern(query, pattern);
+  const legacyShellTool =
+    engine === "v1" &&
+    (toolForMatch === "Bash" ||
+      toolForMatch === "shell" ||
+      toolForMatch === "shell_command");
+  const v2ShellTool = engine === "v2" && isShellToolName(toolName);
+  if (toolForMatch === "Bash" || legacyShellTool || v2ShellTool) {
+    return matchesBashPattern(query, pattern, matcherOptions);
   }
 
   // Other tools use simple name matching
-  return matchesToolPattern(toolName, pattern);
+  return matchesToolPattern(toolForMatch, pattern, matcherOptions);
 }
 
 /**

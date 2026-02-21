@@ -3,7 +3,7 @@ import type { Stream } from "@letta-ai/letta-client/core/streaming";
 import type { LettaStreamingResponse } from "@letta-ai/letta-client/resources/agents/messages";
 import type { StopReasonType } from "@letta-ai/letta-client/resources/runs/runs";
 import { getClient } from "../../agent/client";
-import { STREAM_REQUEST_START_TIME } from "../../agent/message";
+import { getStreamRequestStartTime } from "../../agent/message";
 import { debugWarn } from "../../utils/debug";
 import { formatDuration, logTiming } from "../../utils/timing";
 
@@ -13,6 +13,7 @@ import {
   markIncompleteToolsAsCancelled,
   onChunk,
 } from "./accumulator";
+import { chunkLog } from "./chunkLog";
 import type { ContextTracker } from "./contextTracker";
 import type { ErrorInfo } from "./streamProcessor";
 import { StreamProcessor } from "./streamProcessor";
@@ -64,11 +65,7 @@ export async function drainStream(
   contextTracker?: ContextTracker,
 ): Promise<DrainResult> {
   const startTime = performance.now();
-
-  // Extract request start time for TTFT logging (attached by sendMessageStream)
-  const requestStartTime = (
-    stream as unknown as Record<symbol, number | undefined>
-  )[STREAM_REQUEST_START_TIME];
+  const requestStartTime = getStreamRequestStartTime(stream) ?? startTime;
   let hasLoggedTTFT = false;
 
   const streamProcessor = new StreamProcessor();
@@ -159,7 +156,6 @@ export async function drainStream(
       // Log TTFT (time-to-first-token) when first content chunk arrives
       if (
         !hasLoggedTTFT &&
-        requestStartTime !== undefined &&
         (chunk.message_type === "reasoning_message" ||
           chunk.message_type === "assistant_message")
       ) {
@@ -170,6 +166,13 @@ export async function drainStream(
 
       const { shouldOutput, errorInfo, updatedApproval } =
         streamProcessor.processChunk(chunk);
+
+      // Log chunk for feedback diagnostics
+      try {
+        chunkLog.append(chunk);
+      } catch {
+        // Silently ignore -- diagnostics should not break streaming
+      }
 
       // Check abort signal before processing - don't add data after interrupt
       if (abortSignal?.aborted) {
@@ -239,11 +242,19 @@ export async function drainStream(
       fallbackError = errorMessage;
     }
 
-    // Set error stop reason so drainStreamWithResume can try to reconnect
-    stopReason = "error";
+    // Preserve a stop reason already parsed from stream chunks (e.g. llm_api_error)
+    // and only fall back to generic "error" when none is available.
+    stopReason = streamProcessor.stopReason || "error";
     markIncompleteToolsAsCancelled(buffers, true, "stream_error");
     queueMicrotask(refresh);
   } finally {
+    // Persist chunk log to disk (one write per stream, not per chunk)
+    try {
+      chunkLog.flush();
+    } catch {
+      // Silently ignore -- diagnostics should not break streaming
+    }
+
     // Clean up abort listener
     if (abortSignal) {
       abortSignal.removeEventListener("abort", abortHandler);

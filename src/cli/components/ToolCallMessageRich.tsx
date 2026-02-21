@@ -21,6 +21,7 @@ import {
   isPatchTool,
   isPlanTool,
   isSearchTool,
+  isShellOutputTool,
   isTaskTool,
   isTodoTool,
 } from "../helpers/toolNameMapping.js";
@@ -61,22 +62,6 @@ type ToolCallLine = {
   phase: "streaming" | "ready" | "running" | "finished";
   streaming?: StreamingState;
 };
-
-/**
- * Check if tool is a shell/bash tool that supports streaming output
- */
-function isShellTool(name: string): boolean {
-  const shellTools = [
-    "Bash",
-    "Shell",
-    "shell",
-    "shell_command",
-    "run_shell_command",
-    "RunShellCommand",
-    "ShellCommand",
-  ];
-  return shellTools.includes(name);
-}
 
 /**
  * ToolCallMessageRich - Rich formatting version with old layout logic
@@ -207,7 +192,12 @@ export const ToolCallMessage = memo(
         const truncatedDisplay = needsTruncation
           ? `${normalizedDisplay.slice(0, maxArgsChars - 1)}…`
           : normalizedDisplay;
-        args = `(${truncatedDisplay})`;
+        if (rawName.toLowerCase() === "taskoutput") {
+          const separator = truncatedDisplay.startsWith("(") ? "" : " ";
+          args = separator + truncatedDisplay;
+        } else {
+          args = `(${truncatedDisplay})`;
+        }
       }
     }
 
@@ -233,10 +223,29 @@ export const ToolCallMessage = memo(
     const dotShouldAnimate =
       line.phase === "running" || (line.phase === "ready" && !isStreaming);
 
+    // Extract display text from tool result (handles JSON responses)
+    const extractMessageFromResult = (text: string): string => {
+      try {
+        const parsed = JSON.parse(text);
+        // If it's a JSON object with a message field, extract that
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          typeof parsed.message === "string"
+        ) {
+          return parsed.message;
+        }
+      } catch {
+        // Not JSON or parsing failed, use as-is
+      }
+      return text;
+    };
+
     // Format result for display
     const getResultElement = () => {
       if (!line.resultText) return null;
 
+      const extractedText = extractMessageFromResult(line.resultText);
       const prefix = `  ⎿  `; // Match old format: 2 spaces, glyph, 2 spaces
       const prefixWidth = 5; // Total width of prefix
       const contentWidth = Math.max(0, columns - prefixWidth);
@@ -270,7 +279,7 @@ export const ToolCallMessage = memo(
 
       // Truncate the result text for display (UI only, API gets full response)
       // Strip trailing newlines to avoid extra visual spacing (e.g., from bash echo)
-      const displayResultText = clipToolReturn(line.resultText).replace(
+      const displayResultText = clipToolReturn(extractedText).replace(
         /\n+$/,
         "",
       );
@@ -846,16 +855,21 @@ export const ToolCallMessage = memo(
         </Box>
 
         {/* Streaming output for shell tools during execution */}
-        {isShellTool(rawName) && line.phase === "running" && line.streaming && (
-          <StreamingOutputDisplay streaming={line.streaming} />
-        )}
+        {isShellOutputTool(rawName) &&
+          line.phase === "running" &&
+          line.streaming && (
+            <StreamingOutputDisplay streaming={line.streaming} />
+          )}
 
         {/* Collapsed output for shell tools after completion */}
-        {isShellTool(rawName) &&
+        {isShellOutputTool(rawName) &&
           line.phase === "finished" &&
           line.resultText &&
           line.resultOk !== false && (
-            <CollapsedOutputDisplay output={line.resultText} maxChars={300} />
+            <CollapsedOutputDisplay
+              output={extractMessageFromResult(line.resultText)}
+              maxChars={300}
+            />
           )}
 
         {/* Tool result for non-shell tools or shell tool errors */}
@@ -865,7 +879,7 @@ export const ToolCallMessage = memo(
           // - Shell tool with error (show error message)
           // - Shell tool in streaming/ready phase (show default "Running..." etc)
           const showDefaultResult =
-            !isShellTool(rawName) ||
+            !isShellOutputTool(rawName) ||
             (line.phase === "finished" && line.resultOk === false) ||
             (line.phase !== "running" && line.phase !== "finished");
           return showDefaultResult ? getResultElement() : null;

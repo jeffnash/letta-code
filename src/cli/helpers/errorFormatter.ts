@@ -1,5 +1,6 @@
 import { APIError } from "@letta-ai/letta-client/core/error";
 import { getErrorContext } from "./errorContext";
+import { checkZaiError } from "./zaiErrors";
 
 const LETTA_USAGE_URL = "https://app.letta.com/settings/organization/usage";
 const LETTA_AGENTS_URL =
@@ -166,6 +167,19 @@ function isCreditExhaustedError(e: APIError, reasons?: string[]): boolean {
   return hasErrorReason(e, "not-enough-credits", reasons);
 }
 
+function getTierUsageLimitMessage(reasons: string[]): string | undefined {
+  if (reasons.includes("premium-usage-exceeded")) {
+    return `You've reached your Premium model usage limit. Try switching to Standard or Basic hosted models with /model. View your plan and usage at ${LETTA_USAGE_URL}, or connect your own provider keys with /connect.`;
+  }
+  if (reasons.includes("standard-usage-exceeded")) {
+    return `You've reached your Standard model usage limit. Try switching to Basic hosted models with /model. View your plan and usage at ${LETTA_USAGE_URL}, or connect your own provider keys with /connect.`;
+  }
+  if (reasons.includes("basic-usage-exceeded")) {
+    return `You've reached your Basic model usage limit. Try switching models with /model, view your plan and usage at ${LETTA_USAGE_URL}, or connect your own provider keys with /connect.`;
+  }
+  return undefined;
+}
+
 const ENCRYPTED_CONTENT_HINT = [
   "",
   "This occurs when the conversation contains messages with encrypted",
@@ -293,6 +307,20 @@ export function formatErrorDetails(
   const encryptedContentMsg = checkEncryptedContentError(e);
   if (encryptedContentMsg) return encryptedContentMsg;
 
+  // Check for Z.ai provider errors (wrapped in generic "OpenAI" messages)
+  const errorText =
+    e instanceof APIError
+      ? e.message
+      : e instanceof Error
+        ? e.message
+        : typeof e === "string"
+          ? e
+          : undefined;
+  if (errorText) {
+    const zaiMsg = checkZaiError(errorText);
+    if (zaiMsg) return zaiMsg;
+  }
+
   // Handle APIError from streaming (event: error)
   if (e instanceof APIError) {
     const reasons = getErrorReasons(e);
@@ -341,13 +369,8 @@ export function formatErrorDetails(
       return `Your account is out of credits for hosted inference. Add credits, enable auto-recharge, or upgrade at ${LETTA_USAGE_URL}. You can also connect your own provider keys with /connect.`;
     }
 
-    if (
-      hasErrorReason(e, "premium-usage-exceeded", reasons) ||
-      hasErrorReason(e, "standard-usage-exceeded", reasons) ||
-      hasErrorReason(e, "basic-usage-exceeded", reasons)
-    ) {
-      return `You've reached your hosted model usage limit. View your plan and usage at ${LETTA_USAGE_URL}, or connect your own provider keys with /connect.`;
-    }
+    const tierUsageLimitMsg = getTierUsageLimitMessage(reasons);
+    if (tierUsageLimitMsg) return tierUsageLimitMsg;
 
     if (hasErrorReason(e, "byok-not-available-on-free-tier", reasons)) {
       const { modelDisplayName } = getErrorContext();
@@ -490,10 +513,47 @@ export function getRetryStatusMessage(
 ): string {
   if (!errorDetail) return DEFAULT_RETRY_MESSAGE;
 
+  if (checkZaiError(errorDetail)) return "Z.ai API error, retrying...";
+
   if (errorDetail.includes("Anthropic API is overloaded"))
     return "Anthropic API is overloaded, retrying...";
+  if (
+    errorDetail.includes("ChatGPT API error") ||
+    errorDetail.includes("ChatGPT server error")
+  ) {
+    return "OpenAI ChatGPT backend connection failed, retrying...";
+  }
+  if (
+    errorDetail.includes("upstream connect error") ||
+    errorDetail.includes("Connection error during streaming") ||
+    errorDetail.includes("incomplete chunked read") ||
+    errorDetail.includes("connection termination")
+  ) {
+    const provider = getProviderDisplayName();
+    return `${provider} streaming connection dropped, retrying...`;
+  }
+  if (errorDetail.includes("OpenAI API error"))
+    return "OpenAI API error, retrying...";
 
   return DEFAULT_RETRY_MESSAGE;
+}
+
+const ENDPOINT_TYPE_DISPLAY_NAMES: Record<string, string> = {
+  openai: "OpenAI",
+  anthropic: "Anthropic",
+  chatgpt_oauth: "ChatGPT",
+  google_ai: "Google AI",
+  google_vertex: "Google Vertex",
+  bedrock: "AWS Bedrock",
+  openrouter: "OpenRouter",
+  minimax: "MiniMax",
+  zai: "zAI",
+};
+
+function getProviderDisplayName(): string {
+  const { modelEndpointType } = getErrorContext();
+  if (!modelEndpointType) return "LLM";
+  return ENDPOINT_TYPE_DISPLAY_NAMES[modelEndpointType] ?? modelEndpointType;
 }
 
 /**
@@ -504,6 +564,6 @@ function createAgentLink(
   agentId: string,
   conversationId?: string,
 ): string {
-  const url = `https://app.letta.com/agents/${agentId}${conversationId ? `?conversation=${conversationId}` : ""}`;
+  const url = `https://app.letta.com/agents/${agentId}${conversationId && conversationId !== "default" ? `?conversation=${conversationId}` : ""}`;
   return `View agent: \x1b]8;;${url}\x1b\\${agentId}\x1b]8;;\x1b\\ (run: ${runId})`;
 }

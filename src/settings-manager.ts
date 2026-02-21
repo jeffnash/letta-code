@@ -47,6 +47,14 @@ export interface AgentSettings {
   baseUrl?: string; // undefined = Letta API (api.letta.com)
   pinned?: boolean; // true if agent is pinned
   memfs?: boolean; // true if memory filesystem is enabled
+  toolset?:
+    | "auto"
+    | "codex"
+    | "codex_snake"
+    | "default"
+    | "gemini"
+    | "gemini_snake"
+    | "none"; // toolset mode for this agent (manual override or auto)
 }
 
 export interface Settings {
@@ -182,6 +190,10 @@ class SettingsManager {
   private initialized = false;
   private pendingWrites = new Set<Promise<void>>();
   private secretsAvailable: boolean | null = null;
+  // Keys loaded from the file or explicitly set via updateSettings().
+  // persistSettings() only writes these keys, so manual file edits for
+  // keys we never touched are preserved instead of being clobbered by defaults.
+  private managedKeys = new Set<string>();
 
   /**
    * Initialize the settings manager (loads from disk)
@@ -197,6 +209,9 @@ class SettingsManager {
       if (!exists(settingsPath)) {
         // Create default settings file
         this.settings = { ...DEFAULT_SETTINGS };
+        for (const key of Object.keys(DEFAULT_SETTINGS)) {
+          this.managedKeys.add(key);
+        }
         await this.persistSettings();
       } else {
         // Read and parse settings
@@ -204,6 +219,9 @@ class SettingsManager {
         const loadedSettings = JSON.parse(content) as Settings;
         // Merge with defaults in case new fields were added
         this.settings = { ...DEFAULT_SETTINGS, ...loadedSettings };
+        for (const key of Object.keys(loadedSettings)) {
+          this.managedKeys.add(key);
+        }
       }
 
       this.initialized = true;
@@ -221,6 +239,9 @@ class SettingsManager {
     } catch (error) {
       console.error("Error loading settings, using defaults:", error);
       this.settings = { ...DEFAULT_SETTINGS };
+      for (const key of Object.keys(DEFAULT_SETTINGS)) {
+        this.managedKeys.add(key);
+      }
       this.initialized = true;
 
       // Still check secrets support and try to migrate in case of partial failure
@@ -290,6 +311,8 @@ class SettingsManager {
             }
 
             this.settings = updatedSettings;
+            this.managedKeys.add("refreshToken");
+            this.managedKeys.add("env");
             await this.persistSettings();
 
             debugWarn("settings", "Successfully migrated tokens to secrets");
@@ -355,6 +378,7 @@ class SettingsManager {
 
     if (agents.length > 0) {
       this.settings = { ...this.settings, agents };
+      this.managedKeys.add("agents");
       // Persist the migration (async, fire-and-forget)
       this.persistSettings().catch((error) => {
         console.warn("Failed to persist agents array migration:", error);
@@ -470,6 +494,13 @@ class SettingsManager {
       ...(updatedEnv && { env: { ...this.settings.env, ...updatedEnv } }),
     };
 
+    for (const key of Object.keys(otherUpdates)) {
+      this.managedKeys.add(key);
+    }
+    if (updatedEnv) {
+      this.managedKeys.add("env");
+    }
+
     // Handle secure tokens in keychain
     const secureTokens: SecureTokens = {};
     if (apiKey) {
@@ -527,6 +558,7 @@ class SettingsManager {
 
       if (secureTokens.refreshToken) {
         fallbackSettings.refreshToken = secureTokens.refreshToken;
+        this.managedKeys.add("refreshToken");
       }
 
       if (secureTokens.apiKey) {
@@ -534,6 +566,7 @@ class SettingsManager {
           ...fallbackSettings.env,
           LETTA_API_KEY: secureTokens.apiKey,
         };
+        this.managedKeys.add("env");
       }
 
       this.settings = fallbackSettings;
@@ -654,12 +687,20 @@ class SettingsManager {
         }
       }
 
-      // Merge: existing fields + our managed settings
-      // Our settings take precedence for fields we manage
-      const merged = {
-        ...existingSettings,
-        ...this.settings,
-      };
+      // Only write keys we loaded from the file or explicitly set via updateSettings().
+      // This preserves manual file edits for keys we never touched (e.g. defaults).
+      const merged: Record<string, unknown> = { ...existingSettings };
+      const settingsRecord = this.settings as unknown as Record<
+        string,
+        unknown
+      >;
+      for (const key of this.managedKeys) {
+        if (key in settingsRecord) {
+          merged[key] = settingsRecord[key];
+        } else {
+          delete merged[key];
+        }
+      }
 
       await writeFile(settingsPath, JSON.stringify(merged, null, 2));
     } catch (error) {
@@ -1334,10 +1375,15 @@ class SettingsManager {
         pinned: updates.pinned !== undefined ? updates.pinned : existing.pinned,
         // Use nullish coalescing for memfs (undefined = keep existing)
         memfs: updates.memfs !== undefined ? updates.memfs : existing.memfs,
+        // Use nullish coalescing for toolset (undefined = keep existing)
+        toolset:
+          updates.toolset !== undefined ? updates.toolset : existing.toolset,
       };
       // Clean up undefined/false values
       if (!updated.pinned) delete updated.pinned;
       if (!updated.memfs) delete updated.memfs;
+      if (!updated.toolset || updated.toolset === "auto")
+        delete updated.toolset;
       if (!updated.baseUrl) delete updated.baseUrl;
       agents[idx] = updated;
     } else {
@@ -1350,6 +1396,8 @@ class SettingsManager {
       // Clean up undefined/false values
       if (!newAgent.pinned) delete newAgent.pinned;
       if (!newAgent.memfs) delete newAgent.memfs;
+      if (!newAgent.toolset || newAgent.toolset === "auto")
+        delete newAgent.toolset;
       if (!newAgent.baseUrl) delete newAgent.baseUrl;
       agents.push(newAgent);
     }
@@ -1369,6 +1417,40 @@ class SettingsManager {
    */
   setMemfsEnabled(agentId: string, enabled: boolean): void {
     this.upsertAgentSettings(agentId, { memfs: enabled });
+  }
+
+  /**
+   * Get toolset preference for an agent on the current server.
+   * Defaults to "auto" when no manual override is stored.
+   */
+  getToolsetPreference(
+    agentId: string,
+  ):
+    | "auto"
+    | "codex"
+    | "codex_snake"
+    | "default"
+    | "gemini"
+    | "gemini_snake"
+    | "none" {
+    return this.getAgentSettings(agentId)?.toolset ?? "auto";
+  }
+
+  /**
+   * Set toolset preference for an agent on the current server.
+   */
+  setToolsetPreference(
+    agentId: string,
+    preference:
+      | "auto"
+      | "codex"
+      | "codex_snake"
+      | "default"
+      | "gemini"
+      | "gemini_snake"
+      | "none",
+  ): void {
+    this.upsertAgentSettings(agentId, { toolset: preference });
   }
 
   /**
@@ -1414,6 +1496,7 @@ class SettingsManager {
     const settings = this.getSettings();
     const { oauthState: _, ...rest } = settings;
     this.settings = { ...DEFAULT_SETTINGS, ...rest };
+    this.managedKeys.add("oauthState");
     this.persistSettings().catch((error) => {
       console.error(
         "Failed to persist settings after clearing OAuth state:",
@@ -1554,6 +1637,7 @@ class SettingsManager {
     this.initialized = false;
     this.pendingWrites.clear();
     this.secretsAvailable = null;
+    this.managedKeys.clear();
   }
 }
 

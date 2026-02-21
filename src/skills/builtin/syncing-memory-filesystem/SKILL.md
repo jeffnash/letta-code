@@ -26,26 +26,40 @@ When memfs is enabled, the Letta Code CLI automatically:
 
 If any of these steps fail, you can replicate them manually using the sections below.
 
-## Authentication
+## Authentication (Preferred: Repo-Local)
 
-The harness configures a per-repo credential helper during clone. To verify or reconfigure:
+The harness configures a **per-repo** credential helper during clone and refreshes it on pull/startup.
+This local setup is the default and recommended approach.
+
+Why this matters: host-level **global** credential helpers (e.g. installed by other tooling) can conflict with memfs auth and cause confusing failures.
+
+**Important:** Always use **single-line** format for credential helpers. Multi-line helpers can break tools that parse `git config --list` line-by-line.
 
 ```bash
 cd ~/.letta/agents/<agent-id>/memory
 
-# Check if configured
-git config --get credential.$LETTA_BASE_URL.helper
+# Check local helper(s)
+git config --local --get-regexp '^credential\..*\.helper$'
 
-# Reconfigure (e.g. after API key rotation)
-git config credential.$LETTA_BASE_URL.helper \
-  '!f() { echo "username=letta"; echo "password=$LETTA_API_KEY"; }; f'
+# Reconfigure local helper (e.g. after API key rotation) - SINGLE LINE
+git config --local credential.$LETTA_BASE_URL.helper '!f() { echo "username=letta"; echo "password=$LETTA_API_KEY"; }; f'
 ```
 
-For cloning a *different* agent's repo (e.g. during memory migration), set up a global helper:
+If you suspect global helper conflicts, inspect and clear host-specific global entries:
 
 ```bash
-git config --global credential.$LETTA_BASE_URL.helper \
-  '!f() { echo "username=letta"; echo "password=$LETTA_API_KEY"; }; f'
+# Inspect Letta-related global helpers
+git config --global --get-regexp '^credential\..*letta\.com.*\.helper$'
+
+# Example: clear a conflicting host-specific helper
+git config --global --unset-all credential.https://api.letta.com.helper
+```
+
+For cloning a *different* agent's repo, prefer a one-off auth header over global credential changes:
+
+```bash
+AUTH_HEADER="Authorization: Basic $(printf 'letta:%s' "$LETTA_API_KEY" | base64 | tr -d '\n')"
+git -c "http.extraHeader=$AUTH_HEADER" clone "$LETTA_BASE_URL/v1/git/<agent-id>/state.git" ~/my-agent-memory
 ```
 
 ## Pre-Commit Hook (Frontmatter Validation)
@@ -102,10 +116,9 @@ curl -X PATCH "$LETTA_BASE_URL/v1/agents/$AGENT_ID" \
 mkdir -p "$MEMORY_REPO_DIR"
 git clone "$LETTA_BASE_URL/v1/git/$AGENT_ID/state.git" "$MEMORY_REPO_DIR"
 
-# 3. Configure local credential helper
+# 3. Configure local credential helper (single-line format required)
 cd "$MEMORY_REPO_DIR"
-git config credential.$LETTA_BASE_URL.helper \
-  '!f() { echo "username=letta"; echo "password=$LETTA_API_KEY"; }; f'
+git config --local credential.$LETTA_BASE_URL.helper '!f() { echo "username=letta"; echo "password=$LETTA_API_KEY"; }; f'
 ```
 
 ## Bidirectional Sync
@@ -216,8 +229,9 @@ git push
 ## Troubleshooting
 
 **Clone fails with "Authentication failed":**
-- Check credential helper: `git config --get credential.$LETTA_BASE_URL.helper`
-- Reconfigure: see Authentication section above
+- Check local helper(s): `git -C ~/.letta/agents/<agent-id>/memory config --local --get-regexp '^credential\..*\.helper$'`
+- Check for conflicting global helper(s): `git config --global --get-regexp '^credential\..*letta\.com.*\.helper$'`
+- Reconfigure local helper: see Authentication section above
 - Verify the endpoint is reachable: `curl -u letta:$LETTA_API_KEY $LETTA_BASE_URL/v1/git/<agent-id>/state.git/info/refs?service=git-upload-pack`
 
 **Push/pull doesn't update API:**

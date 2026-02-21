@@ -143,17 +143,22 @@ export interface ApplyMemfsFlagsResult {
   pullSummary?: string;
 }
 
+export interface ApplyMemfsFlagsOptions {
+  pullOnExistingRepo?: boolean;
+  agentTags?: string[];
+}
+
 /**
  * Apply --memfs / --no-memfs CLI flags (or /memfs enable) to an agent.
  *
  * Shared between interactive (index.ts), headless (headless.ts), and
  * the /memfs enable command (App.tsx) to avoid duplicating the setup logic.
  *
- * Steps when enabling:
- *   1. Validate Letta Cloud requirement
- *   2. Persist memfs setting
- *   3. Detach old API-based memory tools
- *   4. Update system prompt to include memfs section
+ * Steps when toggling:
+ *   1. Validate Letta Cloud requirement (for explicit enable)
+ *   2. Reconcile system prompt to the target memory mode
+ *   3. Persist memfs setting locally
+ *   4. Detach old API-based memory tools (when enabling)
  *   5. Add git-memory-enabled tag + clone/pull repo
  *
  * @throws {Error} if Letta Cloud validation fails or git setup fails
@@ -162,44 +167,98 @@ export async function applyMemfsFlags(
   agentId: string,
   memfsFlag: boolean | undefined,
   noMemfsFlag: boolean | undefined,
-  options?: { pullOnExistingRepo?: boolean },
+  options?: ApplyMemfsFlagsOptions,
 ): Promise<ApplyMemfsFlagsResult> {
   const { getServerUrl } = await import("./client");
   const { settingsManager } = await import("../settings-manager");
 
-  // 1. Validate + persist setting
+  // Validate explicit enable on supported backend.
   if (memfsFlag) {
     const serverUrl = getServerUrl();
-    if (!serverUrl.includes("api.letta.com")) {
+    if (
+      !serverUrl.includes("api.letta.com") &&
+      process.env.LETTA_MEMFS_LOCAL !== "1"
+    ) {
       throw new Error(
         "--memfs is only available on Letta Cloud (api.letta.com).",
       );
     }
-    settingsManager.setMemfsEnabled(agentId, true);
-  } else if (noMemfsFlag) {
-    settingsManager.setMemfsEnabled(agentId, false);
   }
 
-  const isEnabled = settingsManager.isMemfsEnabled(agentId);
+  const hasExplicitToggle = Boolean(memfsFlag || noMemfsFlag);
+  const localMemfsEnabled = settingsManager.isMemfsEnabled(agentId);
+  const { GIT_MEMORY_ENABLED_TAG } = await import("./memoryGit");
+  const shouldAutoEnableFromTag =
+    !hasExplicitToggle &&
+    !localMemfsEnabled &&
+    Boolean(options?.agentTags?.includes(GIT_MEMORY_ENABLED_TAG));
+  const targetEnabled = memfsFlag
+    ? true
+    : noMemfsFlag
+      ? false
+      : shouldAutoEnableFromTag
+        ? true
+        : localMemfsEnabled;
 
-  // 2. Detach old API-based memory tools when enabling
-  if (isEnabled && memfsFlag) {
+  // 2. Reconcile system prompt first, then persist local memfs setting.
+  if (hasExplicitToggle || shouldAutoEnableFromTag) {
+    const { updateAgentSystemPromptMemfs } = await import("./modify");
+    const promptUpdate = await updateAgentSystemPromptMemfs(
+      agentId,
+      targetEnabled,
+    );
+    if (!promptUpdate.success) {
+      throw new Error(promptUpdate.message);
+    }
+    settingsManager.setMemfsEnabled(agentId, targetEnabled);
+  }
+
+  const isEnabled =
+    hasExplicitToggle || shouldAutoEnableFromTag
+      ? targetEnabled
+      : settingsManager.isMemfsEnabled(agentId);
+
+  // 3. Detach old API-based memory tools when enabling.
+  if (isEnabled && (memfsFlag || shouldAutoEnableFromTag)) {
     const { detachMemoryTools } = await import("../tools/toolset");
     await detachMemoryTools(agentId);
+
+    // Migration (LET-7353): Remove legacy skills/loaded_skills blocks.
+    // These blocks are no longer used — skills are now injected via system reminders.
+    const { getClient } = await import("./client");
+    const client = await getClient();
+    for (const label of ["skills", "loaded_skills"]) {
+      try {
+        const block = await client.agents.blocks.retrieve(label, {
+          agent_id: agentId,
+        });
+        if (block) {
+          await client.agents.blocks.detach(block.id, {
+            agent_id: agentId,
+          });
+          await client.blocks.delete(block.id);
+        }
+      } catch {
+        // Block doesn't exist or already removed, skip
+      }
+    }
   }
 
-  // 3. Update system prompt to include/exclude memfs section
-  if (memfsFlag || noMemfsFlag) {
-    const { updateAgentSystemPromptMemfs } = await import("./modify");
-    await updateAgentSystemPromptMemfs(agentId, isEnabled);
+  // Keep server-side state aligned with explicit disable.
+  if (noMemfsFlag) {
+    const { removeGitMemoryTag } = await import("./memoryGit");
+    await removeGitMemoryTag(agentId);
   }
 
-  // 4. Add git tag + clone/pull repo
+  // 4. Add git tag + clone/pull repo.
   let pullSummary: string | undefined;
   if (isEnabled) {
     const { addGitMemoryTag, isGitRepo, cloneMemoryRepo, pullMemory } =
       await import("./memoryGit");
-    await addGitMemoryTag(agentId);
+    await addGitMemoryTag(
+      agentId,
+      options?.agentTags ? { tags: options.agentTags } : undefined,
+    );
     if (!isGitRepo(agentId)) {
       await cloneMemoryRepo(agentId);
     } else if (options?.pullOnExistingRepo) {
@@ -208,7 +267,12 @@ export async function applyMemfsFlags(
     }
   }
 
-  const action = memfsFlag ? "enabled" : noMemfsFlag ? "disabled" : "unchanged";
+  const action =
+    memfsFlag || shouldAutoEnableFromTag
+      ? "enabled"
+      : noMemfsFlag
+        ? "disabled"
+        : "unchanged";
   return {
     action,
     memoryDir: isEnabled ? getMemoryFilesystemRoot(agentId) : undefined,
@@ -223,7 +287,11 @@ export async function applyMemfsFlags(
 export async function enableMemfsIfCloud(agentId: string): Promise<void> {
   const { getServerUrl } = await import("./client");
   const serverUrl = getServerUrl();
-  if (!serverUrl.includes("api.letta.com")) return;
+  if (
+    !serverUrl.includes("api.letta.com") &&
+    process.env.LETTA_MEMFS_LOCAL !== "1"
+  )
+    return;
 
   try {
     await applyMemfsFlags(agentId, true, undefined);

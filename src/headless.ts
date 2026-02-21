@@ -14,14 +14,17 @@ import {
   getPreStreamErrorAction,
   isApprovalPendingError,
   isInvalidToolCallIdsError,
+  parseRetryAfterHeaderMs,
+  shouldRetryRunMetadataError,
 } from "./agent/approval-recovery";
 import { getClient } from "./agent/client";
 import { setAgentContext, setConversationId } from "./agent/context";
 import { createAgent } from "./agent/create";
 import { ISOLATED_BLOCK_LABELS } from "./agent/memory";
-
-import { sendMessageStream } from "./agent/message";
+import { getStreamToolContextId, sendMessageStream } from "./agent/message";
 import { getModelUpdateArgs } from "./agent/model";
+import { resolveSkillSourcesSelection } from "./agent/skillSources";
+import type { SkillSource } from "./agent/skills";
 import { SessionStats } from "./agent/stats";
 import {
   createBuffers,
@@ -30,12 +33,36 @@ import {
   toLines,
 } from "./cli/helpers/accumulator";
 import { classifyApprovals } from "./cli/helpers/approvalClassification";
+import { createContextTracker } from "./cli/helpers/contextTracker";
 import { formatErrorDetails } from "./cli/helpers/errorFormatter";
+import {
+  getReflectionSettings,
+  type ReflectionBehavior,
+  type ReflectionSettings,
+  type ReflectionTrigger,
+  reflectionSettingsToLegacyMode,
+} from "./cli/helpers/memoryReminder";
+import {
+  type QueuedMessage,
+  setMessageQueueAdder,
+} from "./cli/helpers/messageQueueBridge";
 import {
   type DrainStreamHook,
   drainStreamWithResume,
 } from "./cli/helpers/stream";
 import { SYSTEM_REMINDER_CLOSE, SYSTEM_REMINDER_OPEN } from "./constants";
+import {
+  mergeQueuedTurnInput,
+  type QueuedTurnInput,
+} from "./queue/turnQueueRuntime";
+import {
+  buildSharedReminderParts,
+  prependReminderPartsToContent,
+} from "./reminders/engine";
+import {
+  createSharedReminderState,
+  syncReminderStateFromContextTracker,
+} from "./reminders/state";
 import { settingsManager } from "./settings-manager";
 import { clearSkillBlockCache } from "./tools/impl/Skill";
 import {
@@ -77,11 +104,140 @@ const LLM_API_ERROR_MAX_RETRIES = 3;
 const CONVERSATION_BUSY_MAX_RETRIES = 1; // Only retry once, fail on 2nd 409
 const CONVERSATION_BUSY_RETRY_DELAY_MS = 2500; // 2.5 seconds
 
+export type BidirectionalQueuedInput = QueuedTurnInput<
+  MessageCreate["content"]
+>;
+
+export function mergeBidirectionalQueuedInput(
+  queued: BidirectionalQueuedInput[],
+): MessageCreate["content"] | null {
+  return mergeQueuedTurnInput(queued, {
+    normalizeUserContent: (content) => content,
+  });
+}
+
+type ReflectionOverrides = {
+  trigger?: ReflectionTrigger;
+  behavior?: ReflectionBehavior;
+  stepCount?: number;
+};
+
+function parseReflectionOverrides(
+  values: Record<string, unknown>,
+): ReflectionOverrides {
+  const triggerRaw = values["reflection-trigger"] as string | undefined;
+  const behaviorRaw = values["reflection-behavior"] as string | undefined;
+  const stepCountRaw = values["reflection-step-count"] as string | undefined;
+
+  if (!triggerRaw && !behaviorRaw && !stepCountRaw) {
+    return {};
+  }
+
+  const overrides: ReflectionOverrides = {};
+
+  if (triggerRaw !== undefined) {
+    if (
+      triggerRaw !== "off" &&
+      triggerRaw !== "step-count" &&
+      triggerRaw !== "compaction-event"
+    ) {
+      throw new Error(
+        `Invalid --reflection-trigger "${triggerRaw}". Valid values: off, step-count, compaction-event`,
+      );
+    }
+    overrides.trigger = triggerRaw;
+  }
+
+  if (behaviorRaw !== undefined) {
+    if (behaviorRaw !== "reminder" && behaviorRaw !== "auto-launch") {
+      throw new Error(
+        `Invalid --reflection-behavior "${behaviorRaw}". Valid values: reminder, auto-launch`,
+      );
+    }
+    overrides.behavior = behaviorRaw;
+  }
+
+  if (stepCountRaw !== undefined) {
+    const parsed = Number.parseInt(stepCountRaw, 10);
+    if (Number.isNaN(parsed) || parsed <= 0) {
+      throw new Error(
+        `Invalid --reflection-step-count "${stepCountRaw}". Expected a positive integer.`,
+      );
+    }
+    overrides.stepCount = parsed;
+  }
+
+  return overrides;
+}
+
+function hasReflectionOverrides(overrides: ReflectionOverrides): boolean {
+  return (
+    overrides.trigger !== undefined ||
+    overrides.behavior !== undefined ||
+    overrides.stepCount !== undefined
+  );
+}
+
+async function applyReflectionOverrides(
+  agentId: string,
+  overrides: ReflectionOverrides,
+): Promise<ReflectionSettings> {
+  const current = getReflectionSettings();
+  const merged: ReflectionSettings = {
+    trigger: overrides.trigger ?? current.trigger,
+    behavior: overrides.behavior ?? current.behavior,
+    stepCount: overrides.stepCount ?? current.stepCount,
+  };
+
+  if (!hasReflectionOverrides(overrides)) {
+    return merged;
+  }
+
+  const memfsEnabled = settingsManager.isMemfsEnabled(agentId);
+  if (!memfsEnabled && merged.trigger === "compaction-event") {
+    throw new Error(
+      "--reflection-trigger compaction-event requires memfs enabled for this agent.",
+    );
+  }
+  if (
+    !memfsEnabled &&
+    merged.trigger !== "off" &&
+    merged.behavior === "auto-launch"
+  ) {
+    throw new Error(
+      "--reflection-behavior auto-launch requires memfs enabled for this agent.",
+    );
+  }
+
+  try {
+    settingsManager.getLocalProjectSettings();
+  } catch {
+    await settingsManager.loadLocalProjectSettings();
+  }
+
+  const legacyMode = reflectionSettingsToLegacyMode(merged);
+  settingsManager.updateLocalProjectSettings({
+    memoryReminderInterval: legacyMode,
+    reflectionTrigger: merged.trigger,
+    reflectionBehavior: merged.behavior,
+    reflectionStepCount: merged.stepCount,
+  });
+  settingsManager.updateSettings({
+    memoryReminderInterval: legacyMode,
+    reflectionTrigger: merged.trigger,
+    reflectionBehavior: merged.behavior,
+    reflectionStepCount: merged.stepCount,
+  });
+
+  return merged;
+}
+
 export async function handleHeadlessCommand(
   argv: string[],
   model?: string,
-  skillsDirectory?: string,
-  noSkills?: boolean,
+  skillsDirectoryOverride?: string,
+  skillSourcesOverride?: SkillSource[],
+  systemInfoReminderEnabledOverride?: boolean,
 ) {
   // Parse CLI args
   // Include all flags from index.ts to prevent them from being treated as positionals
@@ -119,6 +275,7 @@ export async function handleHeadlessCommand(
       "permission-mode": { type: "string" },
       yolo: { type: "boolean" },
       skills: { type: "string" },
+      "skill-sources": { type: "string" },
       "pre-load-skills": { type: "string" },
       "init-blocks": { type: "string" },
       "base-tools": { type: "string" },
@@ -128,6 +285,11 @@ export async function handleHeadlessCommand(
       memfs: { type: "boolean" },
       "no-memfs": { type: "boolean" },
       "no-skills": { type: "boolean" },
+      "no-bundled-skills": { type: "boolean" },
+      "no-system-info-reminder": { type: "boolean" },
+      "reflection-trigger": { type: "string" },
+      "reflection-behavior": { type: "string" },
+      "reflection-step-count": { type: "string" },
       "max-turns": { type: "string" }, // Maximum number of agentic turns
       "no-subagent-max-turns": { type: "boolean" }, // Ignore max-turns limit for subagents
       "show-subagents": { type: "boolean" }, // Don't hide subagents
@@ -265,12 +427,55 @@ export async function handleHeadlessCommand(
   const blockValueArgs = values["block-value"] as string[] | undefined;
   const initBlocksRaw = values["init-blocks"] as string | undefined;
   const baseToolsRaw = values["base-tools"] as string | undefined;
+  const skillsDirectory =
+    (values.skills as string | undefined) ?? skillsDirectoryOverride;
+  const noSkillsFlag = values["no-skills"] as boolean | undefined;
+  const noBundledSkillsFlag = values["no-bundled-skills"] as
+    | boolean
+    | undefined;
+  const skillSourcesRaw = values["skill-sources"] as string | undefined;
   const memfsFlag = values.memfs as boolean | undefined;
   const noMemfsFlag = values["no-memfs"] as boolean | undefined;
+  const requestedMemoryPromptMode: "memfs" | "standard" | undefined = memfsFlag
+    ? "memfs"
+    : noMemfsFlag
+      ? "standard"
+      : undefined;
+  const shouldAutoEnableMemfsForNewAgent = !memfsFlag && !noMemfsFlag;
   const fromAfFile = values["from-af"] as string | undefined;
   const preLoadSkillsRaw = values["pre-load-skills"] as string | undefined;
+  const systemInfoReminderEnabled =
+    systemInfoReminderEnabledOverride ??
+    !(values["no-system-info-reminder"] as boolean | undefined);
+  const reflectionOverrides = (() => {
+    try {
+      return parseReflectionOverrides(values);
+    } catch (error) {
+      console.error(
+        error instanceof Error ? `Error: ${error.message}` : String(error),
+      );
+      process.exit(1);
+    }
+  })();
   const maxTurnsRaw = values["max-turns"] as string | undefined;
-  const tagsRaw = values["tags"] as string | undefined;
+  const tagsRaw = values.tags as string | undefined;
+  const resolvedSkillSources = (() => {
+    if (skillSourcesOverride) {
+      return skillSourcesOverride;
+    }
+    try {
+      return resolveSkillSourcesSelection({
+        skillSourcesRaw,
+        noSkills: noSkillsFlag,
+        noBundledSkills: noBundledSkillsFlag,
+      });
+    } catch (error) {
+      console.error(
+        error instanceof Error ? `Error: ${error.message}` : String(error),
+      );
+      process.exit(1);
+    }
+  })();
 
   // Parse and validate base tools
   let tags: string[] | undefined;
@@ -297,6 +502,13 @@ export async function handleHeadlessCommand(
       process.exit(1);
     }
     maxTurns = parsed;
+  }
+
+  if (preLoadSkillsRaw && resolvedSkillSources.length === 0) {
+    console.error(
+      "Error: --pre-load-skills cannot be used when all skill sources are disabled.",
+    );
+    process.exit(1);
   }
 
   // Handle --conv {agent-id} shorthand: --conv agent-xyz → --agent agent-xyz --conv default
@@ -594,6 +806,7 @@ export async function handleHeadlessCommand(
       systemPromptPreset,
       systemPromptCustom: systemCustom,
       systemPromptAppend: systemAppend,
+      memoryPromptMode: requestedMemoryPromptMode,
       initBlocks,
       baseTools,
       memoryBlocks,
@@ -603,23 +816,20 @@ export async function handleHeadlessCommand(
     const result = await createAgent(createOptions);
     agent = result.agent;
 
-    // Enable memfs by default on Letta Cloud for new agents
-    const { enableMemfsIfCloud } = await import("./agent/memoryFilesystem");
-    await enableMemfsIfCloud(agent.id);
+    // Enable memfs by default on Letta Cloud for new agents when no explicit memfs flags are provided.
+    if (shouldAutoEnableMemfsForNewAgent) {
+      const { enableMemfsIfCloud } = await import("./agent/memoryFilesystem");
+      await enableMemfsIfCloud(agent.id);
+    }
   }
 
   // Priority 4: Try to resume from project settings (.letta/settings.local.json)
-  // Store local conversation ID for use in conversation resolution below
-  let resolvedLocalConvId: string | null = null;
   if (!agent) {
     await settingsManager.loadLocalProjectSettings();
     const localAgentId = settingsManager.getLocalLastAgentId(process.cwd());
     if (localAgentId) {
       try {
         agent = await client.agents.retrieve(localAgentId);
-        // Store local conversation for downstream resolution
-        const localSession = settingsManager.getLocalLastSession(process.cwd());
-        resolvedLocalConvId = localSession?.conversationId ?? null;
       } catch (_error) {
         // Local LRU agent doesn't exist - log and continue
         console.error(`Unable to locate agent ${localAgentId} in .letta/`);
@@ -711,17 +921,18 @@ export async function handleHeadlessCommand(
 
   // Determine which conversation to use
   let conversationId: string;
+  let effectiveReflectionSettings: ReflectionSettings;
 
   const isSubagent = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
 
-  // Apply memfs flag if explicitly specified (memfs is opt-in via /memfs enable or --memfs)
+  // Apply memfs flags and auto-enable from server tag when local settings are missing.
   try {
     const { applyMemfsFlags } = await import("./agent/memoryFilesystem");
     const memfsResult = await applyMemfsFlags(
       agent.id,
       memfsFlag,
       noMemfsFlag,
-      { pullOnExistingRepo: true },
+      { pullOnExistingRepo: true, agentTags: agent.tags },
     );
     if (memfsResult.pullSummary?.includes("CONFLICT")) {
       console.error(
@@ -732,6 +943,18 @@ export async function handleHeadlessCommand(
   } catch (error) {
     console.error(
       `Memory git sync failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    process.exit(1);
+  }
+
+  try {
+    effectiveReflectionSettings = await applyReflectionOverrides(
+      agent.id,
+      reflectionOverrides,
+    );
+  } catch (error) {
+    console.error(
+      `Failed to apply sleeptime settings: ${error instanceof Error ? error.message : String(error)}`,
     );
     process.exit(1);
   }
@@ -803,22 +1026,16 @@ export async function handleHeadlessCommand(
       isolated_block_labels: isolatedBlockLabels,
     });
     conversationId = conversation.id;
-  } else if (resolvedLocalConvId) {
-    // Resumed from local LRU — restore the local conversation
-    if (resolvedLocalConvId === "default") {
-      conversationId = "default";
-    } else {
-      try {
-        await client.conversations.retrieve(resolvedLocalConvId);
-        conversationId = resolvedLocalConvId;
-      } catch {
-        // Local conversation no longer exists — fall back to default
-        conversationId = "default";
-      }
-    }
   } else {
-    // Default (including --new-agent, --agent, global LRU fallback): use "default" conversation
-    conversationId = "default";
+    // Default for headless: always create a new conversation to avoid
+    // 409 "conversation busy" races (e.g., parent agent calling letta -p).
+    // Use --default or --conv default to explicitly target the agent's
+    // primary conversation.
+    const conversation = await client.conversations.create({
+      agent_id: agent.id,
+      isolated_block_labels: isolatedBlockLabels,
+    });
+    conversationId = conversation.id;
   }
   markMilestone("HEADLESS_CONVERSATION_READY");
 
@@ -840,25 +1057,8 @@ export async function handleHeadlessCommand(
     });
   }
 
-  // Migration (LET-7353): Remove legacy skills/loaded_skills blocks
-  for (const label of ["skills", "loaded_skills"]) {
-    try {
-      const block = await client.agents.blocks.retrieve(label, {
-        agent_id: agent.id,
-      });
-      if (block) {
-        await client.agents.blocks.detach(block.id, {
-          agent_id: agent.id,
-        });
-        await client.blocks.delete(block.id);
-      }
-    } catch {
-      // Block doesn't exist or already removed, skip
-    }
-  }
-
   // Set agent context for tools that need it (e.g., Skill tool, Task tool)
-  setAgentContext(agent.id, skillsDirectory, noSkills);
+  setAgentContext(agent.id, skillsDirectory, resolvedSkillSources);
 
   // Validate output format
   const outputFormat =
@@ -893,6 +1093,9 @@ export async function handleHeadlessCommand(
       outputFormat,
       includePartialMessages,
       availableTools,
+      resolvedSkillSources,
+      systemInfoReminderEnabled,
+      effectiveReflectionSettings,
     );
     return;
   }
@@ -921,10 +1124,18 @@ export async function handleHeadlessCommand(
       permission_mode: "",
       slash_commands: [],
       memfs_enabled: settingsManager.isMemfsEnabled(agent.id),
+      skill_sources: resolvedSkillSources,
+      system_info_reminder_enabled: systemInfoReminderEnabled,
+      reflection_trigger: effectiveReflectionSettings.trigger,
+      reflection_behavior: effectiveReflectionSettings.behavior,
+      reflection_step_count: effectiveReflectionSettings.stepCount,
       uuid: `init-${agent.id}`,
     };
     console.log(JSON.stringify(initEvent));
   }
+
+  const reminderContextTracker = createContextTracker();
+  const sharedReminderState = createSharedReminderState();
 
   // Helper to resolve any pending approvals before sending user input
   const resolveAllPendingApprovals = async () => {
@@ -1070,16 +1281,23 @@ export async function handleHeadlessCommand(
         approvalMessages,
         { agentId: agent.id },
       );
-      if (outputFormat === "stream-json") {
-        // Consume quickly but don't emit message frames to stdout
-        for await (const _ of approvalStream) {
-          // no-op
-        }
-      } else {
-        await drainStreamWithResume(
-          approvalStream,
-          createBuffers(agent.id),
-          () => {},
+      const drainResult = await drainStreamWithResume(
+        approvalStream,
+        createBuffers(agent.id),
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        reminderContextTracker,
+      );
+      // If the approval drain errored or was cancelled, abort rather than
+      // looping back and re-fetching approvals (which would restart the cycle).
+      if (
+        drainResult.stopReason === "error" ||
+        drainResult.stopReason === "cancelled"
+      ) {
+        throw new Error(
+          `Approval drain ended with stop reason: ${drainResult.stopReason}`,
         );
       }
     }
@@ -1092,7 +1310,6 @@ export async function handleHeadlessCommand(
   }
 
   // Build message content with reminders
-  const { permissionMode } = await import("./permissions/mode");
   const contentParts: MessageCreate["content"] = [];
   const pushPart = (text: string) => {
     if (!text) return;
@@ -1112,59 +1329,56 @@ ${SYSTEM_REMINDER_CLOSE}
     pushPart(systemReminder);
   }
 
-  // Inject available skills as system-reminder (LET-7353)
-  {
-    const {
-      discoverSkills,
-      SKILLS_DIR: defaultDir,
-      formatSkillsAsSystemReminder,
-    } = await import("./agent/skills");
-    const { getSkillsDirectory } = await import("./agent/context");
-    const { join } = await import("node:path");
-    try {
-      const skillsDir = getSkillsDirectory() || join(process.cwd(), defaultDir);
-      const { skills } = await discoverSkills(skillsDir, agent.id, {
-        skipBundled: noSkills,
-      });
-      const skillsReminder = formatSkillsAsSystemReminder(skills);
-      if (skillsReminder) {
-        pushPart(skillsReminder);
-      }
-
-      // Pre-load specific skills' full content (used by subagents with skills: field)
-      if (preLoadSkillsRaw) {
-        const { readFile: readFileAsync } = await import("node:fs/promises");
-        const skillIds = preLoadSkillsRaw
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
-        const loadedContents: string[] = [];
-        for (const skillId of skillIds) {
-          const skill = skills.find((s) => s.id === skillId);
-          if (skill?.path) {
-            try {
-              const content = await readFileAsync(skill.path, "utf-8");
-              loadedContents.push(`<${skillId}>\n${content}\n</${skillId}>`);
-            } catch {
-              // Skill file not readable, skip
-            }
-          }
-        }
-        if (loadedContents.length > 0) {
-          pushPart(
-            `<loaded_skills>\n${loadedContents.join("\n\n")}\n</loaded_skills>`,
-          );
-        }
-      }
-    } catch {
-      // Skills discovery failed, skip
-    }
+  syncReminderStateFromContextTracker(
+    sharedReminderState,
+    reminderContextTracker,
+  );
+  const lastRunAt = (agent as { last_run_completion?: string })
+    .last_run_completion;
+  const { parts: sharedReminderParts } = await buildSharedReminderParts({
+    mode: isSubagent ? "subagent" : "headless-one-shot",
+    agent: {
+      id: agent.id,
+      name: agent.name,
+      description: agent.description,
+      lastRunAt: lastRunAt ?? null,
+    },
+    state: sharedReminderState,
+    sessionContextReminderEnabled: systemInfoReminderEnabled,
+    reflectionSettings: effectiveReflectionSettings,
+    skillSources: resolvedSkillSources,
+    resolvePlanModeReminder: async () => {
+      const { PLAN_MODE_REMINDER } = await import("./agent/promptAssets");
+      return PLAN_MODE_REMINDER;
+    },
+  });
+  for (const part of sharedReminderParts) {
+    pushPart(part.text);
   }
 
-  // Add plan mode reminder if in plan mode (highest priority)
-  if (permissionMode.getMode() === "plan") {
-    const { PLAN_MODE_REMINDER } = await import("./agent/promptAssets");
-    pushPart(PLAN_MODE_REMINDER);
+  // Pre-load specific skills' full content (used by subagents with skills: field)
+  if (preLoadSkillsRaw) {
+    const { readFile: readFileAsync } = await import("node:fs/promises");
+    const skillIds = preLoadSkillsRaw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const loadedContents: string[] = [];
+    for (const skillId of skillIds) {
+      const skillPath = sharedReminderState.skillPathById[skillId];
+      if (!skillPath) continue;
+      try {
+        const content = await readFileAsync(skillPath, "utf-8");
+        loadedContents.push(`<${skillId}>\n${content}\n</${skillId}>`);
+      } catch {
+        // Skill file not readable, skip
+      }
+    }
+    if (loadedContents.length > 0) {
+      pushPart(
+        `<loaded_skills>\n${loadedContents.join("\n\n")}\n</loaded_skills>`,
+      );
+    }
   }
 
   // Add user prompt
@@ -1233,10 +1447,12 @@ ${SYSTEM_REMINDER_CLOSE}
 
       // Wrap sendMessageStream in try-catch to handle pre-stream errors (e.g., 409)
       let stream: Awaited<ReturnType<typeof sendMessageStream>>;
+      let turnToolContextId: string | null = null;
       try {
         stream = await sendMessageStream(conversationId, currentInput, {
           agentId: agent.id,
         });
+        turnToolContextId = getStreamToolContextId(stream);
       } catch (preStreamError) {
         // Extract error detail using shared helper (handles nested/direct/message shapes)
         const errorDetail = extractConflictDetail(preStreamError);
@@ -1245,6 +1461,14 @@ ${SYSTEM_REMINDER_CLOSE}
           errorDetail,
           conversationBusyRetries,
           CONVERSATION_BUSY_MAX_RETRIES,
+          {
+            status:
+              preStreamError instanceof APIError
+                ? preStreamError.status
+                : undefined,
+            transientRetries: llmApiErrorRetries,
+            maxTransientRetries: LLM_API_ERROR_MAX_RETRIES,
+          },
         );
 
         // Check for pending approval blocking new messages - resolve and retry.
@@ -1297,6 +1521,41 @@ ${SYSTEM_REMINDER_CLOSE}
           await new Promise((resolve) =>
             setTimeout(resolve, CONVERSATION_BUSY_RETRY_DELAY_MS),
           );
+          continue;
+        }
+
+        if (preStreamAction === "retry_transient") {
+          const attempt = llmApiErrorRetries + 1;
+          const retryAfterMs =
+            preStreamError instanceof APIError
+              ? parseRetryAfterHeaderMs(
+                  preStreamError.headers?.get("retry-after"),
+                )
+              : null;
+          const delayMs = retryAfterMs ?? 1000 * 2 ** (attempt - 1);
+
+          llmApiErrorRetries = attempt;
+
+          if (outputFormat === "stream-json") {
+            const retryMsg: RetryMessage = {
+              type: "retry",
+              reason: "llm_api_error",
+              attempt,
+              max_attempts: LLM_API_ERROR_MAX_RETRIES,
+              delay_ms: delayMs,
+              session_id: sessionId,
+              uuid: `retry-pre-stream-${crypto.randomUUID()}`,
+            };
+            console.log(JSON.stringify(retryMsg));
+          } else {
+            const delaySeconds = Math.round(delayMs / 1000);
+            console.error(
+              `Transient API error before streaming (attempt ${attempt} of ${LLM_API_ERROR_MAX_RETRIES}), retrying in ${delaySeconds}s...`,
+            );
+          }
+
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          conversationBusyRetries = 0;
           continue;
         }
 
@@ -1445,6 +1704,7 @@ ${SYSTEM_REMINDER_CLOSE}
           undefined,
           undefined,
           streamJsonHook,
+          reminderContextTracker,
         );
         stopReason = result.stopReason;
         approvals = result.approvals || [];
@@ -1457,6 +1717,10 @@ ${SYSTEM_REMINDER_CLOSE}
           stream,
           buffers,
           () => {}, // No UI refresh needed in headless mode
+          undefined,
+          undefined,
+          undefined,
+          reminderContextTracker,
         );
         stopReason = result.stopReason;
         approvals = result.approvals || [];
@@ -1580,7 +1844,13 @@ ${SYSTEM_REMINDER_CLOSE}
         const { executeApprovalBatch } = await import(
           "./agent/approval-execution"
         );
-        const executedResults = await executeApprovalBatch(decisions);
+        const executedResults = await executeApprovalBatch(
+          decisions,
+          undefined,
+          {
+            toolContextId: turnToolContextId ?? undefined,
+          },
+        );
 
         // Send all results in one batch
         currentInput = [
@@ -1728,31 +1998,9 @@ ${SYSTEM_REMINDER_CLOSE}
           const errorType =
             metaError?.error_type ?? metaError?.error?.error_type;
 
-          // Fallback: detect LLM provider errors from detail even if misclassified
-          // Patterns are derived from handle_llm_error() message formats in the backend
           const detail = metaError?.detail ?? metaError?.error?.detail ?? "";
 
-          // Don't retry 4xx client errors (validation, auth, malformed requests)
-          // These are not transient and won't succeed on retry
-          const is4xxError = /Error code: 4\d{2}/.test(detail);
-
-          const llmProviderPatterns = [
-            "Anthropic API error", // anthropic_client.py:759
-            "OpenAI API error", // openai_client.py:1034
-            "Google Vertex API error", // google_vertex_client.py:848
-            "overloaded", // anthropic_client.py:753 - used for LLMProviderOverloaded
-            "api_error", // Anthropic SDK error type field
-            "Network error", // Transient network failures during streaming
-            "Connection error during Anthropic streaming", // Peer disconnections, incomplete chunked reads
-          ];
-          const isLlmErrorFromDetail = llmProviderPatterns.some((pattern) =>
-            detail.includes(pattern),
-          );
-
-          if (
-            (errorType === "llm_error" || isLlmErrorFromDetail) &&
-            !is4xxError
-          ) {
+          if (shouldRetryRunMetadataError(errorType, detail)) {
             const attempt = llmApiErrorRetries + 1;
             const baseDelayMs = 1000;
             const delayMs = baseDelayMs * 2 ** (attempt - 1);
@@ -1992,6 +2240,9 @@ async function runBidirectionalMode(
   _outputFormat: string,
   includePartialMessages: boolean,
   availableTools: string[],
+  skillSources: SkillSource[],
+  systemInfoReminderEnabled: boolean,
+  reflectionSettings: ReflectionSettings,
 ): Promise<void> {
   const sessionId = agent.id;
   const readline = await import("node:readline");
@@ -2007,12 +2258,20 @@ async function runBidirectionalMode(
     tools: availableTools,
     cwd: process.cwd(),
     memfs_enabled: settingsManager.isMemfsEnabled(agent.id),
+    skill_sources: skillSources,
+    system_info_reminder_enabled: systemInfoReminderEnabled,
+    reflection_trigger: reflectionSettings.trigger,
+    reflection_behavior: reflectionSettings.behavior,
+    reflection_step_count: reflectionSettings.stepCount,
     uuid: `init-${agent.id}`,
   };
   console.log(JSON.stringify(initEvent));
 
   // Track current operation for interrupt support
   let currentAbortController: AbortController | null = null;
+  const reminderContextTracker = createContextTracker();
+  const sharedReminderState = createSharedReminderState();
+  const isSubagent = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
 
   // Resolve pending approvals for this conversation before retrying user input.
   const resolveAllPendingApprovals = async () => {
@@ -2130,11 +2389,23 @@ async function runBidirectionalMode(
         approvalMessages,
         { agentId: agent.id },
       );
-      await drainStreamWithResume(
+      const drainResult = await drainStreamWithResume(
         approvalStream,
         createBuffers(agent.id),
         () => {},
+        undefined,
+        undefined,
+        undefined,
+        reminderContextTracker,
       );
+      if (
+        drainResult.stopReason === "error" ||
+        drainResult.stopReason === "cancelled"
+      ) {
+        throw new Error(
+          `Approval drain ended with stop reason: ${drainResult.stopReason}`,
+        );
+      }
     }
   };
 
@@ -2148,6 +2419,29 @@ async function runBidirectionalMode(
   const lineQueue: string[] = [];
   let lineResolver: ((line: string | null) => void) | null = null;
 
+  const serializeQueuedMessageAsUserLine = (queuedMessage: QueuedMessage) =>
+    JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: queuedMessage.text,
+      },
+      _queuedKind: queuedMessage.kind,
+    });
+
+  // Connect Task/subagent background notifications to the same queueing path
+  // used by user input so bidirectional mode inherits TUI-style queue behavior.
+  setMessageQueueAdder((queuedMessage) => {
+    const syntheticUserLine = serializeQueuedMessageAsUserLine(queuedMessage);
+    if (lineResolver) {
+      const resolve = lineResolver;
+      lineResolver = null;
+      resolve(syntheticUserLine);
+      return;
+    }
+    lineQueue.push(syntheticUserLine);
+  });
+
   // Feed lines into queue or resolver
   rl.on("line", (line) => {
     if (lineResolver) {
@@ -2160,6 +2454,7 @@ async function runBidirectionalMode(
   });
 
   rl.on("close", () => {
+    setMessageQueueAdder(null);
     if (lineResolver) {
       const resolve = lineResolver;
       lineResolver = null;
@@ -2278,7 +2573,7 @@ async function runBidirectionalMode(
 
     let message: {
       type: string;
-      message?: { role: string; content: string };
+      message?: { role: string; content: MessageCreate["content"] };
       request_id?: string;
       request?: { subtype: string };
       session_id?: string;
@@ -2314,6 +2609,12 @@ async function runBidirectionalMode(
               agent_id: agent.id,
               model: agent.llm_config?.model,
               tools: availableTools,
+              memfs_enabled: settingsManager.isMemfsEnabled(agent.id),
+              skill_sources: skillSources,
+              system_info_reminder_enabled: systemInfoReminderEnabled,
+              reflection_trigger: reflectionSettings.trigger,
+              reflection_behavior: reflectionSettings.behavior,
+              reflection_step_count: reflectionSettings.stepCount,
             },
           },
           session_id: sessionId,
@@ -2417,8 +2718,78 @@ async function runBidirectionalMode(
     }
 
     // Handle user messages
-    if (message.type === "user" && message.message?.content) {
-      const userContent = message.message.content;
+    if (message.type === "user" && message.message?.content !== undefined) {
+      const queuedInputs: BidirectionalQueuedInput[] = [
+        {
+          kind: "user",
+          content: message.message.content,
+        },
+      ];
+
+      // Batch any already-buffered user lines into the same turn, mirroring
+      // TUI queue dequeue behavior (single coalesced submit when idle).
+      while (lineQueue.length > 0) {
+        const candidate = lineQueue[0];
+        if (!candidate?.trim()) {
+          lineQueue.shift();
+          continue;
+        }
+
+        let parsedCandidate: {
+          type?: string;
+          message?: { content?: MessageCreate["content"] };
+          _queuedKind?: QueuedMessage["kind"];
+        };
+        try {
+          parsedCandidate = JSON.parse(candidate);
+        } catch {
+          // Leave malformed lines for the main loop to surface as parse errors.
+          break;
+        }
+
+        if (
+          parsedCandidate.type === "user" &&
+          parsedCandidate.message?.content !== undefined
+        ) {
+          lineQueue.shift();
+          if (parsedCandidate._queuedKind === "task_notification") {
+            const notificationText =
+              typeof parsedCandidate.message.content === "string"
+                ? parsedCandidate.message.content
+                : parsedCandidate.message.content
+                    .reduce((texts: string[], part) => {
+                      if (
+                        part.type === "text" &&
+                        "text" in part &&
+                        typeof part.text === "string"
+                      ) {
+                        texts.push(part.text);
+                      }
+                      return texts;
+                    }, [])
+                    .join("");
+            queuedInputs.push({
+              kind: "task_notification",
+              text: notificationText,
+            });
+          } else {
+            queuedInputs.push({
+              kind: "user",
+              content: parsedCandidate.message.content,
+            });
+          }
+          continue;
+        }
+
+        // Stop coalescing when the queue head is not a user-input line.
+        // The outer loop must process control/error/system lines in-order.
+        break;
+      }
+
+      const userContent = mergeBidirectionalQueuedInput(queuedInputs);
+      if (userContent === null) {
+        continue;
+      }
 
       // Create abort controller for this operation
       currentAbortController = new AbortController();
@@ -2429,29 +2800,35 @@ async function runBidirectionalMode(
         let numTurns = 0;
         let lastStopReason: StopReasonType | null = null; // Track for result subtype
         let sawStreamError = false; // Track if we emitted an error during streaming
+        let preStreamTransientRetries = 0;
 
-        // Inject available skills as system-reminder for bidirectional mode (LET-7353)
-        let enrichedContent = userContent;
-        if (typeof enrichedContent === "string") {
-          try {
-            const {
-              discoverSkills: discover,
-              SKILLS_DIR: defaultDir,
-              formatSkillsAsSystemReminder,
-            } = await import("./agent/skills");
-            const { getSkillsDirectory } = await import("./agent/context");
-            const { join } = await import("node:path");
-            const skillsDir =
-              getSkillsDirectory() || join(process.cwd(), defaultDir);
-            const { skills } = await discover(skillsDir, agent.id);
-            const skillsReminder = formatSkillsAsSystemReminder(skills);
-            if (skillsReminder) {
-              enrichedContent = `${skillsReminder}\n\n${enrichedContent}`;
-            }
-          } catch {
-            // Skills discovery failed, skip
-          }
-        }
+        syncReminderStateFromContextTracker(
+          sharedReminderState,
+          reminderContextTracker,
+        );
+        const lastRunAt = (agent as { last_run_completion?: string })
+          .last_run_completion;
+        const { parts: sharedReminderParts } = await buildSharedReminderParts({
+          mode: isSubagent ? "subagent" : "headless-bidirectional",
+          agent: {
+            id: agent.id,
+            name: agent.name,
+            description: agent.description,
+            lastRunAt: lastRunAt ?? null,
+          },
+          state: sharedReminderState,
+          sessionContextReminderEnabled: systemInfoReminderEnabled,
+          reflectionSettings,
+          skillSources,
+          resolvePlanModeReminder: async () => {
+            const { PLAN_MODE_REMINDER } = await import("./agent/promptAssets");
+            return PLAN_MODE_REMINDER;
+          },
+        });
+        const enrichedContent = prependReminderPartsToContent(
+          userContent,
+          sharedReminderParts,
+        );
 
         // Initial input is the user message
         let currentInput: MessageCreate[] = [
@@ -2490,17 +2867,26 @@ async function runBidirectionalMode(
           // Send message to agent.
           // Wrap in try-catch to handle pre-stream 409 approval-pending errors.
           let stream: Awaited<ReturnType<typeof sendMessageStream>>;
+          let turnToolContextId: string | null = null;
           try {
             stream = await sendMessageStream(conversationId, currentInput, {
               agentId: agent.id,
             });
+            turnToolContextId = getStreamToolContextId(stream);
           } catch (preStreamError) {
             // Extract error detail using shared helper (handles nested/direct/message shapes)
             const errorDetail = extractConflictDetail(preStreamError);
 
             // Route through shared pre-stream conflict classifier (parity with main loop + TUI)
             // Bidir mode has no conversation-busy retry budget, so pass 0/0 to disable busy-retry.
-            const preStreamAction = getPreStreamErrorAction(errorDetail, 0, 0);
+            const preStreamAction = getPreStreamErrorAction(errorDetail, 0, 0, {
+              status:
+                preStreamError instanceof APIError
+                  ? preStreamError.status
+                  : undefined,
+              transientRetries: preStreamTransientRetries,
+              maxTransientRetries: LLM_API_ERROR_MAX_RETRIES,
+            });
 
             if (preStreamAction === "resolve_approval_pending") {
               const recoveryMsg: RecoveryMessage = {
@@ -2516,8 +2902,35 @@ async function runBidirectionalMode(
               continue;
             }
 
+            if (preStreamAction === "retry_transient") {
+              const attempt = preStreamTransientRetries + 1;
+              const retryAfterMs =
+                preStreamError instanceof APIError
+                  ? parseRetryAfterHeaderMs(
+                      preStreamError.headers?.get("retry-after"),
+                    )
+                  : null;
+              const delayMs = retryAfterMs ?? 1000 * 2 ** (attempt - 1);
+              preStreamTransientRetries = attempt;
+
+              const retryMsg: RetryMessage = {
+                type: "retry",
+                reason: "llm_api_error",
+                attempt,
+                max_attempts: LLM_API_ERROR_MAX_RETRIES,
+                delay_ms: delayMs,
+                session_id: sessionId,
+                uuid: `retry-bidir-${crypto.randomUUID()}`,
+              };
+              console.log(JSON.stringify(retryMsg));
+
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
+              continue;
+            }
+
             throw preStreamError;
           }
+          preStreamTransientRetries = 0;
           const streamJsonHook: DrainStreamHook = ({
             chunk,
             shouldOutput,
@@ -2586,6 +2999,7 @@ async function runBidirectionalMode(
             currentAbortController?.signal,
             undefined,
             streamJsonHook,
+            reminderContextTracker,
           );
           const stopReason = result.stopReason;
           lastStopReason = stopReason; // Track for result subtype
@@ -2736,7 +3150,11 @@ async function runBidirectionalMode(
             const { executeApprovalBatch } = await import(
               "./agent/approval-execution"
             );
-            const executedResults = await executeApprovalBatch(decisions);
+            const executedResults = await executeApprovalBatch(
+              decisions,
+              undefined,
+              { toolContextId: turnToolContextId ?? undefined },
+            );
 
             // Send approval results back to continue
             currentInput = [
@@ -2871,5 +3289,6 @@ async function runBidirectionalMode(
   }
 
   // Stdin closed, exit gracefully
+  setMessageQueueAdder(null);
   process.exit(0);
 }

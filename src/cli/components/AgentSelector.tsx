@@ -651,7 +651,7 @@ export function AgentSelector({
         }
         loadPinnedAgents();
       }
-    } else if (input === "d" || input === "D") {
+    } else if (input === "D") {
       // Delete agent - open confirmation
       let selectedAgent: AgentState | null = null;
       let selectedAgentId: string | null = null;
@@ -713,7 +713,7 @@ export function AgentSelector({
             backgroundColor={
               isActive ? colors.selector.itemHighlighted : undefined
             }
-            color={isActive ? "black" : undefined}
+            color={isActive ? "white" : undefined}
             bold={isActive}
           >
             {` ${tab.label} `}

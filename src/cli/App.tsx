@@ -38,8 +38,10 @@ import {
   getPreStreamErrorAction,
   isApprovalPendingError,
   isInvalidToolCallIdsError,
+  parseRetryAfterHeaderMs,
   rebuildInputWithFreshDenials,
   shouldAttemptApprovalRecovery,
+  shouldRetryRunMetadataError,
 } from "../agent/approval-recovery";
 import { prefetchAvailableModelHandles } from "../agent/available-models";
 import { getResumeData } from "../agent/check-approval";
@@ -48,14 +50,17 @@ import packageJson from "../../package.json";
 import { getCurrentAgentId, setCurrentAgentId } from "../agent/context";
 import { type AgentProvenance, createAgent } from "../agent/create";
 import { getLettaCodeHeaders } from "../agent/http-headers";
-
 import { ISOLATED_BLOCK_LABELS } from "../agent/memory";
 import {
   ensureMemoryFilesystemDirs,
   getMemoryFilesystemRoot,
 } from "../agent/memoryFilesystem";
-import { sendMessageStream } from "../agent/message";
-import { getModelInfo, getModelShortName } from "../agent/model";
+import { getStreamToolContextId, sendMessageStream } from "../agent/message";
+import {
+  getModelInfo,
+  getModelShortName,
+  type ModelReasoningEffort,
+} from "../agent/model";
 import { INTERRUPT_RECOVERY_ALERT } from "../agent/promptAssets";
 import { SessionStats } from "../agent/stats";
 import {
@@ -76,11 +81,20 @@ import {
 } from "../hooks";
 import type { ApprovalContext } from "../permissions/analyzer";
 import { type PermissionMode, permissionMode } from "../permissions/mode";
+import { OPENAI_CODEX_PROVIDER_NAME } from "../providers/openai-codex-provider";
 import {
   DEFAULT_COMPLETION_PROMISE,
   type RalphState,
   ralphMode,
 } from "../ralph/mode";
+import { buildSharedReminderParts } from "../reminders/engine";
+import {
+  createSharedReminderState,
+  enqueueCommandIoReminder,
+  enqueueToolsetChangeReminder,
+  resetSharedReminderState,
+  syncReminderStateFromContextTracker,
+} from "../reminders/state";
 import { updateProjectSettings } from "../settings";
 import { settingsManager } from "../settings-manager";
 import { telemetry } from "../telemetry";
@@ -88,16 +102,18 @@ import {
   analyzeToolApproval,
   checkToolPermission,
   executeTool,
-  isGeminiModel,
-  isOpenAIModel,
+  getToolNames,
+  releaseToolExecutionContext,
   savePermissionRule,
   type ToolExecutionResult,
 } from "../tools/manager";
 import { clearSkillBlockCache } from "../tools/impl/Skill";
+import type { ToolsetName, ToolsetPreference } from "../tools/toolset";
+import { formatToolsetName } from "../tools/toolset-labels";
 import { debugLog, debugWarn } from "../utils/debug";
+import { getVersion } from "../version";
 import {
   handleMcpAdd,
-  handleMcpUsage,
   type McpCommandContext,
   setActiveCommandId as setActiveMcpCommandId,
 } from "./commands/mcp";
@@ -112,7 +128,11 @@ import {
   setActiveCommandId as setActiveProfileCommandId,
   validateProfileLoad,
 } from "./commands/profile";
-import { type CommandHandle, createCommandRunner } from "./commands/runner";
+import {
+  type CommandFinishedEvent,
+  type CommandHandle,
+  createCommandRunner,
+} from "./commands/runner";
 import { AgentSelector } from "./components/AgentSelector";
 // ApprovalDialog removed - all approvals now render inline
 import { ApprovalPreview } from "./components/ApprovalPreview";
@@ -134,6 +154,7 @@ import { McpSelector } from "./components/McpSelector";
 import { MemfsTreeViewer } from "./components/MemfsTreeViewer";
 import { MemoryTabViewer } from "./components/MemoryTabViewer";
 import { MessageSearch } from "./components/MessageSearch";
+import { ModelReasoningSelector } from "./components/ModelReasoningSelector";
 import { ModelSelector } from "./components/ModelSelector";
 import { NewAgentDialog } from "./components/NewAgentDialog";
 import { PendingApprovalStub } from "./components/PendingApprovalStub";
@@ -169,6 +190,7 @@ import {
 } from "./helpers/accumulator";
 import { classifyApprovals } from "./helpers/approvalClassification";
 import { backfillBuffers } from "./helpers/backfill";
+import { chunkLog } from "./helpers/chunkLog";
 import {
   type ContextWindowOverview,
   renderContextUsage,
@@ -191,13 +213,10 @@ import {
 import { formatCompact } from "./helpers/format";
 import { parsePatchOperations } from "./helpers/formatArgsDisplay";
 import {
-  buildCompactionMemoryReminder,
-  buildMemoryReminder,
   getReflectionSettings,
   parseMemoryPreference,
   type ReflectionSettings,
   reflectionSettingsToLegacyMode,
-  shouldFireStepCountTrigger,
 } from "./helpers/memoryReminder";
 import {
   type QueuedMessage,
@@ -304,6 +323,88 @@ const OPUS_BEDROCK_FALLBACK_HINT =
 // Generic hint for llm_api_error when specific model suggestion not applicable
 const PROVIDER_FALLBACK_HINT =
   "Downstream provider issues? Use /model to switch to another provider";
+
+/**
+ * Derives the current reasoning effort from agent state (canonical) with llm_config as fallback.
+ * model_settings is the source of truth; llm_config.reasoning_effort is a legacy field.
+ */
+function deriveReasoningEffort(
+  modelSettings: AgentState["model_settings"] | undefined | null,
+  llmConfig: LlmConfig | null | undefined,
+): ModelReasoningEffort | null {
+  if (modelSettings && "provider_type" in modelSettings) {
+    // OpenAI/OpenRouter: reasoning.reasoning_effort
+    if (
+      modelSettings.provider_type === "openai" &&
+      "reasoning" in modelSettings &&
+      modelSettings.reasoning
+    ) {
+      const re = (modelSettings.reasoning as { reasoning_effort?: string })
+        .reasoning_effort;
+      if (
+        re === "none" ||
+        re === "minimal" ||
+        re === "low" ||
+        re === "medium" ||
+        re === "high" ||
+        re === "xhigh"
+      )
+        return re;
+    }
+    // Anthropic/Bedrock: effort field
+    if (
+      modelSettings.provider_type === "anthropic" ||
+      modelSettings.provider_type === "bedrock"
+    ) {
+      const effort = (modelSettings as { effort?: string | null }).effort;
+      if (effort === "low" || effort === "medium" || effort === "high")
+        return effort;
+      if (effort === "max") return "xhigh";
+    }
+  }
+  // Fallback: deprecated llm_config fields
+  const re = llmConfig?.reasoning_effort;
+  if (
+    re === "none" ||
+    re === "minimal" ||
+    re === "low" ||
+    re === "medium" ||
+    re === "high" ||
+    re === "xhigh"
+  )
+    return re;
+  if (
+    (llmConfig as { enable_reasoner?: boolean | null })?.enable_reasoner ===
+    false
+  )
+    return "none";
+  return null;
+}
+
+function inferReasoningEffortFromModelPreset(
+  modelId: string | null | undefined,
+  modelHandle: string | null | undefined,
+): ModelReasoningEffort | null {
+  const modelInfo =
+    (modelId ? getModelInfo(modelId) : null) ??
+    (modelHandle ? getModelInfo(modelHandle) : null);
+  const presetEffort = (
+    modelInfo?.updateArgs as { reasoning_effort?: unknown } | undefined
+  )?.reasoning_effort;
+
+  if (
+    presetEffort === "none" ||
+    presetEffort === "minimal" ||
+    presetEffort === "low" ||
+    presetEffort === "medium" ||
+    presetEffort === "high" ||
+    presetEffort === "xhigh"
+  ) {
+    return presetEffort;
+  }
+
+  return null;
+}
 
 // Helper to get appropriate error hint based on stop reason and current model
 function getErrorHintForStopReason(
@@ -491,28 +592,7 @@ async function isRetriableError(
       const errorType = metaError?.error_type ?? metaError?.error?.error_type;
       const detail = metaError?.detail ?? metaError?.error?.detail ?? "";
 
-      // Don't retry 4xx client errors (validation, auth, malformed requests)
-      // These are not transient and won't succeed on retry
-      const is4xxError = /Error code: 4\d{2}/.test(detail);
-
-      if (errorType === "llm_error" && !is4xxError) return true;
-
-      // Fallback: detect LLM provider errors from detail even if misclassified
-      // This handles edge cases where streaming errors weren't properly converted to LLMError
-      // Patterns are derived from handle_llm_error() message formats in the backend
-      const llmProviderPatterns = [
-        "Anthropic API error", // anthropic_client.py:759
-        "OpenAI API error", // openai_client.py:1034
-        "Google Vertex API error", // google_vertex_client.py:848
-        "overloaded", // anthropic_client.py:753 - used for LLMProviderOverloaded
-        "api_error", // Anthropic SDK error type field
-        "Network error", // Transient network failures during streaming
-        "Connection error during Anthropic streaming", // Peer disconnections, incomplete chunked reads
-      ];
-      if (
-        llmProviderPatterns.some((pattern) => detail.includes(pattern)) &&
-        !is4xxError
-      ) {
+      if (shouldRetryRunMetadataError(errorType, detail)) {
         return true;
       }
 
@@ -838,6 +918,7 @@ export default function App({
   showCompactions = false,
   agentProvenance = null,
   releaseNotes = null,
+  sessionContextReminderEnabled = true,
 }: {
   agentId: string;
   agentState?: AgentState | null;
@@ -858,6 +939,7 @@ export default function App({
   showCompactions?: boolean;
   agentProvenance?: AgentProvenance | null;
   releaseNotes?: string | null; // Markdown release notes to display above header
+  sessionContextReminderEnabled?: boolean;
 }) {
   // Warm the model-access cache in the background so /model is fast on first open.
   useEffect(() => {
@@ -949,10 +1031,18 @@ export default function App({
   const [networkPhase, setNetworkPhase] = useState<
     "upload" | "download" | "error" | null
   >(null);
-  // Track permission mode changes for UI updates
-  const [uiPermissionMode, setUiPermissionMode] = useState(
+  // Track permission mode changes for UI updates.
+  // Keep a ref in sync *synchronously* so async approval classification never
+  // reads a stale mode during the render/effect window.
+  const [uiPermissionMode, _setUiPermissionMode] = useState(
     permissionMode.getMode(),
   );
+  const uiPermissionModeRef = useRef<PermissionMode>(uiPermissionMode);
+  const setUiPermissionMode = useCallback((mode: PermissionMode) => {
+    uiPermissionModeRef.current = mode;
+    _setUiPermissionMode(mode);
+  }, []);
+
   const statusLineTriggerVersionRef = useRef(0);
   const [statusLineTriggerVersion, setStatusLineTriggerVersion] = useState(0);
 
@@ -1231,6 +1321,11 @@ export default function App({
     filterProvider?: string;
     forceRefresh?: boolean;
   }>({});
+  const [modelReasoningPrompt, setModelReasoningPrompt] = useState<{
+    modelLabel: string;
+    initialModelId: string;
+    options: Array<{ effort: ModelReasoningEffort; modelId: string }>;
+  } | null>(null);
   const closeOverlay = useCallback(() => {
     const pending = pendingOverlayCommandRef.current;
     if (pending && pending.overlay === activeOverlay) {
@@ -1241,6 +1336,7 @@ export default function App({
     setFeedbackPrefill("");
     setSearchQuery("");
     setModelSelectorOptions({});
+    setModelReasoningPrompt(null);
   }, [activeOverlay]);
 
   // Queued overlay action - executed after end_turn when user makes a selection
@@ -1260,13 +1356,7 @@ export default function App({
       }
     | {
         type: "switch_toolset";
-        toolsetId:
-          | "codex"
-          | "codex_snake"
-          | "default"
-          | "gemini"
-          | "gemini_snake"
-          | "none";
+        toolsetId: ToolsetPreference;
         commandId?: string;
       }
     | { type: "switch_system"; promptId: string; commandId?: string }
@@ -1284,23 +1374,23 @@ export default function App({
   const [currentSystemPromptId, setCurrentSystemPromptId] = useState<
     string | null
   >("default");
-  const [currentToolset, setCurrentToolset] = useState<
-    | "codex"
-    | "codex_snake"
-    | "default"
-    | "gemini"
-    | "gemini_snake"
-    | "none"
-    | null
-  >(null);
+  const [currentToolset, setCurrentToolset] = useState<ToolsetName | null>(
+    null,
+  );
+  const [currentToolsetPreference, setCurrentToolsetPreference] =
+    useState<ToolsetPreference>("auto");
   const [llmConfig, setLlmConfig] = useState<LlmConfig | null>(null);
   const llmConfigRef = useRef(llmConfig);
   useEffect(() => {
     llmConfigRef.current = llmConfig;
   }, [llmConfig]);
+  const agentStateRef = useRef(agentState);
+  useEffect(() => {
+    agentStateRef.current = agentState;
+  }, [agentState]);
   const [currentModelId, setCurrentModelId] = useState<string | null>(null);
   // Full model handle for API calls (e.g., "anthropic/claude-sonnet-4-5-20251101")
-  const [_currentModelHandle, setCurrentModelHandle] = useState<string | null>(
+  const [currentModelHandle, setCurrentModelHandle] = useState<string | null>(
     null,
   );
   // Derive agentName from agentState (single source of truth)
@@ -1316,6 +1406,12 @@ export default function App({
       currentModelLabel.split("/").pop())
     : null;
   const currentModelProvider = llmConfig?.provider_name ?? null;
+  // Derive reasoning effort from model_settings (canonical) with llm_config as legacy fallback.
+  // Some providers may omit explicit effort for default tiers (e.g., Sonnet 4.6 high),
+  // so fall back to the selected model preset when needed.
+  const currentReasoningEffort: ModelReasoningEffort | null =
+    deriveReasoningEffort(agentState?.model_settings, llmConfig) ??
+    inferReasoningEffortFromModelPreset(currentModelId, currentModelLabel);
 
   // Billing tier for conditional UI and error context (fetched once on mount)
   const [billingTier, setBillingTier] = useState<string | null>(null);
@@ -1325,8 +1421,9 @@ export default function App({
     setErrorContext({
       modelDisplayName: currentModelDisplay ?? undefined,
       billingTier: billingTier ?? undefined,
+      modelEndpointType: llmConfig?.model_endpoint_type ?? undefined,
     });
-  }, [currentModelDisplay, billingTier]);
+  }, [currentModelDisplay, billingTier, llmConfig?.model_endpoint_type]);
 
   // Fetch billing tier once on mount
   useEffect(() => {
@@ -1382,6 +1479,14 @@ export default function App({
   const sessionStatsRef = useRef(new SessionStats());
   const sessionStartTimeRef = useRef(Date.now());
   const sessionHooksRanRef = useRef(false);
+
+  // Initialize chunk log for this agent + session (clears buffer, GCs old files).
+  // Re-runs when agentId changes (e.g. agent switch via /agents).
+  useEffect(() => {
+    if (agentId && agentId !== "loading") {
+      chunkLog.init(agentId, telemetry.getSessionId());
+    }
+  }, [agentId]);
 
   const syncTrajectoryTokenBase = useCallback(() => {
     const snapshot = sessionStatsRef.current.getTrajectorySnapshot();
@@ -1491,27 +1596,16 @@ export default function App({
   // Show exit stats on exit (double Ctrl+C)
   const [showExitStats, setShowExitStats] = useState(false);
 
-  // Track if we've sent the session context for this CLI session
-  const hasSentSessionContextRef = useRef(false);
+  const sharedReminderStateRef = useRef(createSharedReminderState());
 
   // Track if we've set the conversation summary for this new conversation
   // Initialized to true for resumed conversations (they already have context)
   const hasSetConversationSummaryRef = useRef(resumedExistingConversation);
   // Store first user query for conversation summary
   const firstUserQueryRef = useRef<string | null>(null);
-
-  // Track skills injection state (LET-7353)
-  const discoveredSkillsRef = useRef<import("../agent/skills").Skill[] | null>(
-    null,
-  );
-  const hasInjectedSkillsRef = useRef(false);
-
-  // Track conversation turn count for periodic memory reminders
-  const turnCountRef = useRef(0);
-
-  // Track last notified permission mode to detect changes
-  const lastNotifiedModeRef = useRef<PermissionMode>("default");
-
+  const resetBootstrapReminderState = useCallback(() => {
+    resetSharedReminderState(sharedReminderStateRef.current);
+  }, []);
   // Static items (things that are done rendering and can be frozen)
   const [staticItems, setStaticItems] = useState<StaticItem[]>([]);
 
@@ -1576,6 +1670,13 @@ export default function App({
   const lastSentInputRef = useRef<Array<MessageCreate | ApprovalCreate> | null>(
     null,
   );
+  const approvalToolContextIdRef = useRef<string | null>(null);
+  const clearApprovalToolContext = useCallback(() => {
+    const contextId = approvalToolContextIdRef.current;
+    if (!contextId) return;
+    approvalToolContextIdRef.current = null;
+    releaseToolExecutionContext(contextId);
+  }, []);
   // Non-null only when the previous turn was explicitly interrupted by the user.
   // Used to gate recovery alert injection to true user-interrupt retries.
   const pendingInterruptRecoveryConversationIdRef = useRef<string | null>(null);
@@ -2274,14 +2375,47 @@ export default function App({
     commitEligibleLines(b);
   }, [commitEligibleLines]);
 
+  const recordCommandReminder = useCallback((event: CommandFinishedEvent) => {
+    const input = event.input.trim();
+    if (!input.startsWith("/")) {
+      return;
+    }
+    enqueueCommandIoReminder(sharedReminderStateRef.current, {
+      input,
+      output: event.output,
+      success: event.success,
+    });
+  }, []);
+
+  const maybeRecordToolsetChangeReminder = useCallback(
+    (params: {
+      source: string;
+      previousToolset: string | null;
+      newToolset: string | null;
+      previousTools: string[];
+      newTools: string[];
+    }) => {
+      const toolsetChanged = params.previousToolset !== params.newToolset;
+      const previousSnapshot = params.previousTools.join("\n");
+      const nextSnapshot = params.newTools.join("\n");
+      const toolsChanged = previousSnapshot !== nextSnapshot;
+      if (!toolsetChanged && !toolsChanged) {
+        return;
+      }
+      enqueueToolsetChangeReminder(sharedReminderStateRef.current, params);
+    },
+    [],
+  );
+
   const commandRunner = useMemo(
     () =>
       createCommandRunner({
         buffersRef,
         refreshDerived,
         createId: uid,
+        onCommandFinished: recordCommandReminder,
       }),
-    [refreshDerived],
+    [recordCommandReminder, refreshDerived],
   );
 
   const startOverlayCommand = useCallback(
@@ -2448,7 +2582,11 @@ export default function App({
           setApprovalContexts(contexts);
         } catch (error) {
           // If analysis fails, leave context as null (will show basic options)
-          console.error("Failed to analyze startup approvals:", error);
+          debugLog(
+            "approvals",
+            "Failed to analyze startup approvals: %O",
+            error,
+          );
         }
       };
 
@@ -2648,13 +2786,21 @@ export default function App({
             "→ **/init**      initialize your agent's memory",
             "→ **/remember**  teach your agent",
           ]
-        : [
-            "→ **/agents**    list all agents",
-            "→ **/resume**    resume a previous conversation",
-            "→ **/pin**       save + name your agent",
-            "→ **/init**      initialize your agent's memory",
-            "→ **/remember**  teach your agent",
-          ];
+        : isPinned
+          ? [
+              "→ **/agents**    list all agents",
+              "→ **/resume**    resume a previous conversation",
+              "→ **/memory**    view your agent's memory",
+              "→ **/init**      initialize your agent's memory",
+              "→ **/remember**  teach your agent",
+            ]
+          : [
+              "→ **/agents**    list all agents",
+              "→ **/resume**    resume a previous conversation",
+              "→ **/pin**       save + name your agent",
+              "→ **/init**      initialize your agent's memory",
+              "→ **/remember**  teach your agent",
+            ];
 
       // Build status lines with optional release notes above header
       const statusLines: string[] = [];
@@ -2702,6 +2848,66 @@ export default function App({
           setLlmConfig(agent.llm_config);
           updateAgentName(agent.name);
           setAgentDescription(agent.description ?? null);
+
+          // Infer the system prompt id for footer/selector display by matching the
+          // stored agent.system content against our known prompt presets.
+          try {
+            const agentSystem = (agent as { system?: unknown }).system;
+            if (typeof agentSystem === "string") {
+              const normalize = (s: string) => {
+                // Match prompt presets even if memfs addon is enabled/disabled.
+                // The memfs addon is appended to the stored agent.system prompt.
+                const withoutMemfs = s.replace(
+                  /\n## Memory Filesystem[\s\S]*?(?=\n# |$)/,
+                  "",
+                );
+                return withoutMemfs.replace(/\r\n/g, "\n").trim();
+              };
+              const sysNorm = normalize(agentSystem);
+              const { SYSTEM_PROMPTS, SYSTEM_PROMPT } = await import(
+                "../agent/promptAssets"
+              );
+
+              // Best-effort preset detection.
+              // Exact match is ideal, but allow prefix-matches because the stored
+              // agent.system may have additional sections appended.
+              let matched: string | null = null;
+
+              const contentMatches = (content: string): boolean => {
+                const norm = normalize(content);
+                return (
+                  norm === sysNorm ||
+                  (norm.length > 0 &&
+                    (sysNorm.startsWith(norm) || norm.startsWith(sysNorm)))
+                );
+              };
+
+              const defaultPrompt = SYSTEM_PROMPTS.find(
+                (p) => p.id === "default",
+              );
+              if (defaultPrompt && contentMatches(defaultPrompt.content)) {
+                matched = "default";
+              } else {
+                const found = SYSTEM_PROMPTS.find((p) =>
+                  contentMatches(p.content),
+                );
+                if (found) {
+                  matched = found.id;
+                } else if (contentMatches(SYSTEM_PROMPT)) {
+                  // SYSTEM_PROMPT is used when no preset was specified.
+                  // Display as default since it maps to the default selector option.
+                  matched = "default";
+                }
+              }
+
+              setCurrentSystemPromptId(matched ?? "custom");
+            } else {
+              setCurrentSystemPromptId("custom");
+            }
+          } catch {
+            // best-effort only
+            setCurrentSystemPromptId("custom");
+          }
           // Get last message timestamp from agent state if available
           const lastRunCompletion = (agent as { last_run_completion?: string })
             .last_run_completion;
@@ -2728,17 +2934,30 @@ export default function App({
           // Store full handle for API calls (e.g., compaction)
           setCurrentModelHandle(agentModelHandle || null);
 
-          // Derive toolset from agent's model (not persisted, computed on resume)
-          if (agentModelHandle) {
-            const derivedToolset = isOpenAIModel(agentModelHandle)
-              ? "codex"
-              : isGeminiModel(agentModelHandle)
-                ? "gemini"
-                : "default";
-            setCurrentToolset(derivedToolset);
+          const persistedToolsetPreference =
+            settingsManager.getToolsetPreference(agentId);
+          setCurrentToolsetPreference(persistedToolsetPreference);
+
+          if (persistedToolsetPreference === "auto") {
+            if (agentModelHandle) {
+              const { switchToolsetForModel } = await import(
+                "../tools/toolset"
+              );
+              const derivedToolset = await switchToolsetForModel(
+                agentModelHandle,
+                agentId,
+              );
+              setCurrentToolset(derivedToolset);
+            } else {
+              setCurrentToolset(null);
+            }
+          } else {
+            const { forceToolsetSwitch } = await import("../tools/toolset");
+            await forceToolsetSwitch(persistedToolsetPreference, agentId);
+            setCurrentToolset(persistedToolsetPreference);
           }
         } catch (error) {
-          console.error("Error fetching agent config:", error);
+          debugLog("agent-config", "Error fetching agent config: %O", error);
         }
       };
       fetchConfig();
@@ -2805,8 +3024,10 @@ export default function App({
     // Git-backed memory: check status periodically (fire-and-forget).
     // Runs every N turns to detect uncommitted changes or unpushed commits.
     const isIntervalTurn =
-      turnCountRef.current > 0 &&
-      turnCountRef.current % MEMFS_CONFLICT_CHECK_INTERVAL === 0;
+      sharedReminderStateRef.current.turnCount > 0 &&
+      sharedReminderStateRef.current.turnCount %
+        MEMFS_CONFLICT_CHECK_INTERVAL ===
+        0;
 
     if (isIntervalTurn && !memfsGitCheckInFlightRef.current) {
       memfsGitCheckInFlightRef.current = true;
@@ -2988,6 +3209,7 @@ export default function App({
           setUiRalphActive(false);
           if (wasYolo) {
             permissionMode.setMode("default");
+            setUiPermissionMode("default");
           }
 
           // Add completion status to transcript
@@ -3012,6 +3234,7 @@ export default function App({
           setUiRalphActive(false);
           if (wasYolo) {
             permissionMode.setMode("default");
+            setUiPermissionMode("default");
           }
 
           // Add status to transcript
@@ -3213,12 +3436,14 @@ export default function App({
           // throws before streaming begins, e.g., retry after LLM error when backend
           // already cleared the approval)
           let stream: Awaited<ReturnType<typeof sendMessageStream>>;
+          let turnToolContextId: string | null = null;
           try {
             stream = await sendMessageStream(
               conversationIdRef.current,
               currentInput,
               { agentId: agentIdRef.current },
             );
+            turnToolContextId = getStreamToolContextId(stream);
           } catch (preStreamError) {
             // Extract error detail using shared helper (handles nested/direct/message shapes)
             const errorDetail = extractConflictDetail(preStreamError);
@@ -3228,6 +3453,14 @@ export default function App({
               errorDetail,
               conversationBusyRetriesRef.current,
               CONVERSATION_BUSY_MAX_RETRIES,
+              {
+                status:
+                  preStreamError instanceof APIError
+                    ? preStreamError.status
+                    : undefined,
+                transientRetries: llmApiErrorRetriesRef.current,
+                maxTransientRetries: LLM_API_ERROR_MAX_RETRIES,
+              },
             );
 
             // Resolve stale approval conflict: fetch real pending approvals, auto-deny, retry.
@@ -3305,6 +3538,54 @@ export default function App({
               if (!cancelled) {
                 // Reset interrupted flag so retry stream chunks are processed
                 buffersRef.current.interrupted = false;
+                continue;
+              }
+              // User pressed ESC - fall through to error handling
+            }
+
+            // Retry pre-stream transient errors (429/5xx/network) with shared LLM retry budget
+            if (preStreamAction === "retry_transient") {
+              llmApiErrorRetriesRef.current += 1;
+              const attempt = llmApiErrorRetriesRef.current;
+              const retryAfterMs =
+                preStreamError instanceof APIError
+                  ? parseRetryAfterHeaderMs(
+                      preStreamError.headers?.get("retry-after"),
+                    )
+                  : null;
+              const delayMs = retryAfterMs ?? 1000 * 2 ** (attempt - 1);
+
+              const statusId = uid("status");
+              buffersRef.current.byId.set(statusId, {
+                kind: "status",
+                id: statusId,
+                lines: [getRetryStatusMessage(errorDetail)],
+              });
+              buffersRef.current.order.push(statusId);
+              refreshDerived();
+
+              let cancelled = false;
+              const startTime = Date.now();
+              while (Date.now() - startTime < delayMs) {
+                if (
+                  abortControllerRef.current?.signal.aborted ||
+                  userCancelledRef.current
+                ) {
+                  cancelled = true;
+                  break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 100));
+              }
+
+              buffersRef.current.byId.delete(statusId);
+              buffersRef.current.order = buffersRef.current.order.filter(
+                (id) => id !== statusId,
+              );
+              refreshDerived();
+
+              if (!cancelled) {
+                buffersRef.current.interrupted = false;
+                conversationBusyRetriesRef.current = 0;
                 continue;
               }
               // User pressed ESC - fall through to error handling
@@ -3496,7 +3777,7 @@ export default function App({
               }
             } catch (error) {
               // Silently fail - don't interrupt the conversation flow
-              console.error("Failed to sync agent state:", error);
+              debugLog("sync-agent", "Failed to sync agent state: %O", error);
             }
           };
 
@@ -3586,6 +3867,7 @@ export default function App({
 
           // Case 1: Turn ended normally
           if (stopReasonToHandle === "end_turn") {
+            clearApprovalToolContext();
             setStreaming(false);
             const liveElapsedMs = (() => {
               const snapshot = sessionStatsRef.current.getTrajectorySnapshot();
@@ -3768,6 +4050,7 @@ export default function App({
 
           // Case 1.5: Stream was cancelled by user
           if (stopReasonToHandle === "cancelled") {
+            clearApprovalToolContext();
             setStreaming(false);
             closeTrajectorySegment();
             syncTrajectoryElapsedBase();
@@ -3823,6 +4106,8 @@ export default function App({
 
           // Case 2: Requires approval
           if (stopReasonToHandle === "requires_approval") {
+            clearApprovalToolContext();
+            approvalToolContextIdRef.current = turnToolContextId;
             // Clear stale state immediately to prevent ID mismatch bugs
             setAutoHandledResults([]);
             setAutoDeniedApprovals([]);
@@ -3838,6 +4123,7 @@ export default function App({
                   : [];
 
             if (approvalsToProcess.length === 0) {
+              clearApprovalToolContext();
               appendError(
                 `Unexpected empty approvals with stop reason: ${stopReason}`,
               );
@@ -3850,6 +4136,8 @@ export default function App({
             // If in quietCancel mode (user queued messages), auto-reject all approvals
             // and send denials + queued messages together
             if (waitingForQueueCancelRef.current) {
+              clearApprovalToolContext();
+
               if (restoreQueueOnCancelRef.current) {
                 // User hit ESC during queue cancel - abort the auto-send
                 setRestoreQueueOnCancel(false);
@@ -3881,6 +4169,11 @@ export default function App({
                 // Queue denial results to be sent with the queued message
                 queueApprovalResults(denialResults);
 
+                debugLog(
+                  "queue",
+                  `Queue-cancel completed (requires_approval): ${denialResults.length} denial(s) queued, messages will be processed by dequeue effect`,
+                );
+
                 // Get queued messages and clear queue
                 const concatenatedMessage = queueSnapshotRef.current.map((item) => item.text).join("\n");
                 setMessageQueue([]);
@@ -3905,6 +4198,7 @@ export default function App({
               userCancelledRef.current ||
               abortControllerRef.current?.signal.aborted
             ) {
+              clearApprovalToolContext();
               setStreaming(false);
               closeTrajectorySegment();
               syncTrajectoryElapsedBase();
@@ -3918,6 +4212,14 @@ export default function App({
             }
 
             // Check permissions for all approvals (including fancy UI tools)
+            // Ensure the singleton permission mode matches what the UI shows.
+            // This prevents rare races where the footer shows YOLO but approvals still
+            // get classified using the default mode.
+            const desiredMode = uiPermissionModeRef.current;
+            if (permissionMode.getMode() !== desiredMode) {
+              permissionMode.setMode(desiredMode);
+            }
+
             const { needsUserInput, autoAllowed, autoDenied } =
               await classifyApprovals(approvalsToProcess, {
                 getContext: analyzeToolApproval,
@@ -4041,6 +4343,8 @@ export default function App({
                       {
                         abortSignal: autoAllowedAbortController.signal,
                         onStreamingOutput: updateStreamingOutput,
+                        toolContextId:
+                          approvalToolContextIdRef.current ?? undefined,
                       },
                     )
                   : [];
@@ -4880,11 +5184,13 @@ export default function App({
       consumeQueuedMessages,
       appendTaskNotificationEvents,
       maybeCheckMemoryGitStatus,
+      clearApprovalToolContext,
       openTrajectorySegment,
       syncTrajectoryTokenBase,
       syncTrajectoryElapsedBase,
       closeTrajectorySegment,
       resetTrajectoryBases,
+      setUiPermissionMode,
     ],
   );
 
@@ -4996,6 +5302,7 @@ export default function App({
         conversationIdRef.current;
       userCancelledRef.current = true; // Prevent dequeue
       setStreaming(false);
+      resetTrajectoryBases();
       setIsExecutingTool(false);
       toolResultsInFlightRef.current = false;
 
@@ -5097,7 +5404,9 @@ export default function App({
       // Stop streaming and show error message (unless tool calls were cancelled,
       // since the tool result will show "Interrupted by user")
       setStreaming(false);
+      resetTrajectoryBases();
       toolResultsInFlightRef.current = false;
+      setIsExecutingTool(false);
       if (!toolsCancelled) {
         appendError(INTERRUPT_MESSAGE, true);
       }
@@ -5174,13 +5483,18 @@ export default function App({
 
         if (abortControllerRef.current) {
           abortControllerRef.current.abort();
+          abortControllerRef.current = null;
         }
+        setIsExecutingTool(false);
+        toolResultsInFlightRef.current = false;
         pendingInterruptRecoveryConversationIdRef.current =
           conversationIdRef.current;
       } catch (e) {
         const errorDetails = formatErrorDetails(e, agentId);
         appendError(`Failed to interrupt stream: ${errorDetails}`);
         setInterruptRequested(false);
+        setIsExecutingTool(false);
+        toolResultsInFlightRef.current = false;
       }
     }
   }, [
@@ -5195,6 +5509,7 @@ export default function App({
     pendingApprovals,
     autoHandledResults,
     queueApprovalResults,
+    resetTrajectoryBases,
   ]);
 
   // Keep ref to latest processConversation to avoid circular deps in useEffect
@@ -5202,6 +5517,32 @@ export default function App({
   useEffect(() => {
     processConversationRef.current = processConversation;
   }, [processConversation]);
+
+  // Reasoning tier cycling state shared by /model, /agents, and tab-cycling flows.
+  const reasoningCycleDebounceMs = 500;
+  const reasoningCycleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const reasoningCycleInFlightRef = useRef(false);
+  const reasoningCycleDesiredRef = useRef<{
+    modelHandle: string;
+    effort: string;
+    modelId: string;
+  } | null>(null);
+  const reasoningCycleLastConfirmedRef = useRef<LlmConfig | null>(null);
+  const reasoningCycleLastConfirmedAgentStateRef = useRef<AgentState | null>(
+    null,
+  );
+
+  const resetPendingReasoningCycle = useCallback(() => {
+    if (reasoningCycleTimerRef.current) {
+      clearTimeout(reasoningCycleTimerRef.current);
+      reasoningCycleTimerRef.current = null;
+    }
+    reasoningCycleDesiredRef.current = null;
+    reasoningCycleLastConfirmedRef.current = null;
+    reasoningCycleLastConfirmedAgentStateRef.current = null;
+  }, []);
 
   const handleAgentSelect = useCallback(
     async (
@@ -5228,6 +5569,9 @@ export default function App({
         cmd.finish(`Already on "${label}"`, true);
         return;
       }
+
+      // Drop any pending reasoning-tier debounce before switching contexts.
+      resetPendingReasoningCycle();
 
       // If agent is busy, queue the switch for after end_turn
       if (isAgentBusy()) {
@@ -5289,17 +5633,25 @@ export default function App({
         setStaticRenderEpoch((e) => e + 1);
         resetTrajectoryBases();
 
-        // Reset turn counter for memory reminders when switching agents
-        turnCountRef.current = 0;
-
         // Update agent state - also update ref immediately for any code that runs before re-render
         agentIdRef.current = targetAgentId;
         setAgentId(targetAgentId);
         setAgentState(agent);
         updateAgentName(agent.name);
         setLlmConfig(agent.llm_config);
+        const agentModelHandle =
+          agent.llm_config.model_endpoint_type && agent.llm_config.model
+            ? agent.llm_config.model_endpoint_type +
+              "/" +
+              agent.llm_config.model
+            : (agent.llm_config.model ?? null);
+        setCurrentModelHandle(agentModelHandle);
         setConversationId(targetConversationId);
         clearSkillBlockCache();
+
+        // Ensure bootstrap reminders are re-injected on the first user turn
+        // after switching to a different conversation/agent context.
+        resetBootstrapReminderState();
 
         // Set conversation switch context for agent switch
         {
@@ -5365,6 +5717,8 @@ export default function App({
       isAgentBusy,
       resetDeferredToolCallCommits,
       resetTrajectoryBases,
+      resetBootstrapReminderState,
+      resetPendingReasoningCycle,
     ],
   );
 
@@ -5393,6 +5747,19 @@ export default function App({
         // Update project settings with new agent
         await updateProjectSettings({ lastAgent: agent.id });
 
+        // New agents always start on their default conversation route.
+        // Persist this explicitly so routing and resume state do not retain
+        // a previous agent's non-default conversation id.
+        const targetConversationId = "default";
+        settingsManager.setLocalLastSession(
+          { agentId: agent.id, conversationId: targetConversationId },
+          process.cwd(),
+        );
+        settingsManager.setGlobalLastSession({
+          agentId: agent.id,
+          conversationId: targetConversationId,
+        });
+
         // Build success message with hints
         const agentUrl = `https://app.letta.com/projects/default-project/agents/${agent.id}`;
         const successOutput = [
@@ -5420,18 +5787,43 @@ export default function App({
         setStaticRenderEpoch((e) => e + 1);
         resetTrajectoryBases();
 
-        // Reset turn counter for memory reminders
-        turnCountRef.current = 0;
-
         // Update agent state
         agentIdRef.current = agent.id;
         setAgentId(agent.id);
         setAgentState(agent);
         updateAgentName(agent.name);
         setLlmConfig(agent.llm_config);
+        const agentModelHandle =
+          agent.llm_config.model_endpoint_type && agent.llm_config.model
+            ? agent.llm_config.model_endpoint_type +
+              "/" +
+              agent.llm_config.model
+            : (agent.llm_config.model ?? null);
+        setCurrentModelHandle(agentModelHandle);
+        setConversationId(targetConversationId);
+
+        // Set conversation switch context for new agent switch
+        pendingConversationSwitchRef.current = {
+          origin: "agent-switch",
+          conversationId: targetConversationId,
+          isDefault: true,
+          agentSwitchContext: {
+            name: agent.name || agent.id,
+            description: agent.description ?? undefined,
+            model: agentModelHandle
+              ? (await import("../agent/model")).getModelDisplayName(
+                  agentModelHandle,
+                ) || agentModelHandle
+              : "unknown",
+            blockCount: agent.blocks?.length ?? 0,
+          },
+        };
 
         // Reset context token tracking for new agent
         resetContextHistory(contextTrackerRef.current);
+
+        // Ensure bootstrap reminders are re-injected after creating a new agent.
+        resetBootstrapReminderState();
 
         const separator = {
           kind: "separator" as const,
@@ -5454,6 +5846,7 @@ export default function App({
       setCommandRunning,
       resetDeferredToolCallCommits,
       resetTrajectoryBases,
+      resetBootstrapReminderState,
     ],
   );
 
@@ -5622,6 +6015,11 @@ export default function App({
       }
 
       // There are pending approvals - check permissions (respects yolo mode)
+      const desiredMode = uiPermissionModeRef.current;
+      if (permissionMode.getMode() !== desiredMode) {
+        permissionMode.setMode(desiredMode);
+      }
+
       const { needsUserInput, autoAllowed, autoDenied } =
         await classifyApprovals(existingApprovals, {
           getContext: analyzeToolApproval,
@@ -5679,6 +6077,7 @@ export default function App({
             {
               abortSignal: autoAllowedAbortController.signal,
               onStreamingOutput: updateStreamingOutput,
+              toolContextId: approvalToolContextIdRef.current ?? undefined,
             },
           );
           // Map to ApprovalResult format (ToolReturn)
@@ -5812,6 +6211,10 @@ export default function App({
 
       if (!msg) return { submitted: false };
 
+      // If the user just cycled reasoning tiers, flush the final choice before
+      // sending the next message so the upcoming run uses the selected tier.
+      await flushPendingReasoningEffort();
+
       // Run UserPromptSubmit hooks - can block the prompt from being processed
       const isCommand = userTextForInput.startsWith("/");
       const hookResult = isSystemOnly
@@ -5894,6 +6297,15 @@ export default function App({
         setDequeueEpoch((e) => e + 1);
       }
 
+      const isSlashCommand = userTextForInput.startsWith("/");
+      if (isAgentBusy() && isSlashCommand) {
+        const attemptedCommand = userTextForInput.split(/\s+/)[0] || "/";
+        const disabledMessage = `'${attemptedCommand}' is disabled while the agent is running.`;
+        const cmd = commandRunner.start(userTextForInput, disabledMessage);
+        cmd.fail(disabledMessage);
+        return { submitted: true }; // Clears input
+      }
+
       // Interactive slash commands (like /memory, /model, /agents) bypass queueing
       // so users can browse/view while the agent is working.
       // Changes made in these overlays will be queued until end_turn.
@@ -5930,6 +6342,7 @@ export default function App({
         justActivatedRalph = true;
         if (isYolo) {
           permissionMode.setMode("bypassPermissions");
+          setUiPermissionMode("bypassPermissions");
         }
 
         const ralphState = ralphMode.getState();
@@ -6106,15 +6519,33 @@ export default function App({
             return { submitted: true };
           }
 
+          // /mcp help - show usage
+          if (firstWord === "help") {
+            const cmd = commandRunner.start(msg, "Showing MCP help...");
+            const output = [
+              "/mcp help",
+              "",
+              "Manage MCP servers.",
+              "",
+              "USAGE",
+              "  /mcp              — open MCP server manager",
+              "  /mcp add ...      — add a new server (without OAuth)",
+              "  /mcp connect      — interactive wizard with OAuth support",
+              "  /mcp help         — show this help",
+              "",
+              "EXAMPLES",
+              "  /mcp add --transport http notion https://mcp.notion.com/mcp",
+            ].join("\n");
+            cmd.finish(output, true);
+            return { submitted: true };
+          }
+
           // Unknown subcommand
           {
             const cmd = commandRunner.start(msg, "Checking MCP usage...");
-            setActiveMcpCommandId(cmd.id);
-            try {
-              handleMcpUsage(mcpCtx, msg);
-            } finally {
-              setActiveMcpCommandId(null);
-            }
+            cmd.fail(
+              `Unknown subcommand: "${firstWord}". Run /mcp help for usage.`,
+            );
           }
           return { submitted: true };
         }
@@ -6186,6 +6617,54 @@ export default function App({
             );
           } finally {
             setActiveConnectCommandId(null);
+          }
+          return { submitted: true };
+        }
+
+        // Special handling for /listen command - start listener mode
+        if (trimmed === "/listen" || trimmed.startsWith("/listen ")) {
+          // Tokenize with quote support: --name "my laptop"
+          const parts = Array.from(
+            trimmed.matchAll(
+              /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|(\S+)/g,
+            ),
+            (match) => match[1] ?? match[2] ?? match[3],
+          );
+
+          let name: string | undefined;
+          let listenAgentId: string | undefined;
+
+          for (let i = 1; i < parts.length; i++) {
+            const part = parts[i];
+            const nextPart = parts[i + 1];
+            if (part === "--name" && nextPart) {
+              name = nextPart;
+              i++;
+            } else if (part === "--agent" && nextPart) {
+              listenAgentId = nextPart;
+              i++;
+            }
+          }
+
+          // Default to current agent if not specified
+          const targetAgentId = listenAgentId || agentId;
+
+          const cmd = commandRunner.start(msg, "Starting listener...");
+          const { handleListen, setActiveCommandId: setActiveListenCommandId } =
+            await import("./commands/listen");
+          setActiveListenCommandId(cmd.id);
+          try {
+            await handleListen(
+              {
+                buffersRef,
+                refreshDerived,
+                setCommandRunning,
+              },
+              msg,
+              { name, agentId: targetAgentId },
+            );
+          } finally {
+            setActiveListenCommandId(null);
           }
           return { submitted: true };
         }
@@ -6600,6 +7079,7 @@ export default function App({
             setUiRalphActive(true);
             if (isYolo) {
               permissionMode.setMode("bypassPermissions");
+              setUiPermissionMode("bypassPermissions");
             }
 
             const ralphState = ralphMode.getState();
@@ -6681,6 +7161,8 @@ export default function App({
             "Starting new conversation...",
           );
 
+          // New conversations should not inherit pending reasoning-tier debounce.
+          resetPendingReasoningCycle();
           setCommandRunning(true);
 
           // Run SessionEnd hooks for current session before starting new one
@@ -6738,8 +7220,8 @@ export default function App({
             // Reset context tokens for new conversation
             resetContextHistory(contextTrackerRef.current);
 
-            // Reset turn counter for memory reminders
-            turnCountRef.current = 0;
+            // Ensure bootstrap reminders are re-injected for the new conversation.
+            resetBootstrapReminderState();
 
             // Clear queued-message state to avoid cross-session leakage
             setMessageQueue([]);
@@ -6787,6 +7269,8 @@ export default function App({
             "Clearing in-context messages...",
           );
 
+          // Clearing conversation state should also clear pending reasoning-tier debounce.
+          resetPendingReasoningCycle();
           setCommandRunning(true);
 
           // Run SessionEnd hooks for current session before clearing
@@ -6826,8 +7310,8 @@ export default function App({
             // Reset context tokens for new conversation
             resetContextHistory(contextTrackerRef.current);
 
-            // Reset turn counter for memory reminders
-            turnCountRef.current = 0;
+            // Ensure bootstrap reminders are re-injected for the new conversation.
+            resetBootstrapReminderState();
 
             // Re-run SessionStart hooks for new conversation
             sessionHooksRanRef.current = false;
@@ -6977,18 +7461,38 @@ export default function App({
         // Supports: /compact, /compact all, /compact sliding_window
         if (msg.trim().startsWith("/compact")) {
           const parts = msg.trim().split(/\s+/);
-          const modeArg = parts[1] as "all" | "sliding_window" | undefined;
+          const rawModeArg = parts[1];
           const validModes = ["all", "sliding_window"];
+
+          if (rawModeArg === "help") {
+            const cmd = commandRunner.start(
+              msg.trim(),
+              "Showing compact help...",
+            );
+            const output = [
+              "/compact help",
+              "",
+              "Summarize conversation history (compaction).",
+              "",
+              "USAGE",
+              "  /compact                   — compact with default mode",
+              "  /compact all               — compact all messages",
+              "  /compact sliding_window    — compact with sliding window",
+              "  /compact help              — show this help",
+            ].join("\n");
+            cmd.finish(output, true);
+            return { submitted: true };
+          }
+
+          const modeArg = rawModeArg as "all" | "sliding_window" | undefined;
 
           // Validate mode if provided
           if (modeArg && !validModes.includes(modeArg)) {
             const cmd = commandRunner.start(
               msg.trim(),
-              `Invalid mode "${modeArg}". Valid modes: ${validModes.join(", ")}`,
+              `Invalid mode "${modeArg}".`,
             );
-            cmd.fail(
-              `Invalid mode "${modeArg}". Valid modes: ${validModes.join(", ")}`,
-            );
+            cmd.fail(`Invalid mode "${modeArg}". Run /compact help for usage.`);
             return { submitted: true };
           }
 
@@ -7100,6 +7604,21 @@ export default function App({
           const subcommand = parts[1]?.toLowerCase();
           const cmd = commandRunner.start(msg.trim(), "Processing rename...");
 
+          if (subcommand === "help") {
+            const output = [
+              "/rename help",
+              "",
+              "Rename the current agent or conversation.",
+              "",
+              "USAGE",
+              "  /rename agent <name>      — rename the agent",
+              "  /rename convo <summary>   — rename the conversation",
+              "  /rename help              — show this help",
+            ].join("\n");
+            cmd.finish(output, true);
+            return { submitted: true };
+          }
+
           if (
             !subcommand ||
             (subcommand !== "agent" && subcommand !== "convo")
@@ -7180,8 +7699,22 @@ export default function App({
             "Updating description...",
           );
 
+          if (newDescription === "help") {
+            const output = [
+              "/description help",
+              "",
+              "Update the current agent's description.",
+              "",
+              "USAGE",
+              "  /description <text>   — set agent description",
+              "  /description help     — show this help",
+            ].join("\n");
+            cmd.finish(output, true);
+            return { submitted: true };
+          }
+
           if (!newDescription) {
-            cmd.fail("Please provide a description: /description <text>");
+            cmd.fail("Usage: /description <text>");
             return { submitted: true };
           }
 
@@ -7226,6 +7759,25 @@ export default function App({
         if (msg.trim().startsWith("/resume")) {
           const parts = msg.trim().split(/\s+/);
           const targetConvId = parts[1]; // Optional conversation ID
+
+          if (targetConvId === "help") {
+            const cmd = commandRunner.start(
+              msg.trim(),
+              "Showing resume help...",
+            );
+            const output = [
+              "/resume help",
+              "",
+              "Resume a previous conversation.",
+              "",
+              "USAGE",
+              "  /resume                       — open conversation selector",
+              "  /resume <conversation_id>     — switch directly to a conversation",
+              "  /resume help                  — show this help",
+            ].join("\n");
+            cmd.finish(output, true);
+            return { submitted: true };
+          }
 
           if (targetConvId) {
             const cmd = commandRunner.start(
@@ -7303,6 +7855,7 @@ export default function App({
                 buffersRef.current.order = [];
                 buffersRef.current.tokenCount = 0;
                 resetContextHistory(contextTrackerRef.current);
+                resetBootstrapReminderState();
                 emittedIdsRef.current.clear();
                 resetDeferredToolCallCommits();
                 setStaticItems([]);
@@ -7359,8 +7912,9 @@ export default function App({
                     setApprovalContexts(contexts);
                   } catch (approvalError) {
                     // If analysis fails, leave context as null (will show basic options)
-                    console.error(
-                      "Failed to analyze resume approvals:",
+                    debugLog(
+                      "approvals",
+                      "Failed to analyze resume approvals: %O",
                       approvalError,
                     );
                   }
@@ -7516,6 +8070,22 @@ export default function App({
         if (msg.trim() === "/pin" || msg.trim().startsWith("/pin ")) {
           const argsStr = msg.trim().slice(4).trim();
 
+          if (argsStr === "help") {
+            const cmd = commandRunner.start(msg.trim(), "Showing pin help...");
+            const output = [
+              "/pin help",
+              "",
+              "Pin the current agent.",
+              "",
+              "USAGE",
+              "  /pin        — pin globally (interactive)",
+              "  /pin -l     — pin locally to this directory",
+              "  /pin help   — show this help",
+            ].join("\n");
+            cmd.finish(output, true);
+            return { submitted: true };
+          }
+
           // Parse args to check if name was provided
           const parts = argsStr.split(/\s+/).filter(Boolean);
           let hasNameArg = false;
@@ -7565,6 +8135,27 @@ export default function App({
 
         // Special handling for /unpin command - unpin current agent from project (or globally with -g)
         if (msg.trim() === "/unpin" || msg.trim().startsWith("/unpin ")) {
+          const unpinArgsStr = msg.trim().slice(6).trim();
+
+          if (unpinArgsStr === "help") {
+            const cmd = commandRunner.start(
+              msg.trim(),
+              "Showing unpin help...",
+            );
+            const output = [
+              "/unpin help",
+              "",
+              "Unpin the current agent.",
+              "",
+              "USAGE",
+              "  /unpin       — unpin globally",
+              "  /unpin -l    — unpin locally",
+              "  /unpin help  — show this help",
+            ].join("\n");
+            cmd.finish(output, true);
+            return { submitted: true };
+          }
+
           const profileCtx: ProfileCommandContext = {
             buffersRef,
             refreshDerived,
@@ -7715,12 +8306,17 @@ export default function App({
 
           if (!subcommand || subcommand === "help") {
             const output = [
-              "memfs commands:",
-              "- /memfs status  — show status",
-              "- /memfs enable  — enable filesystem-backed memory",
-              "- /memfs disable — disable filesystem-backed memory",
-              "- /memfs sync    — sync blocks and files now",
-              "- /memfs reset   — move local memfs to /tmp and recreate dirs",
+              "/memfs help",
+              "",
+              "Manage filesystem-backed memory.",
+              "",
+              "USAGE",
+              "  /memfs status    — show status",
+              "  /memfs enable    — enable filesystem-backed memory",
+              "  /memfs disable   — disable filesystem-backed memory",
+              "  /memfs sync      — sync blocks and files now",
+              "  /memfs reset     — move local memfs to /tmp and recreate dirs",
+              "  /memfs help      — show this help",
             ].join("\n");
             cmd.finish(output, true);
             return { submitted: true };
@@ -7929,7 +8525,7 @@ export default function App({
 
           // Unknown subcommand
           cmd.fail(
-            `Unknown subcommand: ${subcommand}. Use /memfs, /memfs enable, /memfs disable, /memfs sync, or /memfs reset.`,
+            `Unknown subcommand: "${subcommand}". Run /memfs help for usage.`,
           );
           return { submitted: true };
         }
@@ -8175,9 +8771,13 @@ ${recentCommits}
 ## Memory Filesystem Location
 
 Your memory blocks are synchronized with the filesystem at:
-\`~/.letta/agents/${agentId}/memory/\`
+\`${getMemoryFilesystemRoot(agentId)}\`
 
-Use this path when working with memory files during initialization.
+Environment variables available in Letta Code:
+- \`AGENT_ID=${agentId}\`
+- \`MEMORY_DIR=${getMemoryFilesystemRoot(agentId)}\`
+
+Use \`$MEMORY_DIR\` when working with memory files during initialization.
 `
               : "";
 
@@ -8321,9 +8921,6 @@ ${SYSTEM_REMINDER_CLOSE}`;
       const contentParts =
         overrideContentParts ?? buildMessageContentFromDisplay(msg);
 
-      // Prepend plan mode reminder if in plan mode
-      const planModeReminder = getPlanModeReminder();
-
       // Prepend ralph mode reminder if in ralph mode
       let ralphModeReminder = "";
       if (ralphMode.getState().isActive) {
@@ -8337,26 +8934,6 @@ ${SYSTEM_REMINDER_CLOSE}`;
           const ralphState = ralphMode.getState();
           ralphModeReminder = `${buildRalphContinuationReminder(ralphState)}\n\n`;
         }
-      }
-
-      // Prepend session context on first message of CLI session (if enabled)
-      let sessionContextReminder = "";
-      const sessionContextEnabled = settingsManager.getSetting(
-        "sessionContextEnabled",
-      );
-      if (!hasSentSessionContextRef.current && sessionContextEnabled) {
-        const { buildSessionContext } = await import(
-          "./helpers/sessionContext"
-        );
-        sessionContextReminder = buildSessionContext({
-          agentInfo: {
-            id: agentId,
-            name: agentName,
-            description: agentDescription,
-            lastRunAt: agentLastRunAt,
-          },
-        });
-        hasSentSessionContextRef.current = true;
       }
 
       // Inject SessionStart hook feedback (stdout on exit 2) into first message only
@@ -8384,24 +8961,6 @@ ${SYSTEM_REMINDER_CLOSE}
 
       const reflectionSettings = getReflectionSettings();
       const memfsEnabledForAgent = settingsManager.isMemfsEnabled(agentId);
-      const shouldFireStepTrigger = shouldFireStepCountTrigger(
-        turnCountRef.current,
-        reflectionSettings,
-      );
-      let memoryReminderContent = "";
-      if (
-        shouldFireStepTrigger &&
-        (reflectionSettings.behavior === "reminder" || !memfsEnabledForAgent)
-      ) {
-        // Step-count reminder mode (or non-memfs fallback)
-        memoryReminderContent = await buildMemoryReminder(
-          turnCountRef.current,
-          agentId,
-        );
-      }
-
-      // Increment turn count for next iteration
-      turnCountRef.current += 1;
 
       // Build git memory sync reminder if uncommitted changes or unpushed commits
       let memoryGitReminder = "";
@@ -8425,20 +8984,6 @@ ${SYSTEM_REMINDER_CLOSE}
 `;
         // Clear after injecting so it doesn't repeat
         pendingGitReminderRef.current = null;
-      }
-
-      // Build permission mode change alert if mode changed since last notification
-      let permissionModeAlert = "";
-      const currentMode = permissionMode.getMode();
-      if (currentMode !== lastNotifiedModeRef.current) {
-        const modeDescriptions: Record<PermissionMode, string> = {
-          default: "Normal approval flow.",
-          acceptEdits: "File edits auto-approved.",
-          plan: "Read-only mode. Focus on exploration and planning.",
-          bypassPermissions: "All tools auto-approved. Bias toward action.",
-        };
-        permissionModeAlert = `${SYSTEM_REMINDER_OPEN}Permission mode changed to: ${currentMode}. ${modeDescriptions[currentMode]}${SYSTEM_REMINDER_CLOSE}\n\n`;
-        lastNotifiedModeRef.current = currentMode;
       }
 
       // Combine reminders with content as separate text parts.
@@ -8486,44 +9031,28 @@ ${SYSTEM_REMINDER_CLOSE}
           return false;
         }
       };
-      pushReminder(sessionContextReminder);
-
-      // Inject available skills as system-reminder (LET-7353)
-      // Lazy-discover on first message, reinject after compaction
-      {
-        if (!discoveredSkillsRef.current) {
-          try {
-            const { discoverSkills: discover, SKILLS_DIR: defaultDir } =
-              await import("../agent/skills");
-            const { getSkillsDirectory, getNoSkills } = await import(
-              "../agent/context"
-            );
-            const skillsDir =
-              getSkillsDirectory() || join(process.cwd(), defaultDir);
-            const { skills } = await discover(skillsDir, agentId, {
-              skipBundled: getNoSkills(),
-            });
-            discoveredSkillsRef.current = skills;
-          } catch {
-            discoveredSkillsRef.current = [];
-          }
-        }
-
-        const needsSkillsReinject =
-          contextTrackerRef.current.pendingSkillsReinject;
-        if (!hasInjectedSkillsRef.current || needsSkillsReinject) {
-          const { formatSkillsAsSystemReminder } = await import(
-            "../agent/skills"
-          );
-          const skillsReminder = formatSkillsAsSystemReminder(
-            discoveredSkillsRef.current,
-          );
-          if (skillsReminder) {
-            pushReminder(skillsReminder);
-          }
-          hasInjectedSkillsRef.current = true;
-          contextTrackerRef.current.pendingSkillsReinject = false;
-        }
+      syncReminderStateFromContextTracker(
+        sharedReminderStateRef.current,
+        contextTrackerRef.current,
+      );
+      const { getSkillSources } = await import("../agent/context");
+      const { parts: sharedReminderParts } = await buildSharedReminderParts({
+        mode: "interactive",
+        agent: {
+          id: agentId,
+          name: agentName,
+          description: agentDescription,
+          lastRunAt: agentLastRunAt,
+        },
+        state: sharedReminderStateRef.current,
+        sessionContextReminderEnabled,
+        reflectionSettings,
+        skillSources: getSkillSources(),
+        resolvePlanModeReminder: getPlanModeReminder,
+        maybeLaunchReflectionSubagent,
+      });
+      for (const part of sharedReminderParts) {
+        reminderParts.push(part);
       }
 
       // Build conversation switch alert if a switch is pending (behind feature flag)
@@ -8542,41 +9071,10 @@ ${SYSTEM_REMINDER_CLOSE}
       pendingConversationSwitchRef.current = null;
 
       pushReminder(sessionStartHookFeedback);
-      pushReminder(permissionModeAlert);
       pushReminder(conversationSwitchAlert);
-      pushReminder(planModeReminder);
       pushReminder(ralphModeReminder);
-
       pushReminder(bashCommandPrefix);
       pushReminder(userPromptSubmitHookFeedback);
-      pushReminder(memoryReminderContent);
-
-      // Step-count auto-launch mode: fire reflection in background on interval.
-      if (
-        shouldFireStepTrigger &&
-        reflectionSettings.trigger === "step-count" &&
-        reflectionSettings.behavior === "auto-launch"
-      ) {
-        await maybeLaunchReflectionSubagent("step-count");
-      }
-
-      // Consume compaction-triggered reflection behavior on next user turn.
-      if (contextTrackerRef.current.pendingReflectionTrigger) {
-        contextTrackerRef.current.pendingReflectionTrigger = false;
-        if (reflectionSettings.trigger === "compaction-event") {
-          if (
-            reflectionSettings.behavior === "auto-launch" &&
-            memfsEnabledForAgent
-          ) {
-            await maybeLaunchReflectionSubagent("compaction-event");
-          } else {
-            const compactionReminderContent =
-              await buildCompactionMemoryReminder(agentId);
-            pushReminder(compactionReminderContent);
-          }
-        }
-      }
-
       pushReminder(memoryGitReminder);
       const messageContent =
         reminderParts.length > 0
@@ -8664,6 +9162,11 @@ ${SYSTEM_REMINDER_CLOSE}
 
           if (existingApprovals && existingApprovals.length > 0) {
             // There are pending approvals - check permissions first (respects yolo mode)
+            const desiredMode = uiPermissionModeRef.current;
+            if (permissionMode.getMode() !== desiredMode) {
+              permissionMode.setMode(desiredMode);
+            }
+
             const { needsUserInput, autoAllowed, autoDenied } =
               await classifyApprovals(existingApprovals, {
                 getContext: analyzeToolApproval,
@@ -8804,6 +9307,8 @@ ${SYSTEM_REMINDER_CLOSE}
                         {
                           abortSignal: autoAllowedAbortController.signal,
                           onStreamingOutput: updateStreamingOutput,
+                          toolContextId:
+                            approvalToolContextIdRef.current ?? undefined,
                         },
                       )
                     : [];
@@ -9048,6 +9553,8 @@ ${SYSTEM_REMINDER_CLOSE}
                         {
                           abortSignal: autoAllowedAbortController.signal,
                           onStreamingOutput: updateStreamingOutput,
+                          toolContextId:
+                            approvalToolContextIdRef.current ?? undefined,
                         },
                       )
                     : [];
@@ -9211,6 +9718,7 @@ ${SYSTEM_REMINDER_CLOSE}
       pendingRalphConfig,
       openTrajectorySegment,
       resetTrajectoryBases,
+      sessionContextReminderEnabled,
       appendTaskNotificationEvents,
     ],
   );
@@ -9233,6 +9741,7 @@ ${SYSTEM_REMINDER_CLOSE}
     if (
       !streaming &&
       hasAnythingQueued &&
+      !queuedOverlayAction && // Prioritize queued model/toolset/system switches before dequeuing messages
       pendingApprovals.length === 0 &&
       !commandRunning &&
       !isExecutingTool &&
@@ -9266,7 +9775,7 @@ ${SYSTEM_REMINDER_CLOSE}
       // Log why dequeue was blocked (useful for debugging stuck queues)
       debugLog(
         "queue",
-        `Dequeue blocked: streaming=${streaming}, pendingApprovals=${pendingApprovals.length}, commandRunning=${commandRunning}, isExecutingTool=${isExecutingTool}, anySelectorOpen=${anySelectorOpen}, waitingForQueueCancel=${waitingForQueueCancelRef.current}, userCancelled=${userCancelledRef.current}, abortController=${!!abortControllerRef.current}`,
+        `Dequeue blocked: streaming=${streaming}, queuedOverlayAction=${!!queuedOverlayAction}, pendingApprovals=${pendingApprovals.length}, commandRunning=${commandRunning}, isExecutingTool=${isExecutingTool}, anySelectorOpen=${anySelectorOpen}, waitingForQueueCancel=${waitingForQueueCancelRef.current}, userCancelled=${userCancelledRef.current}, abortController=${!!abortControllerRef.current}`,
       );
     }
   }, [
@@ -9276,6 +9785,7 @@ ${SYSTEM_REMINDER_CLOSE}
     commandRunning,
     isExecutingTool,
     anySelectorOpen,
+    queuedOverlayAction,
     dequeueEpoch, // Triggered when userCancelledRef is reset OR task notifications added
   ]);
 
@@ -9386,6 +9896,7 @@ ${SYSTEM_REMINDER_CLOSE}
             {
               abortSignal: approvalAbortController.signal,
               onStreamingOutput: updateStreamingOutput,
+              toolContextId: approvalToolContextIdRef.current ?? undefined,
             },
           );
         } finally {
@@ -9430,9 +9941,12 @@ ${SYSTEM_REMINDER_CLOSE}
             a.size === b.size && [...a].every((id) => b.has(id));
 
           if (!setsEqual(expectedIds, sendingIds)) {
-            console.error("[BUG] Approval ID mismatch detected");
-            console.error("Expected IDs:", Array.from(expectedIds));
-            console.error("Sending IDs:", Array.from(sendingIds));
+            debugLog(
+              "approvals",
+              "[BUG] Approval ID mismatch detected. Expected: %O, Sending: %O",
+              Array.from(expectedIds),
+              Array.from(sendingIds),
+            );
             throw new Error(
               "Approval ID mismatch - refusing to send mismatched IDs",
             );
@@ -9507,6 +10021,7 @@ ${SYSTEM_REMINDER_CLOSE}
         }
       } finally {
         // Always release the execution guard, even if an error occurred
+        clearApprovalToolContext();
         setIsExecutingTool(false);
         toolAbortControllerRef.current = null;
         executingToolCallIdsRef.current = [];
@@ -9528,6 +10043,7 @@ ${SYSTEM_REMINDER_CLOSE}
       queueApprovalResults,
       consumeQueuedMessages,
       appendTaskNotificationEvents,
+      clearApprovalToolContext,
       syncTrajectoryElapsedBase,
       closeTrajectorySegment,
       openTrajectorySegment,
@@ -9716,7 +10232,10 @@ ${SYSTEM_REMINDER_CLOSE}
                 onChunk(buffersRef.current, chunk);
                 refreshDerived();
               },
-              { onStreamingOutput: updateStreamingOutput },
+              {
+                onStreamingOutput: updateStreamingOutput,
+                toolContextId: approvalToolContextIdRef.current ?? undefined,
+              },
             );
 
             // Combine with auto-handled and auto-denied results (from initial check)
@@ -9852,21 +10371,64 @@ ${SYSTEM_REMINDER_CLOSE}
   }, [pendingApprovals, refreshDerived, queueApprovalResults]);
 
   const handleModelSelect = useCallback(
-    async (modelId: string, commandId?: string | null) => {
-      const overlayCommand = commandId
+    async (
+      modelId: string,
+      commandId?: string | null,
+      opts?: { skipReasoningPrompt?: boolean },
+    ) => {
+      let overlayCommand = commandId
         ? commandRunner.getHandle(commandId, "/model")
-        : consumeOverlayCommand("model");
+        : null;
+      const resolveOverlayCommand = () => {
+        if (overlayCommand) {
+          return overlayCommand;
+        }
+        overlayCommand = consumeOverlayCommand("model");
+        return overlayCommand;
+      };
 
       let selectedModel: {
         id: string;
         handle?: string;
         label: string;
-        updateArgs?: { context_window?: number };
+        updateArgs?: Record<string, unknown>;
       } | null = null;
 
       try {
-        const { models } = await import("../agent/model");
+        const { getReasoningTierOptionsForHandle, models } = await import(
+          "../agent/model"
+        );
+        const pickPreferredModelForHandle = (handle: string) => {
+          const candidates = models.filter((m) => m.handle === handle);
+          return (
+            candidates.find((m) => m.isDefault) ??
+            candidates.find((m) => m.isFeatured) ??
+            candidates.find(
+              (m) =>
+                (m.updateArgs as { reasoning_effort?: unknown } | undefined)
+                  ?.reasoning_effort === "medium",
+            ) ??
+            candidates.find(
+              (m) =>
+                (m.updateArgs as { reasoning_effort?: unknown } | undefined)
+                  ?.reasoning_effort === "high",
+            ) ??
+            candidates[0] ??
+            null
+          );
+        };
         selectedModel = models.find((m) => m.id === modelId) ?? null;
+
+        if (!selectedModel && modelId.includes("/")) {
+          const handleMatch = pickPreferredModelForHandle(modelId);
+          if (handleMatch) {
+            selectedModel = {
+              ...handleMatch,
+              id: modelId,
+              handle: modelId,
+            } as unknown as (typeof models)[number];
+          }
+        }
 
         if (!selectedModel && modelId.includes("/")) {
           const { getModelContextWindow } = await import(
@@ -9887,17 +10449,63 @@ ${SYSTEM_REMINDER_CLOSE}
 
         if (!selectedModel) {
           const output = `Model not found: ${modelId}. Run /model and press R to refresh available models.`;
-          const cmd = overlayCommand ?? commandRunner.start("/model", output);
+          const cmd =
+            resolveOverlayCommand() ?? commandRunner.start("/model", output);
           cmd.fail(output);
           return;
         }
         const model = selectedModel;
         const modelHandle = model.handle ?? model.id;
+        const modelUpdateArgs = model.updateArgs as
+          | { reasoning_effort?: unknown; enable_reasoner?: unknown }
+          | undefined;
+        const rawReasoningEffort = modelUpdateArgs?.reasoning_effort;
+        const reasoningLevel =
+          typeof rawReasoningEffort === "string"
+            ? rawReasoningEffort === "none"
+              ? "no"
+              : rawReasoningEffort === "xhigh"
+                ? "max"
+                : rawReasoningEffort
+            : modelUpdateArgs?.enable_reasoner === false
+              ? "no"
+              : null;
+        const reasoningTierOptions =
+          getReasoningTierOptionsForHandle(modelHandle);
+
+        if (
+          !opts?.skipReasoningPrompt &&
+          activeOverlay === "model" &&
+          reasoningTierOptions.length > 1
+        ) {
+          const selectedEffort = (
+            model.updateArgs as { reasoning_effort?: unknown } | undefined
+          )?.reasoning_effort;
+          const preferredOption =
+            (typeof selectedEffort === "string" &&
+              reasoningTierOptions.find(
+                (option) => option.effort === selectedEffort,
+              )) ??
+            reasoningTierOptions.find((option) => option.effort === "medium") ??
+            reasoningTierOptions[0];
+
+          if (preferredOption) {
+            setModelReasoningPrompt({
+              modelLabel: model.label,
+              initialModelId: preferredOption.modelId,
+              options: reasoningTierOptions,
+            });
+            return;
+          }
+        }
+
+        // Switching models should discard any pending debounce from the previous model.
+        resetPendingReasoningCycle();
 
         if (isAgentBusy()) {
           setActiveOverlay(null);
           const cmd =
-            overlayCommand ??
+            resolveOverlayCommand() ??
             commandRunner.start(
               "/model",
               `Model switch queued – will switch after current task completes`,
@@ -9916,7 +10524,7 @@ ${SYSTEM_REMINDER_CLOSE}
 
         await withCommandLock(async () => {
           const cmd =
-            overlayCommand ??
+            resolveOverlayCommand() ??
             commandRunner.start(
               "/model",
               `Switching model to ${model.label}...`,
@@ -9927,52 +10535,89 @@ ${SYSTEM_REMINDER_CLOSE}
           });
 
           const { updateAgentLLMConfig } = await import("../agent/modify");
-          const updatedConfig = await updateAgentLLMConfig(
+          const updatedAgent = await updateAgentLLMConfig(
             agentId,
             modelHandle,
             model.updateArgs,
           );
-          setLlmConfig(updatedConfig);
+          // The API may not echo reasoning_effort back in llm_config or model_settings.effort,
+          // so populate it from model.updateArgs as a reliable fallback.
+          const rawEffort = modelUpdateArgs?.reasoning_effort;
+          setLlmConfig({
+            ...updatedAgent.llm_config,
+            ...(typeof rawEffort === "string"
+              ? { reasoning_effort: rawEffort as ModelReasoningEffort }
+              : {}),
+          });
+          // Refresh agentState so model_settings (canonical reasoning effort source) is current
+          setAgentState((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  llm_config: updatedAgent.llm_config,
+                  model_settings: updatedAgent.model_settings,
+                }
+              : updatedAgent,
+          );
           setCurrentModelId(modelId);
 
           // Reset context token tracking since different models have different tokenizers
           resetContextHistory(contextTrackerRef.current);
+          setCurrentModelHandle(modelHandle);
 
-          const { isOpenAIModel, isGeminiModel } = await import(
-            "../tools/manager"
-          );
-          const targetToolset:
-            | "codex"
-            | "codex_snake"
-            | "default"
-            | "gemini"
-            | "gemini_snake"
-            | "none" = isOpenAIModel(modelHandle)
-            ? "codex"
-            : isGeminiModel(modelHandle)
-              ? "gemini"
-              : "default";
+          const persistedToolsetPreference =
+            settingsManager.getToolsetPreference(agentId);
+          const previousToolsetSnapshot = currentToolset;
+          const previousToolNamesSnapshot = getToolNames();
+          let toolsetNoticeLine: string | null = null;
 
-          let toolsetName:
-            | "codex"
-            | "codex_snake"
-            | "default"
-            | "gemini"
-            | "gemini_snake"
-            | "none"
-            | null = null;
-          if (currentToolset !== targetToolset) {
+          if (persistedToolsetPreference === "auto") {
             const { switchToolsetForModel } = await import("../tools/toolset");
-            toolsetName = await switchToolsetForModel(modelHandle, agentId);
+            const toolsetName = await switchToolsetForModel(
+              modelHandle,
+              agentId,
+            );
+            setCurrentToolsetPreference("auto");
             setCurrentToolset(toolsetName);
+            // Only notify when the toolset actually changes (e.g., Claude → Codex)
+            if (toolsetName !== currentToolset) {
+              toolsetNoticeLine =
+                "Auto toolset selected: switched to " +
+                formatToolsetName(toolsetName) +
+                ". Use /toolset to set a manual override.";
+              maybeRecordToolsetChangeReminder({
+                source: "/model (auto toolset)",
+                previousToolset: previousToolsetSnapshot,
+                newToolset: toolsetName,
+                previousTools: previousToolNamesSnapshot,
+                newTools: getToolNames(),
+              });
+            }
+          } else {
+            const { forceToolsetSwitch } = await import("../tools/toolset");
+            if (currentToolset !== persistedToolsetPreference) {
+              await forceToolsetSwitch(persistedToolsetPreference, agentId);
+              setCurrentToolset(persistedToolsetPreference);
+              maybeRecordToolsetChangeReminder({
+                source: "/model (manual toolset override)",
+                previousToolset: previousToolsetSnapshot,
+                newToolset: persistedToolsetPreference,
+                previousTools: previousToolNamesSnapshot,
+                newTools: getToolNames(),
+              });
+            }
+            setCurrentToolsetPreference(persistedToolsetPreference);
+            toolsetNoticeLine =
+              "Manual toolset override remains active: " +
+              formatToolsetName(persistedToolsetPreference) +
+              ".";
           }
 
-          const autoToolsetLine = toolsetName
-            ? `Automatically switched toolset to ${toolsetName}. Use /toolset to change back if desired.\nConsider switching to a different system prompt using /system to match.`
-            : null;
           const outputLines = [
-            `Switched to ${model.label}`,
-            ...(autoToolsetLine ? [autoToolsetLine] : []),
+            "Switched to " +
+              model.label +
+              (reasoningLevel ? ` (${reasoningLevel} reasoning)` : ""),
+            ...(toolsetNoticeLine ? [toolsetNoticeLine] : []),
           ].join("\n");
 
           cmd.finish(outputLines, true);
@@ -9983,7 +10628,7 @@ ${SYSTEM_REMINDER_CLOSE}
         const guidance =
           "Run /model and press R to refresh available models. If the model is still unavailable, choose another model or connect a provider with /connect.";
         const cmd =
-          overlayCommand ??
+          resolveOverlayCommand() ??
           commandRunner.start(
             "/model",
             `Failed to switch model to ${modelLabel}.`,
@@ -9994,11 +10639,14 @@ ${SYSTEM_REMINDER_CLOSE}
       }
     },
     [
+      activeOverlay,
       agentId,
       commandRunner,
       consumeOverlayCommand,
       currentToolset,
       isAgentBusy,
+      maybeRecordToolsetChangeReminder,
+      resetPendingReasoningCycle,
       withCommandLock,
     ],
   );
@@ -10062,13 +10710,8 @@ ${SYSTEM_REMINDER_CLOSE}
             phase: "running",
           });
 
-          const { updateAgentSystemPromptRaw } = await import(
-            "../agent/modify"
-          );
-          const result = await updateAgentSystemPromptRaw(
-            agentId,
-            prompt.content,
-          );
+          const { updateAgentSystemPrompt } = await import("../agent/modify");
+          const result = await updateAgentSystemPrompt(agentId, promptId);
 
           if (result.success) {
             setCurrentSystemPromptId(promptId);
@@ -10168,16 +10811,7 @@ ${SYSTEM_REMINDER_CLOSE}
   );
 
   const handleToolsetSelect = useCallback(
-    async (
-      toolsetId:
-        | "codex"
-        | "codex_snake"
-        | "default"
-        | "gemini"
-        | "gemini_snake"
-        | "none",
-      commandId?: string | null,
-    ) => {
+    async (toolsetId: ToolsetPreference, commandId?: string | null) => {
       const overlayCommand = commandId
         ? commandRunner.getHandle(commandId, "/toolset")
         : consumeOverlayCommand("toolset");
@@ -10206,20 +10840,67 @@ ${SYSTEM_REMINDER_CLOSE}
       await withCommandLock(async () => {
         const cmd =
           overlayCommand ??
-          commandRunner.start(
-            "/toolset",
-            `Switching toolset to ${toolsetId}...`,
-          );
+          commandRunner.start("/toolset", "Switching toolset...");
         cmd.update({
-          output: `Switching toolset to ${toolsetId}...`,
+          output: "Switching toolset...",
           phase: "running",
         });
 
         try {
-          const { forceToolsetSwitch } = await import("../tools/toolset");
+          const { forceToolsetSwitch, switchToolsetForModel } = await import(
+            "../tools/toolset"
+          );
+          const previousToolsetSnapshot = currentToolset;
+          const previousToolNamesSnapshot = getToolNames();
+
+          if (toolsetId === "auto") {
+            const modelHandle =
+              currentModelHandle ??
+              (llmConfig?.model_endpoint_type && llmConfig?.model
+                ? `${llmConfig.model_endpoint_type}/${llmConfig.model}`
+                : (llmConfig?.model ?? null));
+            if (!modelHandle) {
+              throw new Error(
+                "Could not determine current model for auto toolset",
+              );
+            }
+
+            const derivedToolset = await switchToolsetForModel(
+              modelHandle,
+              agentId,
+            );
+            settingsManager.setToolsetPreference(agentId, "auto");
+            setCurrentToolsetPreference("auto");
+            setCurrentToolset(derivedToolset);
+            maybeRecordToolsetChangeReminder({
+              source: "/toolset",
+              previousToolset: previousToolsetSnapshot,
+              newToolset: derivedToolset,
+              previousTools: previousToolNamesSnapshot,
+              newTools: getToolNames(),
+            });
+            cmd.finish(
+              `Toolset mode set to auto (currently ${formatToolsetName(derivedToolset)}).`,
+              true,
+            );
+            return;
+          }
+
           await forceToolsetSwitch(toolsetId, agentId);
+          settingsManager.setToolsetPreference(agentId, toolsetId);
+          setCurrentToolsetPreference(toolsetId);
           setCurrentToolset(toolsetId);
-          cmd.finish(`Switched toolset to ${toolsetId}`, true);
+          maybeRecordToolsetChangeReminder({
+            source: "/toolset",
+            previousToolset: previousToolsetSnapshot,
+            newToolset: toolsetId,
+            previousTools: previousToolNamesSnapshot,
+            newTools: getToolNames(),
+          });
+          cmd.finish(
+            `Switched toolset to ${formatToolsetName(toolsetId)} (manual override)`,
+            true,
+          );
         } catch (error) {
           const errorDetails = formatErrorDetails(error, agentId);
           cmd.fail(`Failed to switch toolset: ${errorDetails}`);
@@ -10230,7 +10911,11 @@ ${SYSTEM_REMINDER_CLOSE}
       agentId,
       commandRunner,
       consumeOverlayCommand,
+      currentToolset,
+      currentModelHandle,
       isAgentBusy,
+      llmConfig,
+      maybeRecordToolsetChangeReminder,
       withCommandLock,
     ],
   );
@@ -10306,6 +10991,7 @@ ${SYSTEM_REMINDER_CLOSE}
 
                 // Reset context tokens for new conversation
                 resetContextHistory(contextTrackerRef.current);
+                resetBootstrapReminderState();
 
                 cmd.finish(
                   `Switched to conversation (${resumeData.messageHistory.length} messages)`,
@@ -10346,6 +11032,7 @@ ${SYSTEM_REMINDER_CLOSE}
     setCommandRunning,
     commandRunner.getHandle,
     commandRunner.start,
+    resetBootstrapReminderState,
   ]);
 
   // Handle escape when profile confirmation is pending
@@ -10393,18 +11080,17 @@ ${SYSTEM_REMINDER_CLOSE}
                 feature: "letta-code",
                 agent_id: agentId,
                 session_id: telemetry.getSessionId(),
-                version: process.env.npm_package_version || "unknown",
+                version: getVersion(),
                 platform: process.platform,
                 settings: JSON.stringify(safeSettings),
-                // Additional context for debugging
-                system_info: {
-                  local_time: getLocalTime(),
-                  device_type: getDeviceType(),
-                  cwd: process.cwd(),
-                },
-                session_stats: (() => {
+                // System info
+                local_time: getLocalTime(),
+                device_type: getDeviceType(),
+                cwd: process.cwd(),
+                // Session stats
+                ...(() => {
                   const stats = sessionStatsRef.current?.getSnapshot();
-                  if (!stats) return undefined;
+                  if (!stats) return {};
                   return {
                     total_api_ms: stats.totalApiMs,
                     total_wall_ms: stats.totalWallMs,
@@ -10418,14 +11104,14 @@ ${SYSTEM_REMINDER_CLOSE}
                     context_tokens: stats.usage.contextTokens,
                   };
                 })(),
-                agent_info: {
-                  agent_name: agentName,
-                  agent_description: agentDescription,
-                  model: currentModelId,
-                },
-                account_info: {
-                  billing_tier: billingTier,
-                },
+                // Agent info
+                agent_name: agentName ?? undefined,
+                agent_description: agentDescription ?? undefined,
+                model: currentModelId ?? undefined,
+                // Account info
+                billing_tier: billingTier ?? undefined,
+                // Recent chunk log for diagnostics
+                recent_chunks: chunkLog.getEntries(),
               }),
             },
           );
@@ -10481,7 +11167,7 @@ ${SYSTEM_REMINDER_CLOSE}
         setUiPermissionMode("default");
       }
     }
-  }, []);
+  }, [setUiPermissionMode]);
 
   // Handle permission mode changes from the Input component (e.g., shift+tab cycling)
   const handlePermissionModeChange = useCallback(
@@ -10495,8 +11181,241 @@ ${SYSTEM_REMINDER_CLOSE}
       setUiPermissionMode(mode);
       triggerStatusLineRefresh();
     },
-    [triggerStatusLineRefresh],
+    [triggerStatusLineRefresh, setUiPermissionMode],
   );
+
+  // Reasoning tier cycling (Tab hotkey in InputRich.tsx)
+  //
+  // We update the footer immediately (optimistic local state) and debounce the
+  // actual server update so users can rapidly cycle tiers.
+
+  const flushPendingReasoningEffort = useCallback(async () => {
+    const desired = reasoningCycleDesiredRef.current;
+    if (!desired) return;
+
+    if (reasoningCycleInFlightRef.current) return;
+    if (!agentId) return;
+
+    // Don't change model settings mid-run.
+    // If a flush is requested while busy, ensure we still apply once the run completes.
+    if (isAgentBusy()) {
+      if (reasoningCycleTimerRef.current) {
+        clearTimeout(reasoningCycleTimerRef.current);
+      }
+      reasoningCycleTimerRef.current = setTimeout(() => {
+        reasoningCycleTimerRef.current = null;
+        void flushPendingReasoningEffort();
+      }, reasoningCycleDebounceMs);
+      return;
+    }
+
+    // Clear any pending timer; we're flushing now.
+    if (reasoningCycleTimerRef.current) {
+      clearTimeout(reasoningCycleTimerRef.current);
+      reasoningCycleTimerRef.current = null;
+    }
+
+    reasoningCycleInFlightRef.current = true;
+    try {
+      await withCommandLock(async () => {
+        const cmd = commandRunner.start("/reasoning", "Setting reasoning...");
+
+        try {
+          const { updateAgentLLMConfig } = await import("../agent/modify");
+          const updatedAgent = await updateAgentLLMConfig(
+            agentId,
+            desired.modelHandle,
+            {
+              reasoning_effort: desired.effort,
+            },
+          );
+
+          // The API may not echo reasoning_effort back; populate from desired.effort.
+          setLlmConfig({
+            ...updatedAgent.llm_config,
+            reasoning_effort: desired.effort as ModelReasoningEffort,
+          });
+          // Refresh agentState so model_settings (canonical reasoning effort source) is current
+          setAgentState((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  llm_config: updatedAgent.llm_config,
+                  model_settings: updatedAgent.model_settings,
+                }
+              : updatedAgent,
+          );
+          setCurrentModelId(desired.modelId);
+
+          // Clear pending state.
+          reasoningCycleDesiredRef.current = null;
+          reasoningCycleLastConfirmedRef.current = null;
+          reasoningCycleLastConfirmedAgentStateRef.current = null;
+
+          const display =
+            desired.effort === "medium"
+              ? "med"
+              : desired.effort === "minimal"
+                ? "low"
+                : desired.effort;
+          cmd.finish(`Reasoning set to ${display}`, true);
+        } catch (error) {
+          const errorDetails = formatErrorDetails(error, agentId);
+          cmd.fail(`Failed to set reasoning: ${errorDetails}`);
+
+          // Revert optimistic UI if we have a confirmed config snapshot.
+          if (reasoningCycleLastConfirmedRef.current) {
+            const prev = reasoningCycleLastConfirmedRef.current;
+            reasoningCycleDesiredRef.current = null;
+            reasoningCycleLastConfirmedRef.current = null;
+            setLlmConfig(prev);
+            // Also revert the agentState optimistic patch
+            if (reasoningCycleLastConfirmedAgentStateRef.current) {
+              setAgentState(reasoningCycleLastConfirmedAgentStateRef.current);
+              reasoningCycleLastConfirmedAgentStateRef.current = null;
+            }
+
+            const { getModelInfo } = await import("../agent/model");
+            const modelHandle =
+              prev.model_endpoint_type && prev.model
+                ? `${
+                    prev.model_endpoint_type === "chatgpt_oauth"
+                      ? OPENAI_CODEX_PROVIDER_NAME
+                      : prev.model_endpoint_type
+                  }/${prev.model}`
+                : prev.model;
+            const modelInfo = modelHandle ? getModelInfo(modelHandle) : null;
+            setCurrentModelId(modelInfo?.id ?? null);
+          }
+        }
+      });
+    } finally {
+      reasoningCycleInFlightRef.current = false;
+    }
+  }, [agentId, commandRunner, isAgentBusy, withCommandLock]);
+
+  const handleCycleReasoningEffort = useCallback(() => {
+    void (async () => {
+      if (!agentId) return;
+      if (reasoningCycleInFlightRef.current) return;
+
+      const current = llmConfigRef.current;
+      // For ChatGPT OAuth sessions, llm_config may report model_endpoint_type as
+      // "chatgpt_oauth" while our code/model registry uses the provider name
+      // "chatgpt-plus-pro" in handles.
+      const modelHandle =
+        current?.model_endpoint_type && current?.model
+          ? `${
+              current.model_endpoint_type === "chatgpt_oauth"
+                ? OPENAI_CODEX_PROVIDER_NAME
+                : current.model_endpoint_type
+            }/${current.model}`
+          : current?.model;
+      if (!modelHandle) return;
+
+      // Derive current effort from agentState.model_settings (canonical) with llmConfig fallback
+      const currentEffort =
+        deriveReasoningEffort(agentStateRef.current?.model_settings, current) ??
+        "none";
+
+      const { models } = await import("../agent/model");
+      const tiers = models
+        .filter((m) => m.handle === modelHandle)
+        .map((m) => {
+          const effort = (
+            m.updateArgs as { reasoning_effort?: unknown } | undefined
+          )?.reasoning_effort;
+          return {
+            id: m.id,
+            effort: typeof effort === "string" ? effort : null,
+          };
+        })
+        .filter((m): m is { id: string; effort: string } => Boolean(m.effort));
+
+      // Only enable cycling when there are multiple tiers for the same handle.
+      if (tiers.length < 2) return;
+
+      const order = ["none", "minimal", "low", "medium", "high", "xhigh"];
+      const rank = (effort: string): number => {
+        const idx = order.indexOf(effort);
+        return idx >= 0 ? idx : 999;
+      };
+
+      const sorted = [...tiers].sort((a, b) => rank(a.effort) - rank(b.effort));
+      const curIndex = sorted.findIndex((t) => t.effort === currentEffort);
+      const nextIndex = (curIndex + 1) % sorted.length;
+      const next = sorted[nextIndex];
+      if (!next) return;
+
+      // Snapshot the last confirmed config once per burst so we can revert on failure.
+      if (!reasoningCycleLastConfirmedRef.current) {
+        reasoningCycleLastConfirmedRef.current = current ?? null;
+        reasoningCycleLastConfirmedAgentStateRef.current =
+          agentStateRef.current ?? null;
+      }
+
+      // Optimistic UI update (footer changes immediately).
+      setLlmConfig((prev) =>
+        prev ? ({ ...prev, reasoning_effort: next.effort } as LlmConfig) : prev,
+      );
+      // Also patch agentState.model_settings for OpenAI/Anthropic/Bedrock so the footer
+      // (which prefers model_settings) reflects the change without waiting for the server.
+      setAgentState((prev) => {
+        if (!prev) return prev ?? null;
+        const ms = prev.model_settings;
+        if (!ms || !("provider_type" in ms)) return prev;
+        if (ms.provider_type === "openai") {
+          return {
+            ...prev,
+            model_settings: {
+              ...ms,
+              reasoning: {
+                ...(ms as { reasoning?: Record<string, unknown> }).reasoning,
+                reasoning_effort: next.effort as
+                  | "none"
+                  | "minimal"
+                  | "low"
+                  | "medium"
+                  | "high"
+                  | "xhigh",
+              },
+            },
+          } as AgentState;
+        }
+        if (
+          ms.provider_type === "anthropic" ||
+          ms.provider_type === "bedrock"
+        ) {
+          // Map "xhigh" → "max": footer derivation only recognizes "max" for Anthropic effort.
+          // Cast needed: "max" is valid on the backend but not yet in the SDK type.
+          const anthropicEffort = next.effort === "xhigh" ? "max" : next.effort;
+          return {
+            ...prev,
+            model_settings: {
+              ...ms,
+              effort: anthropicEffort as "low" | "medium" | "high" | "max",
+            },
+          } as AgentState;
+        }
+        return prev;
+      });
+      setCurrentModelId(next.id);
+
+      // Debounce the server update.
+      reasoningCycleDesiredRef.current = {
+        modelHandle,
+        effort: next.effort,
+        modelId: next.id,
+      };
+      if (reasoningCycleTimerRef.current) {
+        clearTimeout(reasoningCycleTimerRef.current);
+      }
+      reasoningCycleTimerRef.current = setTimeout(() => {
+        reasoningCycleTimerRef.current = null;
+        void flushPendingReasoningEffort();
+      }, reasoningCycleDebounceMs);
+    })();
+  }, [agentId, flushPendingReasoningEffort]);
 
   const handlePlanApprove = useCallback(
     async (acceptEdits: boolean = false) => {
@@ -10567,6 +11486,7 @@ ${SYSTEM_REMINDER_CLOSE}
       refreshDerived,
       setStreaming,
       setIsExecutingTool,
+      setUiPermissionMode,
     ],
   );
 
@@ -10801,6 +11721,7 @@ Plan file path: ${planFilePath}`;
     sendAllResults,
     refreshDerived,
     setIsExecutingTool,
+    setUiPermissionMode,
   ]);
 
   const handleEnterPlanModeReject = useCallback(async () => {
@@ -11000,7 +11921,7 @@ Plan file path: ${planFilePath}`;
         ? [
             "→ **/agents**    list all agents",
             "→ **/resume**    resume a previous conversation",
-            "→ **/memory**    view your agent's memory blocks",
+            "→ **/memory**    view your agent's memory",
             "→ **/init**      initialize your agent's memory",
             "→ **/remember**  teach your agent",
           ]
@@ -11216,6 +12137,12 @@ Plan file path: ${planFilePath}`;
                             allowPersistence={
                               currentApprovalContext?.allowPersistence ?? true
                             }
+                            defaultScope={
+                              currentApprovalContext?.defaultScope === "user"
+                                ? "session"
+                                : (currentApprovalContext?.defaultScope ??
+                                  "project")
+                            }
                             showPreview={showApprovalPreview}
                           />
                         ) : ln.kind === "user" ? (
@@ -11294,6 +12221,11 @@ Plan file path: ${planFilePath}`;
                     }
                     allowPersistence={
                       currentApprovalContext?.allowPersistence ?? true
+                    }
+                    defaultScope={
+                      currentApprovalContext?.defaultScope === "user"
+                        ? "session"
+                        : (currentApprovalContext?.defaultScope ?? "project")
                     }
                     showPreview={showApprovalPreview}
                   />
@@ -11379,6 +12311,7 @@ Plan file path: ${planFilePath}`;
                 }
                 permissionMode={uiPermissionMode}
                 onPermissionModeChange={handlePermissionModeChange}
+                onCycleReasoningEffort={handleCycleReasoningEffort}
                 onExit={handleExit}
                 onInterrupt={handleInterrupt}
                 interruptRequested={interruptRequested}
@@ -11386,6 +12319,7 @@ Plan file path: ${planFilePath}`;
                 agentName={agentName}
                 currentModel={currentModelDisplay}
                 currentModelProvider={currentModelProvider}
+                currentReasoningEffort={currentReasoningEffort}
                 messageQueue={messageQueue}
                 onEnterQueueEditMode={handleEnterQueueEditMode}
                 onEscapeCancel={
@@ -11410,24 +12344,38 @@ Plan file path: ${planFilePath}`;
             </Box>
 
             {/* Model Selector - conditionally mounted as overlay */}
-            {activeOverlay === "model" && (
-              <ModelSelector
-                currentModelId={currentModelId ?? undefined}
-                onSelect={handleModelSelect}
-                onCancel={closeOverlay}
-                filterProvider={modelSelectorOptions.filterProvider}
-                forceRefresh={modelSelectorOptions.forceRefresh}
-                billingTier={billingTier ?? undefined}
-                isSelfHosted={(() => {
-                  const settings = settingsManager.getSettings();
-                  const baseURL =
-                    process.env.LETTA_BASE_URL ||
-                    settings.env?.LETTA_BASE_URL ||
-                    "https://api.letta.com";
-                  return !baseURL.includes("api.letta.com");
-                })()}
-              />
-            )}
+            {activeOverlay === "model" &&
+              (modelReasoningPrompt ? (
+                <ModelReasoningSelector
+                  modelLabel={modelReasoningPrompt.modelLabel}
+                  options={modelReasoningPrompt.options}
+                  initialModelId={modelReasoningPrompt.initialModelId}
+                  onSelect={(selectedModelId) => {
+                    setModelReasoningPrompt(null);
+                    void handleModelSelect(selectedModelId, null, {
+                      skipReasoningPrompt: true,
+                    });
+                  }}
+                  onCancel={() => setModelReasoningPrompt(null)}
+                />
+              ) : (
+                <ModelSelector
+                  currentModelId={currentModelId ?? undefined}
+                  onSelect={handleModelSelect}
+                  onCancel={closeOverlay}
+                  filterProvider={modelSelectorOptions.filterProvider}
+                  forceRefresh={modelSelectorOptions.forceRefresh}
+                  billingTier={billingTier ?? undefined}
+                  isSelfHosted={(() => {
+                    const settings = settingsManager.getSettings();
+                    const baseURL =
+                      process.env.LETTA_BASE_URL ||
+                      settings.env?.LETTA_BASE_URL ||
+                      "https://api.letta.com";
+                    return !baseURL.includes("api.letta.com");
+                  })()}
+                />
+              ))}
 
             {activeOverlay === "sleeptime" && (
               <SleeptimeSelector
@@ -11487,6 +12435,7 @@ Plan file path: ${planFilePath}`;
             {activeOverlay === "toolset" && (
               <ToolsetSelector
                 currentToolset={currentToolset ?? undefined}
+                currentPreference={currentToolsetPreference}
                 onSelect={handleToolsetSelect}
                 onCancel={closeOverlay}
               />
@@ -11646,6 +12595,7 @@ Plan file path: ${planFilePath}`;
                       buffersRef.current.order = [];
                       buffersRef.current.tokenCount = 0;
                       resetContextHistory(contextTrackerRef.current);
+                      resetBootstrapReminderState();
                       emittedIdsRef.current.clear();
                       resetDeferredToolCallCommits();
                       setStaticItems([]);
@@ -11711,8 +12661,9 @@ Plan file path: ${planFilePath}`;
                           setApprovalContexts(contexts);
                         } catch (approvalError) {
                           // If analysis fails, leave context as null (will show basic options)
-                          console.error(
-                            "Failed to analyze resume approvals:",
+                          debugLog(
+                            "approvals",
+                            "Failed to analyze resume approvals: %O",
                             approvalError,
                           );
                         }
@@ -11799,6 +12750,7 @@ Plan file path: ${planFilePath}`;
                     buffersRef.current.order = [];
                     buffersRef.current.tokenCount = 0;
                     resetContextHistory(contextTrackerRef.current);
+                    resetBootstrapReminderState();
                     emittedIdsRef.current.clear();
                     resetDeferredToolCallCommits();
                     setStaticItems([]);
@@ -11939,6 +12891,7 @@ Plan file path: ${planFilePath}`;
                       buffersRef.current.order = [];
                       buffersRef.current.tokenCount = 0;
                       resetContextHistory(contextTrackerRef.current);
+                      resetBootstrapReminderState();
                       emittedIdsRef.current.clear();
                       resetDeferredToolCallCommits();
                       setStaticItems([]);
@@ -12038,6 +12991,7 @@ Plan file path: ${planFilePath}`;
               (settingsManager.isMemfsEnabled(agentId) ? (
                 <MemfsTreeViewer
                   agentId={agentId}
+                  agentName={agentState?.name}
                   onClose={closeOverlay}
                   conversationId={conversationId}
                 />

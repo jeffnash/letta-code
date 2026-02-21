@@ -43,6 +43,7 @@ const PARALLEL_SAFE_TOOLS = new Set([
   // === Anthropic toolset (default) ===
   "Read",
   "view_image",
+  "ViewImage",
   "Grep",
   "Glob",
 
@@ -190,6 +191,7 @@ async function executeSingleDecision(
       chunk: string,
       isStderr?: boolean,
     ) => void;
+    toolContextId?: string;
   },
 ): Promise<ApprovalResult> {
   // If aborted, record an interrupted result
@@ -275,6 +277,7 @@ async function executeSingleDecision(
         {
           signal: options?.abortSignal,
           toolCallId: decision.approval.toolCallId,
+          toolContextId: options?.toolContextId,
           onOutput: options?.onStreamingOutput
             ? (chunk, stream) =>
                 options.onStreamingOutput?.(
@@ -388,6 +391,7 @@ export async function executeApprovalBatch(
       chunk: string,
       isStderr?: boolean,
     ) => void;
+    toolContextId?: string;
   },
 ): Promise<ApprovalResult[]> {
   // Pre-allocate results array to maintain original order
@@ -533,6 +537,7 @@ export async function executeAutoAllowedTools(
       chunk: string,
       isStderr?: boolean,
     ) => void;
+    toolContextId?: string;
   },
 ): Promise<AutoAllowedResult[]> {
   const decisions: ApprovalDecision[] = autoAllowed.map((ac) => ({

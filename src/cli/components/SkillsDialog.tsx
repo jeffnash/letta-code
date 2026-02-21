@@ -52,14 +52,14 @@ export function SkillsDialog({ onClose, agentId }: SkillsDialogProps) {
         const { discoverSkills, SKILLS_DIR } = await import(
           "../../agent/skills"
         );
-        const { getSkillsDirectory, getNoSkills } = await import(
+        const { getSkillsDirectory, getSkillSources } = await import(
           "../../agent/context"
         );
         const { join } = await import("node:path");
         const skillsDir =
           getSkillsDirectory() || join(process.cwd(), SKILLS_DIR);
         const result = await discoverSkills(skillsDir, agentId, {
-          skipBundled: getNoSkills(),
+          sources: getSkillSources(),
         });
         setSkills(result.skills);
       } catch {
@@ -167,7 +167,7 @@ export function SkillsDialog({ onClose, agentId }: SkillsDialogProps) {
             backgroundColor={
               isActive ? colors.selector.itemHighlighted : undefined
             }
-            color={isActive ? "black" : undefined}
+            color={isActive ? "white" : undefined}
             bold={isActive}
           >
             {` ${getTabLabel(tab)} `}

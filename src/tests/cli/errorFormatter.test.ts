@@ -181,4 +181,76 @@ describe("formatErrorDetails", () => {
     expect(message).toContain("minimax-m2.1");
     expect(message).toContain("/model");
   });
+
+  test("uses premium-specific guidance for premium-usage-exceeded", () => {
+    const error = new APIError(
+      429,
+      {
+        error: "Rate limited",
+        reasons: ["premium-usage-exceeded"],
+      },
+      undefined,
+      new Headers(),
+    );
+
+    const message = formatErrorDetails(error);
+
+    expect(message).toContain("Premium model usage limit");
+    expect(message).toContain("Standard or Basic hosted models");
+    expect(message).toContain("/model");
+    expect(message).not.toContain("hosted model usage limit");
+  });
+
+  test("uses standard-specific guidance for standard-usage-exceeded", () => {
+    const error = new APIError(
+      429,
+      {
+        error: "Rate limited",
+        reasons: ["standard-usage-exceeded"],
+      },
+      undefined,
+      new Headers(),
+    );
+
+    const message = formatErrorDetails(error);
+
+    expect(message).toContain("Standard model usage limit");
+    expect(message).toContain("Basic hosted models");
+    expect(message).toContain("/model");
+  });
+
+  test("uses basic-specific guidance for basic-usage-exceeded", () => {
+    const error = new APIError(
+      429,
+      {
+        error: "Rate limited",
+        reasons: ["basic-usage-exceeded"],
+      },
+      undefined,
+      new Headers(),
+    );
+
+    const message = formatErrorDetails(error);
+
+    expect(message).toContain("Basic model usage limit");
+    expect(message).toContain("/model");
+  });
+
+  test("formats Z.ai error from APIError with embedded error code", () => {
+    const error = new APIError(
+      429,
+      {
+        error:
+          "Rate limited by OpenAI: Error code: 429 - {'error': {'code': 1302, 'message': 'High concurrency usage exceeds limits'}}",
+      },
+      undefined,
+      new Headers(),
+    );
+
+    const message = formatErrorDetails(error);
+
+    expect(message).toContain("Z.ai rate limit");
+    expect(message).toContain("High concurrency usage exceeds limits");
+    expect(message).not.toContain("OpenAI");
+  });
 });

@@ -68,6 +68,7 @@ type Props = {
   approveAlwaysText?: string;
   allowPersistence?: boolean;
   showPreview?: boolean;
+  defaultScope?: "project" | "session";
 
   // Special handlers for ExitPlanMode
   onPlanApprove?: (acceptEdits: boolean) => void;
@@ -109,7 +110,11 @@ function getBashInfo(approval: ApprovalRequest): BashInfo | null {
       command =
         typeof args.command === "string" ? args.command : "(no command)";
       description =
-        typeof args.description === "string" ? args.description : "";
+        typeof args.description === "string"
+          ? args.description
+          : typeof args.justification === "string"
+            ? args.justification
+            : "";
     }
 
     return {
@@ -211,6 +216,7 @@ export const ApprovalSwitch = memo(
     precomputedDiff,
     allDiffs,
     showPreview = true,
+    defaultScope = "project",
   }: Props) => {
     const toolName = approval.toolName;
 
@@ -247,6 +253,7 @@ export const ApprovalSwitch = memo(
             isFocused={isFocused}
             approveAlwaysText={approveAlwaysText}
             allowPersistence={allowPersistence}
+            defaultScope={defaultScope}
             showPreview={showPreview}
           />
         );
@@ -267,6 +274,7 @@ export const ApprovalSwitch = memo(
             isFocused={isFocused}
             approveAlwaysText={approveAlwaysText}
             allowPersistence={allowPersistence}
+            defaultScope={defaultScope}
             showPreview={showPreview}
           />
         );
@@ -336,6 +344,7 @@ export const ApprovalSwitch = memo(
         isFocused={isFocused}
         approveAlwaysText={approveAlwaysText}
         allowPersistence={allowPersistence}
+        defaultScope={defaultScope}
         showPreview={showPreview}
       />
     );

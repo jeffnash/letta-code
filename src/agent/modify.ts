@@ -7,7 +7,6 @@ import type {
   GoogleAIModelSettings,
   OpenAIModelSettings,
 } from "@letta-ai/letta-client/resources/agents/agents";
-import type { LlmConfig } from "@letta-ai/letta-client/resources/models/models";
 import { OPENAI_CODEX_PROVIDER_NAME } from "../providers/openai-codex-provider";
 import { getModelContextWindow } from "./available-models";
 import { getClient } from "./client";
@@ -56,8 +55,15 @@ function buildModelSettings(
           | "minimal"
           | "low"
           | "medium"
-          | "high",
+          | "high"
+          | "xhigh",
       };
+    }
+    const verbosity = updateArgs?.verbosity;
+    if (verbosity === "low" || verbosity === "medium" || verbosity === "high") {
+      // The backend supports verbosity for OpenAI-family providers; the generated
+      // client type may lag this field, so set it via a narrow record cast.
+      (openaiSettings as Record<string, unknown>).verbosity = verbosity;
     }
     settings = openaiSettings;
   } else if (isAnthropic) {
@@ -65,6 +71,14 @@ function buildModelSettings(
       provider_type: "anthropic",
       parallel_tool_calls: true,
     };
+    // Map reasoning_effort to Anthropic's effort field (controls token spending via output_config)
+    const effort = updateArgs?.reasoning_effort;
+    if (effort === "low" || effort === "medium" || effort === "high") {
+      anthropicSettings.effort = effort;
+    } else if (effort === "xhigh") {
+      // "max" is valid on the backend but the SDK type hasn't caught up yet
+      (anthropicSettings as Record<string, unknown>).effort = "max";
+    }
     // Build thinking config if either enable_reasoner or max_reasoning_tokens is specified
     if (
       updateArgs?.enable_reasoner !== undefined ||
@@ -121,6 +135,13 @@ function buildModelSettings(
       provider_type: "bedrock",
       parallel_tool_calls: true,
     };
+    // Map reasoning_effort to Anthropic's effort field (Bedrock runs Claude models)
+    const effort = updateArgs?.reasoning_effort;
+    if (effort === "low" || effort === "medium" || effort === "high") {
+      bedrockSettings.effort = effort;
+    } else if (effort === "xhigh") {
+      bedrockSettings.effort = "max";
+    }
     // Build thinking config if either enable_reasoner or max_reasoning_tokens is specified
     if (
       updateArgs?.enable_reasoner !== undefined ||
@@ -161,16 +182,30 @@ function buildModelSettings(
  * @param modelHandle - The model handle (e.g., "anthropic/claude-sonnet-4-5-20250929")
  * @param updateArgs - Additional config args (context_window, reasoning_effort, enable_reasoner, etc.)
  * @param preserveParallelToolCalls - If true, preserves the parallel_tool_calls setting when updating the model
- * @returns The updated LLM configuration from the server
+ * @returns The updated agent state from the server (includes llm_config and model_settings)
  */
 export async function updateAgentLLMConfig(
   agentId: string,
   modelHandle: string,
   updateArgs?: Record<string, unknown>,
-): Promise<LlmConfig> {
+): Promise<AgentState> {
   const client = await getClient();
 
-  const modelSettings = buildModelSettings(modelHandle, updateArgs);
+  // CLIProxy routes GPT reasoning levels via handle suffixes (e.g. cliproxy/gpt-5.2-high).
+  // Our models.json normalizes handles for the reasoning tier picker, so we need to
+  // reconstruct the suffixed handle before sending to the server.
+  // Only applies to GPT models — other CLIProxy models (Gemini, Claude) don't use this pattern.
+  let routedHandle = modelHandle;
+  if (
+    modelHandle.startsWith("cliproxy/") &&
+    updateArgs?.reasoning_effort &&
+    /^cliproxy\/(copilot-)?gpt-/i.test(modelHandle)
+  ) {
+    const effort = updateArgs.reasoning_effort as string;
+    routedHandle = `${modelHandle}-${effort}`;
+  }
+
+  const modelSettings = buildModelSettings(routedHandle, updateArgs);
   // First try updateArgs, then fall back to API-cached context window for BYOK models
   const contextWindow =
     (updateArgs?.context_window as number | undefined) ??
@@ -178,7 +213,7 @@ export async function updateAgentLLMConfig(
   const hasModelSettings = Object.keys(modelSettings).length > 0;
 
   await client.agents.update(agentId, {
-    model: modelHandle,
+    model: routedHandle,
     ...(hasModelSettings && { model_settings: modelSettings }),
     ...(contextWindow && { context_window_limit: contextWindow }),
     ...(typeof updateArgs?.max_output_tokens === "number" && {
@@ -187,7 +222,7 @@ export async function updateAgentLLMConfig(
   });
 
   const finalAgent = await client.agents.retrieve(agentId);
-  return finalAgent.llm_config;
+  return finalAgent;
 }
 
 export interface SystemPromptUpdateResult {
@@ -247,13 +282,25 @@ export async function updateAgentSystemPrompt(
   systemPromptId: string,
 ): Promise<UpdateSystemPromptResult> {
   try {
-    const { resolveSystemPrompt, SYSTEM_PROMPT_MEMORY_ADDON } = await import(
-      "./promptAssets"
+    const { resolveSystemPrompt } = await import("./promptAssets");
+    const { detectMemoryPromptDrift, reconcileMemoryPrompt } = await import(
+      "./memoryPrompt"
     );
+    const { settingsManager } = await import("../settings-manager");
+
+    const client = await getClient();
+    const currentAgent = await client.agents.retrieve(agentId);
     const baseContent = await resolveSystemPrompt(systemPromptId);
-    // Append the non-memfs memory section by default.
-    // If memfs is enabled, the caller should follow up with updateAgentSystemPromptMemfs().
-    const systemPromptContent = `${baseContent}\n${SYSTEM_PROMPT_MEMORY_ADDON}`;
+
+    const settingIndicatesMemfs = settingsManager.isMemfsEnabled(agentId);
+    const promptIndicatesMemfs = detectMemoryPromptDrift(
+      currentAgent.system || "",
+      "standard",
+    ).some((drift) => drift.code === "memfs_language_with_standard_mode");
+
+    const memoryMode =
+      settingIndicatesMemfs || promptIndicatesMemfs ? "memfs" : "standard";
+    const systemPromptContent = reconcileMemoryPrompt(baseContent, memoryMode);
 
     const updateResult = await updateAgentSystemPromptRaw(
       agentId,
@@ -268,7 +315,6 @@ export async function updateAgentSystemPrompt(
     }
 
     // Re-fetch agent to get updated state
-    const client = await getClient();
     const agent = await client.agents.retrieve(agentId);
 
     return {
@@ -453,10 +499,10 @@ export async function unlinkToolsFromAgent(
 }
 
 /**
- * Updates an agent's system prompt to swap between the memfs and non-memfs memory sections.
+ * Updates an agent's system prompt to swap between managed memory modes.
  *
- * When enabling memfs: strips any existing # Memory section, appends the memfs memory addon.
- * When disabling memfs: strips any existing # Memory section, appends the non-memfs memory addon.
+ * Uses the shared memory prompt reconciler so we safely replace managed memory
+ * sections without corrupting fenced code blocks or leaving orphan fragments.
  *
  * @param agentId - The agent ID to update
  * @param enableMemfs - Whether to enable (add) or disable (remove) the memfs addon
@@ -469,26 +515,15 @@ export async function updateAgentSystemPromptMemfs(
   try {
     const client = await getClient();
     const agent = await client.agents.retrieve(agentId);
-    let currentSystemPrompt = agent.system || "";
+    const { reconcileMemoryPrompt } = await import("./memoryPrompt");
 
-    const { SYSTEM_PROMPT_MEMFS_ADDON, SYSTEM_PROMPT_MEMORY_ADDON } =
-      await import("./promptAssets");
-
-    // Strip any existing memory section (covers both old inline "# Memory" / "## Memory"
-    // sections and the new addon format including "## Memory Filesystem" subsections).
-    // Matches from "# Memory" or "## Memory" to the next top-level heading or end of string.
-    const memoryHeaderRegex =
-      /\n#{1,2} Memory\b[\s\S]*?(?=\n#{1,2} (?!Memory|Filesystem|Structure|How It Works|Syncing|History)[^\n]|$)/;
-    currentSystemPrompt = currentSystemPrompt.replace(memoryHeaderRegex, "");
-
-    // Append the appropriate memory section
-    const addon = enableMemfs
-      ? SYSTEM_PROMPT_MEMFS_ADDON
-      : SYSTEM_PROMPT_MEMORY_ADDON;
-    currentSystemPrompt = `${currentSystemPrompt}\n${addon}`;
+    const nextSystemPrompt = reconcileMemoryPrompt(
+      agent.system || "",
+      enableMemfs ? "memfs" : "standard",
+    );
 
     await client.agents.update(agentId, {
-      system: currentSystemPrompt,
+      system: nextSystemPrompt,
     });
 
     return {

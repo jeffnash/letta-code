@@ -12,13 +12,16 @@ import {
 import type { AgentProvenance } from "./agent/create";
 import { getLettaCodeHeaders } from "./agent/http-headers";
 import { ISOLATED_BLOCK_LABELS } from "./agent/memory";
+import { resolveSkillSourcesSelection } from "./agent/skillSources";
 import { LETTA_CLOUD_API_URL } from "./auth/oauth";
 import { ConversationSelector } from "./cli/components/ConversationSelector";
+import { formatErrorDetails } from "./cli/helpers/errorFormatter";
 import type { ApprovalRequest } from "./cli/helpers/stream";
 import { ProfileSelectionInline } from "./cli/profile-selection";
 import { runSubcommand } from "./cli/subcommands/router";
 import { permissionMode } from "./permissions/mode";
 import { settingsManager } from "./settings-manager";
+import { startStartupAutoUpdateCheck } from "./startup-auto-update";
 import { telemetry } from "./telemetry";
 import { loadTools, upsertToolsIfNeeded } from "./tools/manager";
 import { clearSkillBlockCache } from "./tools/impl/Skill";
@@ -63,7 +66,7 @@ OPTIONS
   -n, --name <name>     Resume agent by name (from pinned agents, case-insensitive)
   -m, --model <id>      Model ID or handle (e.g., "opus-4.5" or "anthropic/claude-opus-4-5")
   -s, --system <id>     System prompt ID or subagent name (applies to new or existing agent)
-  --toolset <name>      Force toolset: "codex", "default", or "gemini" (overrides model-based auto-selection)
+  --toolset <name>      Toolset mode: "auto", "codex", "default", or "gemini" (manual values override model-based auto-selection)
   -p, --prompt          Headless prompt mode
   --output-format <fmt> Output format for headless mode (text, json, stream-json)
                         Default: text
@@ -73,12 +76,23 @@ OPTIONS
                         Emit stream_event wrappers for each chunk (stream-json only)
   --from-agent <id>     Inject agent-to-agent system reminder (headless mode)
   --skills <path>       Custom path to skills directory (default: .skills in current directory)
+  --skill-sources <csv> Skill sources: all,bundled,global,agent,project (default: all)
+  --no-skills           Disable all skill sources
+  --no-bundled-skills   Disable bundled skills only
   --import <path>       Create agent from an AgentFile (.af) template
                         Use @author/name to import from the agent registry
   --memfs               Enable memory filesystem for this agent
   --no-memfs            Disable memory filesystem for this agent
   --show-subagents      Don't hide subagents created by the Task tool
   --no-subagent-max-turns  Ignore --max-turns limit for subagents
+  --no-system-info-reminder
+                        Disable first-turn environment reminder (device/git/cwd context)
+  --reflection-trigger <mode>
+                        Sleeptime trigger: off, step-count, compaction-event
+  --reflection-behavior <mode>
+                        Sleeptime behavior: reminder, auto-launch
+  --reflection-step-count <n>
+                        Sleeptime step-count interval (positive integer)
 
 SUBCOMMANDS (JSON-only)
   letta memfs status --agent <id>
@@ -238,7 +252,7 @@ async function printInfo() {
  */
 function getModelForToolLoading(
   specifiedModel?: string,
-  specifiedToolset?: "codex" | "default" | "gemini",
+  specifiedToolset?: "auto" | "codex" | "default" | "gemini",
 ): string | undefined {
   // If toolset is explicitly specified, use a dummy model from that provider
   // to trigger the correct toolset loading logic
@@ -364,21 +378,7 @@ async function main(): Promise<void> {
 
   // Check for updates on startup (non-blocking)
   const { checkAndAutoUpdate } = await import("./updater/auto-update");
-  checkAndAutoUpdate()
-    .then((result) => {
-      // Surface ENOTEMPTY failures so users know how to fix
-      if (result?.enotemptyFailed) {
-        console.error(
-          "\nAuto-update failed due to filesystem issue (ENOTEMPTY).",
-        );
-        console.error(
-          "Fix: rm -rf $(npm prefix -g)/lib/node_modules/@letta-ai/letta-code && npm i -g @letta-ai/letta-code\n",
-        );
-      }
-    })
-    .catch(() => {
-      // Silently ignore other update failures (network timeouts, etc.)
-    });
+  startStartupAutoUpdateCheck(checkAndAutoUpdate);
 
   // Clean up old overflow files (non-blocking, 24h retention)
   const { cleanupOldOverflowFiles } = await import("./tools/impl/overflow");
@@ -435,6 +435,7 @@ async function main(): Promise<void> {
         "include-partial-messages": { type: "boolean" },
         "from-agent": { type: "string" },
         skills: { type: "string" },
+        "skill-sources": { type: "string" },
         "pre-load-skills": { type: "string" },
         "from-af": { type: "string" },
         import: { type: "string" },
@@ -445,6 +446,11 @@ async function main(): Promise<void> {
         "show-subagents": { type: "boolean" },
         "no-subagent-max-turns": { type: "boolean" },
         "no-skills": { type: "boolean" },
+        "no-bundled-skills": { type: "boolean" },
+        "no-system-info-reminder": { type: "boolean" },
+        "reflection-trigger": { type: "string" },
+        "reflection-behavior": { type: "string" },
+        "reflection-step-count": { type: "string" },
         "max-turns": { type: "string" },
       },
       strict: true,
@@ -473,6 +479,16 @@ async function main(): Promise<void> {
   // Handle help flag first
   if (values.help) {
     printHelp();
+
+    // Test-only hook to keep process alive briefly so startup auto-update can run.
+    const helpDelayMs = Number.parseInt(
+      process.env.LETTA_TEST_HELP_EXIT_DELAY_MS ?? "",
+      10,
+    );
+    if (Number.isFinite(helpDelayMs) && helpDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, helpDelayMs));
+    }
+
     process.exit(0);
   }
 
@@ -558,7 +574,34 @@ async function main(): Promise<void> {
   const noMemfsFlag = values["no-memfs"] as boolean | undefined;
   const showSubagentsFlag = values["show-subagents"] as boolean | undefined;
   const noSubagentMaxTurnsFlag = values["no-subagent-max-turns"] as boolean | undefined;
+  const requestedMemoryPromptMode: "memfs" | "standard" | undefined = memfsFlag
+    ? "memfs"
+    : noMemfsFlag
+      ? "standard"
+      : undefined;
+  const shouldAutoEnableMemfsForNewAgent = !memfsFlag && !noMemfsFlag;
   const noSkillsFlag = values["no-skills"] as boolean | undefined;
+  const noBundledSkillsFlag = values["no-bundled-skills"] as
+    | boolean
+    | undefined;
+  const skillSourcesRaw = values["skill-sources"] as string | undefined;
+  const noSystemInfoReminderFlag = values["no-system-info-reminder"] as
+    | boolean
+    | undefined;
+  const resolvedSkillSources = (() => {
+    try {
+      return resolveSkillSourcesSelection({
+        skillSourcesRaw,
+        noSkills: noSkillsFlag,
+        noBundledSkills: noBundledSkillsFlag,
+      });
+    } catch (error) {
+      console.error(
+        error instanceof Error ? `Error: ${error.message}` : String(error),
+      );
+      process.exit(1);
+    }
+  })();
   const fromAfFile =
     (values.import as string | undefined) ??
     (values["from-af"] as string | undefined);
@@ -619,10 +662,11 @@ async function main(): Promise<void> {
     specifiedToolset &&
     specifiedToolset !== "codex" &&
     specifiedToolset !== "default" &&
-    specifiedToolset !== "gemini"
+    specifiedToolset !== "gemini" &&
+    specifiedToolset !== "auto"
   ) {
     console.error(
-      `Error: Invalid toolset "${specifiedToolset}". Must be "codex", "default", or "gemini".`,
+      `Error: Invalid toolset "${specifiedToolset}". Must be "auto", "codex", "default", or "gemini".`,
     );
     process.exit(1);
   }
@@ -956,7 +1000,7 @@ async function main(): Promise<void> {
     // For headless mode, load tools synchronously (respecting model/toolset when provided)
     const modelForTools = getModelForToolLoading(
       specifiedModel,
-      specifiedToolset as "codex" | "default" | undefined,
+      specifiedToolset as "auto" | "codex" | "default" | "gemini" | undefined,
     );
     await loadTools(modelForTools);
     const client = await getClient();
@@ -968,7 +1012,8 @@ async function main(): Promise<void> {
       process.argv,
       specifiedModel,
       skillsDirectory,
-      noSkillsFlag,
+      resolvedSkillSources,
+      !noSystemInfoReminderFlag,
     );
     return;
   }
@@ -1018,7 +1063,7 @@ async function main(): Promise<void> {
     agentIdArg: string | null;
     model?: string;
     systemPromptPreset?: string;
-    toolset?: "codex" | "default" | "gemini";
+    toolset?: "auto" | "codex" | "default" | "gemini";
     skillsDirectory?: string;
     fromAfFile?: string;
     isRegistryImport?: boolean;
@@ -1049,6 +1094,10 @@ async function main(): Promise<void> {
     const [selectedGlobalAgentId, setSelectedGlobalAgentId] = useState<
       string | null
     >(null);
+    // Cache agent object from Phase 1 validation to avoid redundant re-fetch in Phase 2
+    const [validatedAgent, setValidatedAgent] = useState<AgentState | null>(
+      null,
+    );
     // Track agent and conversation for conversation selector (--resume flag)
     const [resumeAgentId, setResumeAgentId] = useState<string | null>(null);
     const [resumeAgentName, setResumeAgentName] = useState<string | null>(null);
@@ -1359,11 +1408,13 @@ async function main(): Promise<void> {
         }
 
         // Step 1: Check local project LRU (session helpers centralize legacy fallback)
+        // Cache the retrieved agent to avoid redundant re-fetch in init()
         const localAgentId = settingsManager.getLocalLastAgentId(process.cwd());
         let localAgentExists = false;
+        let cachedAgent: AgentState | null = null;
         if (localAgentId) {
           try {
-            await client.agents.retrieve(localAgentId);
+            cachedAgent = await client.agents.retrieve(localAgentId);
             localAgentExists = true;
           } catch {
             setFailedAgentMessage(
@@ -1377,7 +1428,7 @@ async function main(): Promise<void> {
         let globalAgentExists = false;
         if (globalAgentId && globalAgentId !== localAgentId) {
           try {
-            await client.agents.retrieve(globalAgentId);
+            cachedAgent = await client.agents.retrieve(globalAgentId);
             globalAgentExists = true;
           } catch {
             // Global agent doesn't exist either
@@ -1407,6 +1458,9 @@ async function main(): Promise<void> {
         switch (target.action) {
           case "resume":
             setSelectedGlobalAgentId(target.agentId);
+            if (cachedAgent && cachedAgent.id === target.agentId) {
+              setValidatedAgent(cachedAgent);
+            }
             // Don't set selectedConversationId — DEFAULT PATH uses default conv.
             // Conversation restoration is handled by --continue path instead.
             setLoadingState("assembling");
@@ -1517,12 +1571,11 @@ async function main(): Promise<void> {
         // Set resuming state early so loading messages are accurate
         setIsResumingSession(!!resumingAgentId);
 
-        // Load toolset: use explicit --toolset flag if provided, otherwise derive from model
-        // NOTE: We don't persist toolset per-agent. On resume, toolset is re-derived from model.
-        // If explicit toolset overrides need to persist, see comment in tools/toolset.ts
+        // Load an initial toolset for startup (explicit --toolset or model-derived).
+        // App.tsx will reconcile persisted per-agent toolset preference after agent metadata loads.
         const modelForTools = getModelForToolLoading(
           model,
-          toolset as "codex" | "default" | undefined,
+          toolset as "auto" | "codex" | "default" | "gemini" | undefined,
         );
         await loadTools(modelForTools);
 
@@ -1657,25 +1710,31 @@ async function main(): Promise<void> {
             skillsDirectory,
             parallelToolCalls: true,
             systemPromptPreset,
+            memoryPromptMode: requestedMemoryPromptMode,
             initBlocks,
             baseTools,
           });
           agent = result.agent;
           setAgentProvenance(result.provenance);
 
-          // Enable memfs by default on Letta Cloud for new agents
-          const { enableMemfsIfCloud } = await import(
-            "./agent/memoryFilesystem"
-          );
-          await enableMemfsIfCloud(agent.id);
+          // Enable memfs by default on Letta Cloud for new agents when no explicit memfs flags are provided.
+          if (shouldAutoEnableMemfsForNewAgent) {
+            const { enableMemfsIfCloud } = await import(
+              "./agent/memoryFilesystem"
+            );
+            await enableMemfsIfCloud(agent.id);
+          }
         }
 
         // Priority 4: Try to resume from project settings LRU (.letta/settings.local.json)
         // Note: If LRU retrieval failed in early validation, we already showed selector and returned
-        // This block handles the case where we have a valid resumingAgentId from early validation
+        // Use cached agent from Phase 1 validation when available to avoid redundant API call
         if (!agent && resumingAgentId) {
           try {
-            agent = await client.agents.retrieve(resumingAgentId);
+            agent =
+              validatedAgent && validatedAgent.id === resumingAgentId
+                ? validatedAgent
+                : await client.agents.retrieve(resumingAgentId);
           } catch (error) {
             // Agent disappeared between validation and now - show selector
             console.error(
@@ -1732,36 +1791,19 @@ async function main(): Promise<void> {
         settingsManager.updateLocalProjectSettings({ lastAgent: agent.id });
         settingsManager.updateSettings({ lastAgent: agent.id });
 
-        // Migration (LET-7353): Remove legacy skills/loaded_skills blocks
-        // These blocks are no longer used - skills are now injected via system reminders
-        for (const label of ["skills", "loaded_skills"]) {
-          try {
-            const block = await client.agents.blocks.retrieve(label, {
-              agent_id: agent.id,
-            });
-            if (block) {
-              await client.agents.blocks.detach(block.id, {
-                agent_id: agent.id,
-              });
-              await client.blocks.delete(block.id);
-            }
-          } catch {
-            // Block doesn't exist or already removed, skip
-          }
-        }
-
         // Set agent context for tools that need it (e.g., Skill tool)
-        setAgentContext(agent.id, skillsDirectory, noSkillsFlag);
+        setAgentContext(agent.id, skillsDirectory, resolvedSkillSources);
 
-        // Apply memfs flag if explicitly specified (memfs is opt-in via /memfs enable or --memfs)
+        // Start memfs sync early — awaited in parallel with getResumeData below
         const isSubagent = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
-        try {
-          const { applyMemfsFlags } = await import("./agent/memoryFilesystem");
-          await applyMemfsFlags(agent.id, memfsFlag, noMemfsFlag);
-        } catch (error) {
-          console.error(error instanceof Error ? error.message : String(error));
-          process.exit(1);
-        }
+        const agentId = agent.id;
+        const agentTags = agent.tags ?? undefined;
+        const memfsSyncPromise = import("./agent/memoryFilesystem").then(
+          ({ applyMemfsFlags }) =>
+            applyMemfsFlags(agentId, memfsFlag, noMemfsFlag, {
+              agentTags,
+            }),
+        );
 
 
         // Check if we're resuming an existing agent
@@ -1845,12 +1887,10 @@ async function main(): Promise<void> {
           setResumedExistingConversation(true);
           try {
             // Load message history and pending approvals from the conversation
-            // Re-fetch agent to get fresh message_ids for accurate pending approval detection
             setLoadingState("checking");
-            const freshAgent = await client.agents.retrieve(agent.id);
             const data = await getResumeData(
               client,
-              freshAgent,
+              agent,
               specifiedConversationId,
             );
             setResumeData(data);
@@ -1884,12 +1924,10 @@ async function main(): Promise<void> {
             // If it no longer exists, fall back to creating new
             try {
               // Load message history and pending approvals from the conversation
-              // Re-fetch agent to get fresh message_ids for accurate pending approval detection
               setLoadingState("checking");
-              const freshAgent = await client.agents.retrieve(agent.id);
               const data = await getResumeData(
                 client,
-                freshAgent,
+                agent,
                 lastSession.conversationId,
               );
               // Only set state after validation succeeds
@@ -1927,10 +1965,9 @@ async function main(): Promise<void> {
           // User selected a specific conversation from the --resume selector
           try {
             setLoadingState("checking");
-            const freshAgent = await client.agents.retrieve(agent.id);
             const data = await getResumeData(
               client,
-              freshAgent,
+              agent,
               selectedConversationId,
             );
             conversationIdToUse = selectedConversationId;
@@ -1957,12 +1994,27 @@ async function main(): Promise<void> {
           // Default (including --new-agent): use the agent's "default" conversation
           conversationIdToUse = "default";
 
-          // Load message history from the default conversation
+          // Load message history and memfs sync in parallel — they're independent
           setLoadingState("checking");
-          const freshAgent = await client.agents.retrieve(agent.id);
-          const data = await getResumeData(client, freshAgent, "default");
+          const [data] = await Promise.all([
+            getResumeData(client, agent, "default"),
+            memfsSyncPromise.catch((error) => {
+              console.error(
+                error instanceof Error ? error.message : String(error),
+              );
+              process.exit(1);
+            }),
+          ]);
           setResumeData(data);
           setResumedExistingConversation(true);
+        }
+
+        // Ensure memfs sync completed (already resolved for default path via Promise.all above)
+        try {
+          await memfsSyncPromise;
+        } catch (error) {
+          console.error(error instanceof Error ? error.message : String(error));
+          process.exit(1);
         }
 
         // Save the session (agent + conversation) to settings
@@ -1989,8 +2041,7 @@ async function main(): Promise<void> {
 
       init().catch((err) => {
         // Handle errors gracefully without showing raw stack traces
-        const message =
-          err instanceof Error ? err.message : "An unexpected error occurred";
+        const message = formatErrorDetails(err);
         console.error(`\nError during initialization: ${message}`);
         if (process.env.DEBUG) {
           console.error(err);
@@ -2007,6 +2058,7 @@ async function main(): Promise<void> {
       fromAfFile,
       loadingState,
       selectedGlobalAgentId,
+      validatedAgent,
       shouldContinue,
       resumeAgentId,
       selectedConversationId,
@@ -2102,6 +2154,7 @@ async function main(): Promise<void> {
         showCompactions: settings.showCompactions,
         agentProvenance,
         releaseNotes,
+        sessionContextReminderEnabled: !noSystemInfoReminderFlag,
       });
     }
 
@@ -2119,6 +2172,7 @@ async function main(): Promise<void> {
       showCompactions: settings.showCompactions,
       agentProvenance,
       releaseNotes,
+      sessionContextReminderEnabled: !noSystemInfoReminderFlag,
     });
   }
 
@@ -2132,7 +2186,12 @@ async function main(): Promise<void> {
       agentIdArg: specifiedAgentId,
       model: specifiedModel,
       systemPromptPreset: systemPromptPreset,
-      toolset: specifiedToolset as "codex" | "default" | "gemini" | undefined,
+      toolset: specifiedToolset as
+        | "auto"
+        | "codex"
+        | "default"
+        | "gemini"
+        | undefined,
       skillsDirectory: skillsDirectory,
       fromAfFile: fromAfFile,
       isRegistryImport: isRegistryImport,

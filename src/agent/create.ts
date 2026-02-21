@@ -9,8 +9,10 @@ import type {
 import { DEFAULT_AGENT_NAME } from "../constants";
 import { settingsManager } from "../settings-manager";
 import { getModelContextWindow } from "./available-models";
-import { getClient } from "./client";
+import { getClient, getServerUrl } from "./client";
+import { getLettaCodeHeaders } from "./http-headers";
 import { getDefaultMemoryBlocks } from "./memory";
+import { type MemoryPromptMode, reconcileMemoryPrompt } from "./memoryPrompt";
 import {
   formatAvailableModelsAsync,
 
@@ -19,10 +21,7 @@ import {
   resolveModelAsync,
 } from "./model";
 import { updateAgentLLMConfig } from "./modify";
-import {
-  resolveSystemPrompt,
-  SYSTEM_PROMPT_MEMORY_ADDON,
-} from "./promptAssets";
+import { resolveSystemPrompt } from "./promptAssets";
 import { SLEEPTIME_MEMORY_PERSONA } from "./prompts/sleeptime";
 
 /**
@@ -49,6 +48,88 @@ export interface CreateAgentResult {
   provenance: AgentProvenance;
 }
 
+function isToolsNotFoundError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  const status = (err as { status?: unknown } | null)?.status;
+
+  return (
+    typeof message === "string" &&
+    /tools not found by name/i.test(message) &&
+    /memory_apply_patch|memory|web_search|fetch_webpage/i.test(message) &&
+    (status === undefined || status === 400)
+  );
+}
+
+async function addBaseToolsToServer(): Promise<boolean> {
+  const settings = await settingsManager.getSettingsWithSecureTokens();
+  const apiKey = process.env.LETTA_API_KEY || settings.env?.LETTA_API_KEY;
+
+  if (!apiKey) {
+    console.warn(
+      "Cannot auto-populate base tools: missing LETTA_API_KEY for manual endpoint call.",
+    );
+    return false;
+  }
+
+  try {
+    const response = await fetch(`${getServerUrl()}/v1/tools/add-base-tools`, {
+      method: "POST",
+      headers: getLettaCodeHeaders(apiKey),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      console.warn(
+        `Failed to add base tools via /v1/tools/add-base-tools (${response.status}): ${body || response.statusText}`,
+      );
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.warn(
+      `Failed to call /v1/tools/add-base-tools: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
+type CreateWithToolsFn = (tools: string[]) => Promise<AgentState>;
+type AddBaseToolsFn = () => Promise<boolean>;
+
+export async function createAgentWithBaseToolsRecovery(
+  createWithTools: CreateWithToolsFn,
+  toolNames: string[],
+  addBaseTools: AddBaseToolsFn = addBaseToolsToServer,
+): Promise<AgentState> {
+  try {
+    return await createWithTools(toolNames);
+  } catch (err) {
+    if (!isToolsNotFoundError(err)) {
+      throw err;
+    }
+
+    console.warn(
+      "Agent creation failed due to missing base tools. Attempting to add base tools on server...",
+    );
+    await addBaseTools();
+
+    try {
+      return await createWithTools(toolNames);
+    } catch (retryErr) {
+      console.warn(
+        `Agent creation still failed after base-tool bootstrap: ${
+          retryErr instanceof Error ? retryErr.message : String(retryErr)
+        }`,
+      );
+      console.warn(
+        "Retrying agent creation with no server-side tools attached.",
+      );
+      return await createWithTools([]);
+    }
+  }
+}
+
 export interface CreateAgentOptions {
   name?: string;
   /** Agent description shown in /agents selector */
@@ -65,6 +146,8 @@ export interface CreateAgentOptions {
   systemPromptCustom?: string;
   /** Additional text to append to the resolved system prompt */
   systemPromptAppend?: string;
+  /** Which managed memory prompt mode to apply */
+  memoryPromptMode?: MemoryPromptMode;
   /** Block labels to initialize (from default blocks) */
   initBlocks?: string[];
   /** Base tools to include */
@@ -311,17 +394,23 @@ export async function createAgent(
     blockProvenance.push({ label: blockId, source: "shared" });
   }
 
-  // Get the model's context window from its configuration (if known)
-  // First try models.json, then fall back to API-cached context window for BYOK models
-  const modelUpdateArgs = getModelUpdateArgs(modelHandle);
+  // Get the model's context window from its configuration (if known).
+  // If the caller specified a model *ID* (e.g. gpt-5.3-codex-plus-pro-high),
+  // use that identifier to preserve tier-specific updateArgs like reasoning_effort.
+  // Otherwise, fall back to the resolved handle.
+  const modelIdentifierForDefaults = options.model ?? modelHandle;
+  const modelUpdateArgs = options.model
+    ? getModelUpdateArgs(modelIdentifierForDefaults)
+    : undefined;
   const contextWindow =
     (modelUpdateArgs?.context_window as number | undefined) ??
     (await getModelContextWindow(modelHandle));
 
   // Resolve system prompt content:
   // 1. If systemPromptCustom is provided, use it as-is
-  // 2. Otherwise, resolve effectiveSystemPromptPreset to content (may be auto-selected based on model)
-  // 3. If systemPromptAppend is provided, append it to the result
+  // 2. Otherwise, resolve systemPromptPreset to content
+  // 3. Reconcile to the selected managed memory mode
+  // 4. If systemPromptAppend is provided, append it to the result
   let systemPromptContent: string;
   if (options.systemPromptCustom) {
     systemPromptContent = options.systemPromptCustom;
@@ -329,9 +418,10 @@ export async function createAgent(
     systemPromptContent = await resolveSystemPrompt(effectiveSystemPromptPreset);
   }
 
-  // Append the non-memfs memory section by default.
-  // If memfs is enabled, updateAgentSystemPromptMemfs() will swap it for the memfs version.
-  systemPromptContent = `${systemPromptContent}\n${SYSTEM_PROMPT_MEMORY_ADDON}`;
+  systemPromptContent = reconcileMemoryPrompt(
+    systemPromptContent,
+    options.memoryPromptMode ?? "standard",
+  );
 
   // Append additional instructions if provided
   if (options.systemPromptAppend) {
@@ -354,7 +444,7 @@ export async function createAgent(
   const agentDescription =
     options.description ?? `Letta Code agent created in ${process.cwd()}`;
 
-  const agent = await client.agents.create({
+  const createAgentRequestBase = {
     agent_type: "letta_v1_agent" as AgentType,
     system: systemPromptContent,
     name,
@@ -362,7 +452,6 @@ export async function createAgent(
     embedding: embeddingModelVal || undefined,
     model: modelHandle,
     ...(contextWindow && { context_window_limit: contextWindow }),
-    tools: toolNames,
     // New blocks created inline with agent (saves ~2s of sequential API calls)
     memory_blocks:
       filteredMemoryBlocks.length > 0 ? filteredMemoryBlocks : undefined,
@@ -376,7 +465,19 @@ export async function createAgent(
     initial_message_sequence: [],
     parallel_tool_calls: parallelToolCallsVal,
     enable_sleeptime: enableSleeptimeVal,
-  });
+  };
+
+  const createWithTools = (tools: string[]) =>
+    client.agents.create({
+      ...createAgentRequestBase,
+      tools,
+    });
+
+  const agent = await createAgentWithBaseToolsRecovery(
+    createWithTools,
+    toolNames,
+    addBaseToolsToServer,
+  );
 
   // Attach Letta Code tools to the agent with requires_approval rules
   const { linkToolsToAgent } = await import("./modify");
@@ -384,11 +485,17 @@ export async function createAgent(
 
   // Note: Preflight check above falls back to 'memory' when 'memory_apply_patch' is unavailable.
 
-  // Apply updateArgs if provided (e.g., context_window, reasoning_effort, verbosity, etc.)
-  // We intentionally pass context_window through so updateAgentLLMConfig can set
+  // Apply updateArgs if provided (e.g., context_window, reasoning_effort, verbosity, etc.).
+  // Also apply tier defaults from models.json when the caller explicitly selected a model.
+  //
+  // Note: we intentionally pass context_window through so updateAgentLLMConfig can set
   // context_window_limit using the latest server API, avoiding any fallback.
-  if (options.updateArgs && Object.keys(options.updateArgs).length > 0) {
-    await updateAgentLLMConfig(agent.id, modelHandle, options.updateArgs);
+  const mergedUpdateArgs = {
+    ...(modelUpdateArgs ?? {}),
+    ...(options.updateArgs ?? {}),
+  };
+  if (Object.keys(mergedUpdateArgs).length > 0) {
+    await updateAgentLLMConfig(agent.id, modelHandle, mergedUpdateArgs);
   }
 
   // Always retrieve the agent to ensure we get the full state with populated memory blocks

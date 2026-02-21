@@ -4,6 +4,7 @@ import Link from "ink-link";
 import { useEffect, useState } from "react";
 import { getClient } from "../../agent/client";
 import { getConversationQueryString } from "../helpers/conversationQuery";
+import { debugLog } from "../../utils/debug";
 import { useTerminalWidth } from "../hooks/useTerminalWidth";
 import { colors } from "./colors";
 import { MarkdownDisplay } from "./MarkdownDisplay";
@@ -59,7 +60,7 @@ export function MemoryTabViewer({
         });
         setFreshBlocks(agent.memory?.blocks || []);
       } catch (error) {
-        console.error("Failed to fetch memory blocks:", error);
+        debugLog("memory-tab", "Failed to fetch memory blocks: %O", error);
         // Fall back to passed-in blocks if fetch fails
         setFreshBlocks(blocks);
       } finally {
@@ -138,7 +139,7 @@ export function MemoryTabViewer({
             backgroundColor={
               isActive ? colors.selector.itemHighlighted : undefined
             }
-            color={isActive ? "black" : undefined}
+            color={isActive ? "white" : undefined}
             bold={isActive}
           >
             {` ${block.label} `}
@@ -162,7 +163,7 @@ export function MemoryTabViewer({
             View your agent's memory
           </Text>
         </Box>
-        <Text dimColor>{"  "}Loading memory blocks...</Text>
+        <Text dimColor>{"  "}Loading memory...</Text>
         <Box marginTop={1}>
           <Text dimColor>{"  "}Esc cancel</Text>
         </Box>
@@ -184,7 +185,7 @@ export function MemoryTabViewer({
             View your agent's memory
           </Text>
         </Box>
-        <Text dimColor>{"  "}No memory blocks attached to this agent.</Text>
+        <Text dimColor>{"  "}No memory attached to this agent.</Text>
         <Box marginTop={1}>
           <Text dimColor>{"  "}Esc cancel</Text>
         </Box>

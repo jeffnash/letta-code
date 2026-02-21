@@ -57,6 +57,52 @@ function applySafetyToUpdateArgs(
   return safe;
 }
 
+export type ModelReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh";
+
+const REASONING_EFFORT_ORDER: ModelReasoningEffort[] = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+];
+
+function isModelReasoningEffort(value: unknown): value is ModelReasoningEffort {
+  return (
+    typeof value === "string" &&
+    REASONING_EFFORT_ORDER.includes(value as ModelReasoningEffort)
+  );
+}
+
+export function getReasoningTierOptionsForHandle(modelHandle: string): Array<{
+  effort: ModelReasoningEffort;
+  modelId: string;
+}> {
+  const byEffort = new Map<ModelReasoningEffort, string>();
+
+  for (const model of models) {
+    if (model.handle !== modelHandle) continue;
+    const effort = (model.updateArgs as { reasoning_effort?: unknown } | null)
+      ?.reasoning_effort;
+    if (!isModelReasoningEffort(effort)) continue;
+    if (!byEffort.has(effort)) {
+      byEffort.set(effort, model.id);
+    }
+  }
+
+  return REASONING_EFFORT_ORDER.flatMap((effort) => {
+    const modelId = byEffort.get(effort);
+    return modelId ? [{ effort, modelId }] : [];
+  });
+}
+
 /**
  * Resolve a model by ID or handle (synchronous - static list only)
  * @param modelIdentifier - Can be either a model ID (e.g., "opus-4.5") or a full handle (e.g., "anthropic/claude-opus-4-5")
@@ -332,6 +378,22 @@ export async function getModelUpdateArgsAsync(
  * @returns The model entry if found, null otherwise
  */
 function findModelByHandle(handle: string): (typeof models)[number] | null {
+  const pickPreferred = (candidates: (typeof models)[number][]) =>
+    candidates.find((m) => m.isDefault) ??
+    candidates.find((m) => m.isFeatured) ??
+    candidates.find(
+      (m) =>
+        (m.updateArgs as { reasoning_effort?: unknown } | undefined)
+          ?.reasoning_effort === "medium",
+    ) ??
+    candidates.find(
+      (m) =>
+        (m.updateArgs as { reasoning_effort?: unknown } | undefined)
+          ?.reasoning_effort === "high",
+    ) ??
+    candidates[0] ??
+    null;
+
   // Try exact match first
   const exactMatch = models.find((m) => m.handle === handle);
   if (exactMatch) return exactMatch;
@@ -344,7 +406,7 @@ function findModelByHandle(handle: string): (typeof models)[number] | null {
     const modelPortion = rest.join("/");
     // Find models with the same provider where the model portion is contained
     // in the models.json handle (handles vendor prefixes and version suffixes)
-    const partialMatch = models.find((m) => {
+    const providerMatches = models.filter((m) => {
       if (!m.handle.startsWith(`${provider}/`)) return false;
       const mModelPortion = m.handle.slice(provider.length + 1);
       // Check if either contains the other (handles both directions)
@@ -353,7 +415,17 @@ function findModelByHandle(handle: string): (typeof models)[number] | null {
         modelPortion.includes(mModelPortion)
       );
     });
-    if (partialMatch) return partialMatch;
+    const providerMatch = pickPreferred(providerMatches);
+    if (providerMatch) return providerMatch;
+
+    // Cross-provider fallback by model suffix. This helps when llm_config reports
+    // provider_type=openai for BYOK models that are represented in models.json
+    // under a different provider prefix (e.g. chatgpt-plus-pro/*).
+    const suffixMatches = models.filter((m) =>
+      m.handle.endsWith(`/${modelPortion}`),
+    );
+    const suffixMatch = pickPreferred(suffixMatches);
+    if (suffixMatch) return suffixMatch;
   }
 
   return null;

@@ -18,10 +18,9 @@ describe("Shell Launchers", () => {
     expect(launchers).toEqual([]);
   });
 
-  test("accepts argv-style arrays defensively", () => {
-    const launchers = buildShellLaunchers(["bash", "-lc", "echo test"]);
+  test("handles command with flags", () => {
+    const launchers = buildShellLaunchers("echo test");
     expect(launchers.length).toBeGreaterThan(0);
-    // Should still end up passing the script to a launcher.
     const joined = launchers.map((l) => l.join(" ")).join("\n");
     expect(joined).toContain("echo test");
   });
@@ -69,6 +68,15 @@ describe("Shell Launchers", () => {
         );
 
         expect(bashLauncher).toBeDefined();
+      });
+
+      test("uses login shell flag when login=true", () => {
+        const launchers = buildShellLaunchers("echo test", { login: true });
+        const loginLauncher = launchers.find(
+          (l) =>
+            (l[0]?.includes("bash") || l[0]?.includes("zsh")) && l[1] === "-lc",
+        );
+        expect(loginLauncher).toBeDefined();
       });
 
       test("prefers user SHELL environment", () => {

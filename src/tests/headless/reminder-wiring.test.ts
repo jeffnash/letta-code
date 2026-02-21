@@ -1,0 +1,66 @@
+import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+describe("headless shared reminder wiring", () => {
+  test("one-shot mode builds shared reminders with system-info flag", () => {
+    const headlessPath = fileURLToPath(
+      new URL("../../headless.ts", import.meta.url),
+    );
+    const source = readFileSync(headlessPath, "utf-8");
+
+    expect(source).toContain('isSubagent ? "subagent" : "headless-one-shot"');
+    expect(source).toContain(
+      "sessionContextReminderEnabled: systemInfoReminderEnabled",
+    );
+  });
+
+  test("bidirectional mode builds shared reminders with plan-mode resolver", () => {
+    const headlessPath = fileURLToPath(
+      new URL("../../headless.ts", import.meta.url),
+    );
+    const source = readFileSync(headlessPath, "utf-8");
+
+    expect(source).toContain(
+      'isSubagent ? "subagent" : "headless-bidirectional"',
+    );
+    expect(source).toContain("resolvePlanModeReminder: async () => {");
+    expect(source).toContain("const { PLAN_MODE_REMINDER } = await import");
+  });
+
+  test("all headless drains pass context tracker for compaction-driven reminder state", () => {
+    const headlessPath = fileURLToPath(
+      new URL("../../headless.ts", import.meta.url),
+    );
+    const source = readFileSync(headlessPath, "utf-8");
+
+    expect(source).toContain("syncReminderStateFromContextTracker(");
+    expect(source).toContain("reminderContextTracker");
+  });
+
+  test("subagent mode is wired via LETTA_CODE_AGENT_ROLE check", () => {
+    const headlessPath = fileURLToPath(
+      new URL("../../headless.ts", import.meta.url),
+    );
+    const source = readFileSync(headlessPath, "utf-8");
+
+    expect(source).toContain(
+      'process.env.LETTA_CODE_AGENT_ROLE === "subagent"',
+    );
+    expect(source).toContain('isSubagent ? "subagent" : "headless-one-shot"');
+    expect(source).toContain(
+      'isSubagent ? "subagent" : "headless-bidirectional"',
+    );
+  });
+
+  test("one-shot approval drain uses shared stream processor", () => {
+    const headlessPath = fileURLToPath(
+      new URL("../../headless.ts", import.meta.url),
+    );
+    const source = readFileSync(headlessPath, "utf-8");
+
+    expect(source).toContain("const approvalStream = await sendMessageStream(");
+    expect(source).toContain("await drainStreamWithResume(");
+    expect(source).not.toContain("for await (const _ of approvalStream)");
+  });
+});
