@@ -11,9 +11,7 @@ import {
   getMemoryFilesystemRoot,
   getMemorySystemDir,
   labelFromRelativePath,
-  parseBlockFromFileContent,
   renderMemoryFilesystemTree,
-  validateBlockLabel,
 } from "../../agent/memoryFilesystem";
 
 // Helper to create a mock client
@@ -92,111 +90,8 @@ function createMockClient(options: {
   };
 }
 
-describe("parseBlockFromFileContent", () => {
-  test("parses frontmatter with label, description, and limit", () => {
-    const content = `---
-label: persona/soul
-description: Who I am and what I value
-limit: 30000
----
-
-My persona content here.`;
-
-    const result = parseBlockFromFileContent(content, "default-label");
-
-    expect(result.label).toBe("persona/soul");
-    expect(result.description).toBe("Who I am and what I value");
-    expect(result.limit).toBe(30000);
-    expect(result.value).toBe("My persona content here.");
-  });
-
-  test("uses default label when frontmatter label is missing", () => {
-    const content = `---
-description: Some description
----
-
-Content here.`;
-
-    const result = parseBlockFromFileContent(content, "my-default-label");
-
-    expect(result.label).toBe("my-default-label");
-    expect(result.description).toBe("Some description");
-  });
-
-  test("generates description from label when frontmatter description is missing", () => {
-    const content = `---
-label: test/block
----
-
-Content here.`;
-
-    const result = parseBlockFromFileContent(content, "default");
-
-    expect(result.label).toBe("test/block");
-    expect(result.description).toBe("Memory block: test/block");
-  });
-
-  test("uses default limit when frontmatter limit is missing or invalid", () => {
-    const content = `---
-label: test
-limit: invalid
----
-
-Content.`;
-
-    const result = parseBlockFromFileContent(content, "default");
-
-    expect(result.limit).toBe(20000);
-  });
-
-  test("handles content without frontmatter", () => {
-    const content = "Just plain content without frontmatter.";
-
-    const result = parseBlockFromFileContent(content, "fallback-label");
-
-    expect(result.label).toBe("fallback-label");
-    expect(result.description).toBe("Memory block: fallback-label");
-    expect(result.limit).toBe(20000);
-    expect(result.value).toBe("Just plain content without frontmatter.");
-  });
-
-  test("sets read_only from frontmatter", () => {
-    const content = `---
-label: test/block
-read_only: true
----
-
-Read-only content.`;
-
-    const result = parseBlockFromFileContent(content, "default");
-
-    expect(result.read_only).toBe(true);
-  });
-
-  test("sets read_only for known read-only labels", () => {
-    const content = `---
-label: skills
----
-
-Skills content.`;
-
-    const result = parseBlockFromFileContent(content, "skills");
-
-    expect(result.read_only).toBe(true);
-  });
-
-  test("does not set read_only for regular blocks", () => {
-    const content = `---
-label: persona/soul
----
-
-Regular content.`;
-
-    const result = parseBlockFromFileContent(content, "persona/soul");
-
-    expect(result.read_only).toBeUndefined();
-  });
-});
+// parseBlockFromFileContent tests removed - YAML frontmatter no longer
+// used with git-backed memory (files contain raw block content).
 
 describe("labelFromRelativePath", () => {
   test("converts simple filename to label", () => {
@@ -701,76 +596,4 @@ describe("location mismatch auto-sync", () => {
   });
 });
 
-describe("validateBlockLabel", () => {
-  const targetDir = "/home/user/.letta/agents/agent-123/memory/system";
 
-  describe("valid labels", () => {
-    test("simple label", () => {
-      expect(validateBlockLabel("persona", targetDir)).toBe("persona");
-    });
-
-    test("nested label with single slash", () => {
-      expect(validateBlockLabel("persona/soul", targetDir)).toBe("persona/soul");
-    });
-
-    test("nested label with multiple slashes", () => {
-      expect(validateBlockLabel("letta_code/dev_workflow/patterns", targetDir)).toBe(
-        "letta_code/dev_workflow/patterns"
-      );
-    });
-
-    test("label with hyphens", () => {
-      expect(validateBlockLabel("my-notes", targetDir)).toBe("my-notes");
-    });
-
-    test("label with underscores", () => {
-      expect(validateBlockLabel("todo_list", targetDir)).toBe("todo_list");
-    });
-
-    test("label with numbers", () => {
-      expect(validateBlockLabel("2024-01-27", targetDir)).toBe("2024-01-27");
-    });
-
-    test("label with mixed characters", () => {
-      expect(validateBlockLabel("human/prefs", targetDir)).toBe("human/prefs");
-    });
-  });
-
-  describe("invalid labels - path traversal attacks", () => {
-    test("rejects parent directory traversal", () => {
-      expect(() => validateBlockLabel("../etc/passwd", targetDir)).toThrow(
-        "parent directory traversal"
-      );
-    });
-
-    test("rejects double dot only", () => {
-      expect(() => validateBlockLabel("..", targetDir)).toThrow(
-        "parent directory traversal"
-      );
-    });
-
-    test("rejects embedded parent traversal", () => {
-      expect(() => validateBlockLabel("foo/../bar", targetDir)).toThrow(
-        "parent directory traversal"
-      );
-    });
-
-    test("rejects absolute path with leading slash", () => {
-      expect(() => validateBlockLabel("/etc/passwd", targetDir)).toThrow(
-        "absolute paths are not allowed"
-      );
-    });
-
-    test("rejects Windows absolute path", () => {
-      expect(() => validateBlockLabel("C:\\Windows", targetDir)).toThrow(
-        "absolute paths are not allowed"
-      );
-    });
-
-    test("rejects backslash absolute path", () => {
-      expect(() => validateBlockLabel("\\\\server\\share", targetDir)).toThrow(
-        "absolute paths are not allowed"
-      );
-    });
-  });
-});

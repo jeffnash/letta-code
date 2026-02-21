@@ -14,14 +14,15 @@
  */
 
 import { Box } from "ink";
-import Link from "ink-link";
 import { memo } from "react";
-import { formatStats, getTreeChars } from "../helpers/subagentDisplay.js";
+import {
+  formatStats,
+  getSubagentModelDisplay,
+  getTreeChars,
+} from "../helpers/subagentDisplay.js";
 import { useTerminalWidth } from "../hooks/useTerminalWidth.js";
 import { colors } from "./colors.js";
 import { Text } from "./Text";
-
-const isTmux = Boolean(process.env.TMUX);
 
 // ============================================================================
 // Types
@@ -64,16 +65,15 @@ const AgentRow = memo(({ agent, isLast }: AgentRowProps) => {
 
   const isRunning = agent.status === "running";
   const shouldDim = isRunning && !agent.isBackground;
+  const showStats = !(agent.isBackground && isRunning);
+  const hideBackgroundStatusLine =
+    agent.isBackground && isRunning && !agent.agentURL;
   const stats = formatStats(agent.toolCount, agent.totalTokens, isRunning);
-  const ids = [agent.taskId, agent.agentId, agent.conversationId].filter(
-    Boolean,
-  ) as string[];
-  const modelLabel = agent.model ? `Model: ${agent.model}` : "";
-  const subagentLabel = `Subagent: ${agent.type.toLowerCase()}`;
+  const modelDisplay = getSubagentModelDisplay(agent.model);
 
   return (
     <Box flexDirection="column">
-      {/* Main row: tree char + description + type + stats */}
+      {/* Main row: tree char + description + type + model + stats */}
       <Box flexDirection="row">
         <Text>
           <Text color={colors.subagent.treeChar}>
@@ -85,28 +85,30 @@ const AgentRow = memo(({ agent, isLast }: AgentRowProps) => {
           </Text>
           <Text dimColor>
             {" · "}
-            {stats}
+            {agent.type.toLowerCase()}
           </Text>
+          {modelDisplay && (
+            <>
+              <Text dimColor>{` · ${modelDisplay.label}`}</Text>
+              {modelDisplay.isByokProvider && (
+                <Text
+                  color={
+                    modelDisplay.isOpenAICodexProvider ? "#74AA9C" : "yellow"
+                  }
+                >
+                  {" ▲"}
+                </Text>
+              )}
+            </>
+          )}
+          {showStats && (
+            <Text dimColor>
+              {" · "}
+              {stats}
+            </Text>
+          )}
         </Text>
       </Box>
-
-      <Box flexDirection="row">
-        <Text color={colors.subagent.treeChar}>
-          {"   "}
-          {continueChar} ⎿{" "}
-        </Text>
-        <Text dimColor>{subagentLabel}</Text>
-      </Box>
-
-      {modelLabel && (
-        <Box flexDirection="row">
-          <Text color={colors.subagent.treeChar}>
-            {"   "}
-            {continueChar} ⎿{" "}
-          </Text>
-          <Text dimColor>{modelLabel}</Text>
-        </Box>
-      )}
 
       {/* Subagent URL */}
       {agent.agentURL && (
@@ -115,64 +117,50 @@ const AgentRow = memo(({ agent, isLast }: AgentRowProps) => {
             {"   "}
             {continueChar} ⎿{" "}
           </Text>
-          {!isTmux ? (
-            <Link url={agent.agentURL}>
-              <Text dimColor>Agent ↗</Text>
-            </Link>
-          ) : (
-            <Text dimColor>{agent.agentURL}</Text>
-          )}
-        </Box>
-      )}
-
-      {ids.length > 0 && (
-        <Box flexDirection="row">
-          <Text color={colors.subagent.treeChar}>
-            {"   "}
-            {continueChar} ⎿{" "}
-          </Text>
-          <Text dimColor>{"IDs: "}</Text>
-          <Text dimColor>{ids.join(" · ")}</Text>
+          <Text dimColor>{"Subagent: "}</Text>
+          <Text dimColor>{agent.agentURL}</Text>
         </Box>
       )}
 
       {/* Status line */}
-      <Box flexDirection="row">
-        {agent.status === "completed" && !agent.isBackground ? (
-          <>
-            <Text color={colors.subagent.treeChar}>
-              {"   "}
-              {continueChar}
-            </Text>
-            <Text dimColor>{"   Done"}</Text>
-          </>
-        ) : agent.status === "error" ? (
-          <>
-            <Box width={gutterWidth} flexShrink={0}>
-              <Text>
-                <Text color={colors.subagent.treeChar}>
-                  {"   "}
-                  {continueChar}
+      {!hideBackgroundStatusLine && (
+        <Box flexDirection="row">
+          {agent.status === "completed" && !agent.isBackground ? (
+            <>
+              <Text color={colors.subagent.treeChar}>
+                {"   "}
+                {continueChar}
+              </Text>
+              <Text dimColor>{"   Done"}</Text>
+            </>
+          ) : agent.status === "error" ? (
+            <>
+              <Box width={gutterWidth} flexShrink={0}>
+                <Text>
+                  <Text color={colors.subagent.treeChar}>
+                    {"   "}
+                    {continueChar}
+                  </Text>
+                  <Text dimColor>{"   "}</Text>
                 </Text>
-                <Text dimColor>{"   "}</Text>
+              </Box>
+              <Box flexGrow={1} width={contentWidth}>
+                <Text wrap="wrap" color={colors.subagent.error}>
+                  {agent.error}
+                </Text>
+              </Box>
+            </>
+          ) : (
+            <>
+              <Text color={colors.subagent.treeChar}>
+                {"   "}
+                {continueChar}
               </Text>
-            </Box>
-            <Box flexGrow={1} width={contentWidth}>
-              <Text wrap="wrap" color={colors.subagent.error}>
-                {agent.error}
-              </Text>
-            </Box>
-          </>
-        ) : (
-          <>
-            <Text color={colors.subagent.treeChar}>
-              {"   "}
-              {continueChar}
-            </Text>
-            <Text dimColor>{"   Running in the background"}</Text>
-          </>
-        )}
-      </Box>
+              <Text dimColor>{"   Running in the background"}</Text>
+            </>
+          )}
+        </Box>
+      )}
     </Box>
   );
 });

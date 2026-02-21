@@ -4,16 +4,34 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { buildShellLaunchers } from "../tools/impl/shellLaunchers";
+import { executePromptHook } from "./prompt-executor";
 import {
+  type CommandHookConfig,
   type HookCommand,
   type HookExecutionResult,
   HookExitCode,
   type HookInput,
   type HookResult,
+  isCommandHook,
+  isPromptHook,
 } from "./types";
 
 /** Default timeout for hook execution (60 seconds) */
 const DEFAULT_TIMEOUT_MS = 60000;
+
+/**
+ * Get a display identifier for a hook (for logging and feedback)
+ */
+function getHookIdentifier(hook: HookCommand): string {
+  if (isCommandHook(hook)) {
+    return hook.command;
+  }
+  if (isPromptHook(hook)) {
+    // Use first 50 chars of prompt as identifier
+    return `prompt:${hook.prompt.slice(0, 50)}${hook.prompt.length > 50 ? "..." : ""}`;
+  }
+  return "unknown";
+}
 
 /**
  * Try to spawn a hook command with a specific launcher
@@ -50,8 +68,10 @@ function trySpawnWithLauncher(
 }
 
 /**
- * Execute a single hook command with JSON input via stdin
- * Uses cross-platform shell launchers with fallback support
+ * Execute a single hook with JSON input
+ * Dispatches to appropriate executor based on hook type:
+ * - "command": executes shell command with JSON via stdin
+ * - "prompt": sends to LLM for evaluation
  */
 export async function executeHookCommand(
   hook: HookCommand,
@@ -72,6 +92,36 @@ export async function executeHookCommand(
     };
   }
 
+  // Dispatch based on hook type
+  if (isPromptHook(hook)) {
+    return executePromptHook(hook, input, workingDirectory);
+  }
+
+  // Default to command hook execution
+  if (isCommandHook(hook)) {
+    return executeCommandHook(hook, input, workingDirectory);
+  }
+
+  // Unknown hook type
+  return {
+    exitCode: HookExitCode.ERROR,
+    stdout: "",
+    stderr: "",
+    timedOut: false,
+    durationMs: 0,
+    error: `Unknown hook type: ${(hook as HookCommand).type}`,
+  };
+}
+
+/**
+ * Execute a command hook with JSON input via stdin
+ * Uses cross-platform shell launchers with fallback support
+ */
+export async function executeCommandHook(
+  hook: CommandHookConfig,
+  input: HookInput,
+  workingDirectory: string = process.cwd(),
+): Promise<HookResult> {
   const startTime = Date.now();
   const timeout = hook.timeout ?? DEFAULT_TIMEOUT_MS;
   const inputJson = JSON.stringify(input);
@@ -321,11 +371,10 @@ export async function executeHooks(
     }
 
     // Collect feedback from stderr when hook blocks
-    // Format: [command]: {stderr} per spec
     if (result.exitCode === HookExitCode.BLOCK) {
       blocked = true;
       if (result.stderr) {
-        feedback.push(`[${hook.command}]: ${result.stderr}`);
+        feedback.push(`[${getHookIdentifier(hook)}]: ${result.stderr}`);
       }
       // Stop processing more hooks after a block
       break;
@@ -372,7 +421,7 @@ export async function executeHooksParallel(
     const hook = hooks[i];
     if (!result || !hook) continue;
 
-    // For exit 0, try to parse JSON for additionalContext (matching Claude Code behavior)
+    // For exit 0, try to parse JSON for additionalContext
     if (result.exitCode === HookExitCode.ALLOW && result.stdout?.trim()) {
       try {
         const json = JSON.parse(result.stdout.trim());
@@ -387,11 +436,11 @@ export async function executeHooksParallel(
       }
     }
 
-    // Format: [command]: {stderr} per spec
+    // Collect feedback from stderr when hook blocks
     if (result.exitCode === HookExitCode.BLOCK) {
       blocked = true;
       if (result.stderr) {
-        feedback.push(`[${hook.command}]: ${result.stderr}`);
+        feedback.push(`[${getHookIdentifier(hook)}]: ${result.stderr}`);
       }
     }
     if (result.exitCode === HookExitCode.ERROR) {

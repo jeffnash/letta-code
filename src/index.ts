@@ -6,15 +6,12 @@ import type { Message } from "@letta-ai/letta-client/resources/agents/messages";
 import { getResumeData, type ResumeData } from "./agent/check-approval";
 import { getClient } from "./agent/client";
 import {
-  getMemoryBlockSupport,
-  initializeLoadedSkillsFlag,
   setAgentContext,
   setConversationId as setContextConversationId,
 } from "./agent/context";
 import type { AgentProvenance } from "./agent/create";
 import { getLettaCodeHeaders } from "./agent/http-headers";
-import { ensureSkillsBlocks, ISOLATED_BLOCK_LABELS } from "./agent/memory";
-import { validatePromptAssets } from "./agent/promptAssets";
+import { ISOLATED_BLOCK_LABELS } from "./agent/memory";
 import { LETTA_CLOUD_API_URL } from "./auth/oauth";
 import { ConversationSelector } from "./cli/components/ConversationSelector";
 import type { ApprovalRequest } from "./cli/helpers/stream";
@@ -28,8 +25,6 @@ import { clearSkillBlockCache } from "./tools/impl/Skill";
 import { markMilestone } from "./utils/timing";
 
 // Validate bundled prompt assets early - throws if build is corrupted
-validatePromptAssets();
-
 function printHelp() {
   // Keep this plaintext (no colors) so output pipes cleanly
   const usage = `
@@ -78,8 +73,8 @@ OPTIONS
                         Emit stream_event wrappers for each chunk (stream-json only)
   --from-agent <id>     Inject agent-to-agent system reminder (headless mode)
   --skills <path>       Custom path to skills directory (default: .skills in current directory)
-  --sleeptime           Enable sleeptime memory management (only for new agents)
-  --from-af <path>      Create agent from an AgentFile (.af) template
+  --import <path>       Create agent from an AgentFile (.af) template
+                        Use @author/name to import from the agent registry
   --memfs               Enable memory filesystem for this agent
   --no-memfs            Disable memory filesystem for this agent
   --show-subagents      Don't hide subagents created by the Task tool
@@ -421,6 +416,7 @@ async function main(): Promise<void> {
         agent: { type: "string", short: "a" },
         name: { type: "string", short: "n" },
         model: { type: "string", short: "m" },
+        embedding: { type: "string" },
         system: { type: "string", short: "s" },
         "system-custom": { type: "string" },
         "system-append": { type: "string" },
@@ -439,13 +435,16 @@ async function main(): Promise<void> {
         "include-partial-messages": { type: "boolean" },
         "from-agent": { type: "string" },
         skills: { type: "string" },
-        sleeptime: { type: "boolean" },
+        "pre-load-skills": { type: "string" },
         "from-af": { type: "string" },
-        "no-skills": { type: "boolean" },
+        import: { type: "string" },
+        tags: { type: "string" },
+
         memfs: { type: "boolean" },
         "no-memfs": { type: "boolean" },
         "show-subagents": { type: "boolean" },
         "no-subagent-max-turns": { type: "boolean" },
+        "no-skills": { type: "boolean" },
         "max-turns": { type: "string" },
       },
       strict: true,
@@ -555,12 +554,14 @@ async function main(): Promise<void> {
     (values["memory-blocks"] as string | undefined) ?? undefined;
   const specifiedToolset = (values.toolset as string | undefined) ?? undefined;
   const skillsDirectory = (values.skills as string | undefined) ?? undefined;
-  const sleeptimeFlag = (values.sleeptime as boolean | undefined) ?? undefined;
   const memfsFlag = values.memfs as boolean | undefined;
   const noMemfsFlag = values["no-memfs"] as boolean | undefined;
   const showSubagentsFlag = values["show-subagents"] as boolean | undefined;
   const noSubagentMaxTurnsFlag = values["no-subagent-max-turns"] as boolean | undefined;
-  const fromAfFile = values["from-af"] as string | undefined;
+  const noSkillsFlag = values["no-skills"] as boolean | undefined;
+  const fromAfFile =
+    (values.import as string | undefined) ??
+    (values["from-af"] as string | undefined);
   const isHeadless = values.prompt || values.run || !process.stdin.isTTY;
 
   // Fail if an unknown command/argument is passed (and we're not in headless mode where it might be a prompt)
@@ -700,7 +701,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     if (fromAfFile) {
-      console.error("Error: --conversation cannot be used with --from-af");
+      console.error("Error: --conversation cannot be used with --import");
       process.exit(1);
     }
     if (shouldResume) {
@@ -729,31 +730,49 @@ async function main(): Promise<void> {
     }
   }
 
-  // Validate --from-af flag
+  // Validate --import flag (also accepts legacy --from-af)
+  // Detect if it's a registry handle (e.g., @author/name) or a local file path
+  let isRegistryImport = false;
   if (fromAfFile) {
     if (specifiedAgentId) {
-      console.error("Error: --from-af cannot be used with --agent");
+      console.error("Error: --import cannot be used with --agent");
       process.exit(1);
     }
     if (specifiedAgentName) {
-      console.error("Error: --from-af cannot be used with --name");
+      console.error("Error: --import cannot be used with --name");
       process.exit(1);
     }
     if (shouldResume) {
-      console.error("Error: --from-af cannot be used with --resume");
+      console.error("Error: --import cannot be used with --resume");
       process.exit(1);
     }
     if (forceNew) {
-      console.error("Error: --from-af cannot be used with --new-agent");
+      console.error("Error: --import cannot be used with --new");
       process.exit(1);
     }
-    // Verify file exists
-    const { resolve } = await import("node:path");
-    const { existsSync } = await import("node:fs");
-    const resolvedPath = resolve(fromAfFile);
-    if (!existsSync(resolvedPath)) {
-      console.error(`Error: AgentFile not found: ${resolvedPath}`);
-      process.exit(1);
+
+    // Check if this looks like a registry handle (@author/name)
+    if (fromAfFile.startsWith("@")) {
+      // Definitely a registry handle
+      isRegistryImport = true;
+      // Validate handle format
+      const normalized = fromAfFile.slice(1);
+      const parts = normalized.split("/");
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        console.error(
+          `Error: Invalid registry handle "${fromAfFile}". Use format: letta --import @author/agentname`,
+        );
+        process.exit(1);
+      }
+    } else {
+      // Local file - verify it exists
+      const { resolve } = await import("node:path");
+      const { existsSync } = await import("node:fs");
+      const resolvedPath = resolve(fromAfFile);
+      if (!existsSync(resolvedPath)) {
+        console.error(`Error: AgentFile not found: ${resolvedPath}`);
+        process.exit(1);
+      }
     }
   }
 
@@ -945,7 +964,12 @@ async function main(): Promise<void> {
     markMilestone("TOOLS_LOADED");
 
     const { handleHeadlessCommand } = await import("./headless");
-    await handleHeadlessCommand(process.argv, specifiedModel, skillsDirectory);
+    await handleHeadlessCommand(
+      process.argv,
+      specifiedModel,
+      skillsDirectory,
+      noSkillsFlag,
+    );
     return;
   }
 
@@ -985,6 +1009,7 @@ async function main(): Promise<void> {
     toolset,
     skillsDirectory,
     fromAfFile,
+    isRegistryImport,
   }: {
     continueSession: boolean;
     forceNew: boolean;
@@ -996,6 +1021,7 @@ async function main(): Promise<void> {
     toolset?: "codex" | "default" | "gemini";
     skillsDirectory?: string;
     fromAfFile?: string;
+    isRegistryImport?: boolean;
   }) {
     const [showKeybindingSetup, setShowKeybindingSetup] = useState<
       boolean | null
@@ -1141,7 +1167,6 @@ async function main(): Promise<void> {
         // Load settings
         await settingsManager.loadLocalProjectSettings();
         const localSettings = settingsManager.getLocalProjectSettings();
-        const globalPinned = settingsManager.getGlobalPinnedAgents();
         const client = await getClient();
 
         // For self-hosted servers, pre-fetch available models
@@ -1324,63 +1349,89 @@ async function main(): Promise<void> {
 
         // =====================================================================
         // DEFAULT PATH: No special flags
-        // Check local LRU, then selector, then defaults
+        // Check local LRU → global LRU → selector → create default
         // =====================================================================
 
-        // Check if user would see selector (fresh dir, no bypass flags)
-        const wouldShowSelector =
-          !localSettings.lastAgent && !forceNew && !agentIdArg && !fromAfFile;
+        // Short-circuit: flags handled by init() skip resolution entirely
+        if (forceNew || agentIdArg || fromAfFile) {
+          setLoadingState("assembling");
+          return;
+        }
 
-        if (
-          wouldShowSelector &&
-          globalPinned.length === 0 &&
-          !needsModelPicker
-        ) {
-          // New user with no pinned agents - create a fresh Memo agent
-          // NOTE: Always creates a new agent (no server-side tag lookup) to avoid
-          // picking up agents created by other users on shared orgs.
-          // Skip if needsModelPicker is true - let user select a model first.
-          const { ensureDefaultAgents } = await import("./agent/defaults");
+        // Step 1: Check local project LRU (session helpers centralize legacy fallback)
+        const localAgentId = settingsManager.getLocalLastAgentId(process.cwd());
+        let localAgentExists = false;
+        if (localAgentId) {
           try {
-            const memoAgent = await ensureDefaultAgents(client);
-            if (memoAgent) {
-              setSelectedGlobalAgentId(memoAgent.id);
-              setLoadingState("assembling");
-              return;
-            }
-            // If memoAgent is null (createDefaultAgents disabled), fall through
-          } catch (err) {
-            console.error(
-              `Failed to create default agents: ${err instanceof Error ? err.message : String(err)}`,
+            await client.agents.retrieve(localAgentId);
+            localAgentExists = true;
+          } catch {
+            setFailedAgentMessage(
+              `Unable to locate recently used agent ${localAgentId}`,
             );
-            process.exit(1);
           }
         }
 
-        // If there's a local LRU, use it directly (takes priority over model picker)
-        if (localSettings.lastAgent) {
+        // Step 2: Check global LRU (covers directory-switching case)
+        const globalAgentId = settingsManager.getGlobalLastAgentId();
+        let globalAgentExists = false;
+        if (globalAgentId && globalAgentId !== localAgentId) {
           try {
-            await client.agents.retrieve(localSettings.lastAgent);
+            await client.agents.retrieve(globalAgentId);
+            globalAgentExists = true;
+          } catch {
+            // Global agent doesn't exist either
+          }
+        } else if (globalAgentId && globalAgentId === localAgentId) {
+          globalAgentExists = localAgentExists;
+        }
+
+        // Step 3: Resolve startup target using pure decision logic
+        const mergedPinned = settingsManager.getMergedPinnedAgents(
+          process.cwd(),
+        );
+        const { resolveStartupTarget } = await import(
+          "./agent/resolve-startup-agent"
+        );
+        const target = resolveStartupTarget({
+          localAgentId,
+          localConversationId: null, // DEFAULT PATH always uses default conv
+          localAgentExists,
+          globalAgentId,
+          globalAgentExists,
+          mergedPinnedCount: mergedPinned.length,
+          forceNew: false, // forceNew short-circuited above
+          needsModelPicker,
+        });
+
+        switch (target.action) {
+          case "resume":
+            setSelectedGlobalAgentId(target.agentId);
+            // Don't set selectedConversationId — DEFAULT PATH uses default conv.
+            // Conversation restoration is handled by --continue path instead.
             setLoadingState("assembling");
             return;
-          } catch {
-            // LRU agent doesn't exist, show message and fall through to selector
-            setFailedAgentMessage(
-              `Unable to locate recently used agent ${localSettings.lastAgent}`,
-            );
+          case "select":
+            setLoadingState("selecting_global");
+            return;
+          case "create": {
+            const { ensureDefaultAgents } = await import("./agent/defaults");
+            try {
+              const defaultAgent = await ensureDefaultAgents(client);
+              if (defaultAgent) {
+                setSelectedGlobalAgentId(defaultAgent.id);
+                setLoadingState("assembling");
+                return;
+              }
+              // If null (createDefaultAgents disabled), fall through
+            } catch (err) {
+              console.error(
+                `Failed to create default agent: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              process.exit(1);
+            }
+            break;
           }
-        }
-
-        // On self-hosted with unavailable default model, show selector to pick a model
-        if (needsModelPicker) {
-          setLoadingState("selecting_global");
-          return;
-        }
-
-        // Show selector if there are pinned agents to choose from
-        if (wouldShowSelector && globalPinned.length > 0) {
-          setLoadingState("selecting_global");
-          return;
         }
 
         setLoadingState("assembling");
@@ -1483,23 +1534,46 @@ async function main(): Promise<void> {
         const { getModelUpdateArgs } = await import("./agent/model");
 
         let agent: AgentState | null = null;
-        let isNewlyCreatedAgent = false;
 
-        // Priority 1: Import from AgentFile template
+        // Priority 1: Import from AgentFile template (local file or registry)
         if (fromAfFile) {
           setLoadingState("importing");
-          const { importAgentFromFile } = await import("./agent/import");
-          const result = await importAgentFromFile({
-            filePath: fromAfFile,
-            modelOverride: model,
-            stripMessages: true,
-          });
+          let result: { agent: AgentState; skills?: string[] };
+
+          if (isRegistryImport) {
+            // Import from letta-ai/agent-file registry
+            const { importAgentFromRegistry } = await import("./agent/import");
+            result = await importAgentFromRegistry({
+              handle: fromAfFile,
+              modelOverride: model,
+              stripMessages: true,
+              stripSkills: false,
+            });
+          } else {
+            // Import from local file
+            const { importAgentFromFile } = await import("./agent/import");
+            result = await importAgentFromFile({
+              filePath: fromAfFile,
+              modelOverride: model,
+              stripMessages: true,
+              stripSkills: false,
+            });
+          }
+
           agent = result.agent;
-          isNewlyCreatedAgent = true;
           setAgentProvenance({
             isNew: true,
             blocks: [],
           });
+
+          // Display extracted skills summary
+          if (result.skills && result.skills.length > 0) {
+            const { getAgentSkillsDir } = await import("./agent/skills");
+            const skillsDir = getAgentSkillsDir(agent.id);
+            console.log(
+              `\n📦 Extracted ${result.skills.length} skill${result.skills.length === 1 ? "" : "s"} to ${skillsDir}: ${result.skills.join(", ")}\n`,
+            );
+          }
         }
 
         // Priority 2: Try to use --agent specified ID
@@ -1577,21 +1651,23 @@ async function main(): Promise<void> {
           }
 
           const updateArgs = getModelUpdateArgs(effectiveModel);
-          const result = await createAgent(
-            undefined,
-            effectiveModel,
-            undefined,
+          const result = await createAgent({
+            model: effectiveModel,
             updateArgs,
             skillsDirectory,
-            true, // parallelToolCalls always enabled
-            sleeptimeFlag ?? settings.enableSleeptime,
+            parallelToolCalls: true,
             systemPromptPreset,
             initBlocks,
             baseTools,
-          );
+          });
           agent = result.agent;
-          isNewlyCreatedAgent = true;
           setAgentProvenance(result.provenance);
+
+          // Enable memfs by default on Letta Cloud for new agents
+          const { enableMemfsIfCloud } = await import(
+            "./agent/memoryFilesystem"
+          );
+          await enableMemfsIfCloud(agent.id);
         }
 
         // Priority 4: Try to resume from project settings LRU (.letta/settings.local.json)
@@ -1656,68 +1732,37 @@ async function main(): Promise<void> {
         settingsManager.updateLocalProjectSettings({ lastAgent: agent.id });
         settingsManager.updateSettings({ lastAgent: agent.id });
 
-        // Ensure the agent has the required skills blocks (for backwards compatibility)
-        const createdBlocks = await ensureSkillsBlocks(agent.id);
-        if (createdBlocks.length > 0) {
-          console.log("Created missing skills blocks for agent compatibility");
+        // Migration (LET-7353): Remove legacy skills/loaded_skills blocks
+        // These blocks are no longer used - skills are now injected via system reminders
+        for (const label of ["skills", "loaded_skills"]) {
+          try {
+            const block = await client.agents.blocks.retrieve(label, {
+              agent_id: agent.id,
+            });
+            if (block) {
+              await client.agents.blocks.detach(block.id, {
+                agent_id: agent.id,
+              });
+              await client.blocks.delete(block.id);
+            }
+          } catch {
+            // Block doesn't exist or already removed, skip
+          }
         }
 
         // Set agent context for tools that need it (e.g., Skill tool)
-        setAgentContext(agent.id, skillsDirectory);
+        setAgentContext(agent.id, skillsDirectory, noSkillsFlag);
 
-        // Only touch skills-related blocks if they're actually present on the agent.
-        // Some subagents are spawned with a restricted memory block set.
-        const { supportsSkills, supportsLoadedSkills } =
-          getMemoryBlockSupport(agent);
-
-        // Apply memfs flag if specified, or enable by default for new agents
+        // Apply memfs flag if explicitly specified (memfs is opt-in via /memfs enable or --memfs)
         const isSubagent = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
-        if (memfsFlag) {
-          settingsManager.setMemfsEnabled(agent.id, true);
-        } else if (noMemfsFlag) {
-          settingsManager.setMemfsEnabled(agent.id, false);
-        } else if (isNewlyCreatedAgent && !isSubagent) {
-          // Enable memfs by default for newly created agents (but not subagents)
-          settingsManager.setMemfsEnabled(agent.id, true);
+        try {
+          const { applyMemfsFlags } = await import("./agent/memoryFilesystem");
+          await applyMemfsFlags(agent.id, memfsFlag, noMemfsFlag);
+        } catch (error) {
+          console.error(error instanceof Error ? error.message : String(error));
+          process.exit(1);
         }
 
-        // Fire-and-forget: Initialize loaded skills flag (LET-7101)
-        // Don't await - this is just for the skill unload reminder
-        if (supportsLoadedSkills) {
-          initializeLoadedSkillsFlag().catch(() => {
-            // Ignore errors - not critical
-          });
-        }
-
-        // Fire-and-forget: Sync skills in background (LET-7101)
-        // This ensures new skills added after agent creation are available
-        // Don't await - user can start typing immediately
-        if (supportsSkills) {
-          (async () => {
-            try {
-              const { syncSkillsToAgent, SKILLS_DIR } = await import(
-                "./agent/skills"
-              );
-              const { join } = await import("node:path");
-
-              const resolvedSkillsDirectory =
-                skillsDirectory || join(process.cwd(), SKILLS_DIR);
-
-              await syncSkillsToAgent(
-                client,
-                agent.id,
-                resolvedSkillsDirectory,
-                {
-                  skipIfUnchanged: true,
-                },
-              );
-            } catch (error) {
-              console.warn(
-                `[skills] Background sync failed: ${error instanceof Error ? error.message : String(error)}`,
-              );
-            }
-          })();
-        }
 
         // Check if we're resuming an existing agent
         // We're resuming if:
@@ -2054,6 +2099,7 @@ async function main(): Promise<void> {
         messageHistory: resumeData?.messageHistory ?? EMPTY_MESSAGE_ARRAY,
         resumedExistingConversation,
         tokenStreaming: settings.tokenStreaming,
+        showCompactions: settings.showCompactions,
         agentProvenance,
         releaseNotes,
       });
@@ -2070,6 +2116,7 @@ async function main(): Promise<void> {
       messageHistory: resumeData?.messageHistory ?? EMPTY_MESSAGE_ARRAY,
       resumedExistingConversation,
       tokenStreaming: settings.tokenStreaming,
+      showCompactions: settings.showCompactions,
       agentProvenance,
       releaseNotes,
     });
@@ -2088,6 +2135,7 @@ async function main(): Promise<void> {
       toolset: specifiedToolset as "codex" | "default" | "gemini" | undefined,
       skillsDirectory: skillsDirectory,
       fromAfFile: fromAfFile,
+      isRegistryImport: isRegistryImport,
     }),
     {
       exitOnCtrlC: false, // We handle CTRL-C manually with double-press guard

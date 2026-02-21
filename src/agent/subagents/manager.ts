@@ -23,13 +23,14 @@ import { cliPermissions } from "../../permissions/cli";
 import { permissionMode } from "../../permissions/mode";
 import { sessionPermissions } from "../../permissions/session";
 import { settingsManager } from "../../settings-manager";
-import { preloadSkillsContent } from "../../tools/impl/Skill";
+
 import { getErrorMessage } from "../../utils/error";
 import { getAvailableModelHandles } from "../available-models";
 import { getClient } from "../client";
 import { getCurrentAgentId } from "../context";
 import { getDefaultModel, resolveModel, resolveModelAsync } from "../model";
 import { SKILLS_DIR } from "../skills";
+
 import { getAllSubagentConfigs, type SubagentConfig } from ".";
 
 // ============================================================================
@@ -636,7 +637,6 @@ function buildSubagentArgs(
   userPrompt: string,
   existingAgentId?: string,
   existingConversationId?: string,
-  preloadedSkillsContent?: string,
   maxTurns?: number,
 ): string[] {
   const args: string[] = [];
@@ -656,8 +656,6 @@ function buildSubagentArgs(
     }
     // Don't pass --system (existing agent keeps its prompt)
     // Don't pass --model (existing agent keeps its model)
-    // Skip skills block operations (existing agent may not have standard blocks)
-    args.push("--no-skills");
   } else {
     // Create new agent (original behavior)
     args.push("--new-agent", "--system", type);
@@ -719,14 +717,14 @@ function buildSubagentArgs(
     args.push("--tools", config.allowedTools.join(","));
   }
 
-  // Add pre-loaded skills content if provided (only for new agents)
-  if (!isDeployingExisting && preloadedSkillsContent) {
-    args.push("--block-value", `loaded_skills=${preloadedSkillsContent}`);
-  }
-
   // Add max turns limit if specified
   if (maxTurns !== undefined && maxTurns > 0) {
     args.push("--max-turns", String(maxTurns));
+  }
+
+  // Pre-load skills specified in the subagent config
+  if (config.skills.length > 0) {
+    args.push("--pre-load-skills", config.skills.join(","));
   }
 
   return args;
@@ -777,23 +775,13 @@ async function executeSubagent(
   }
 
   try {
-    // Pre-load skills if configured
-    let preloadedSkillsContent: string | undefined;
-    if (config.skills && config.skills.length > 0) {
-      preloadedSkillsContent = await preloadSkillsContent(
-        config.skills,
-        SKILLS_DIR,
-      );
-    }
-
-    const cliArgs = buildSubagentArgs(
+    let cliArgs = buildSubagentArgs(
       type,
       config,
       model,
       userPrompt,
       existingAgentId,
       existingConversationId,
-      preloadedSkillsContent,
       maxTurns,
     );
 
@@ -801,14 +789,19 @@ async function executeSubagent(
     // Use the same binary as the current process, with fallbacks:
     // 1. LETTA_CODE_BIN env var (explicit override)
     // 2. Current process argv[1] if it's a .js file (built letta.js)
-    // 3. ./letta.js if running from dev (src/index.ts)
+    // 3. Dev mode: use process.execPath (bun) with the .ts script as first arg
     // 4. "letta" (global install)
     const currentScript = process.argv[1] || "";
-    const lettaCmd =
+    let lettaCmd =
       process.env.LETTA_CODE_BIN ||
       (currentScript.endsWith(".js") ? currentScript : null) ||
-      (currentScript.includes("src/index.ts") ? "./letta.js" : null) ||
       "letta";
+    // In dev mode (running .ts file via bun), use the runtime binary directly
+    // and prepend the script path to the CLI args
+    if (currentScript.endsWith(".ts") && !process.env.LETTA_CODE_BIN) {
+      lettaCmd = process.execPath; // e.g., /path/to/bun
+      cliArgs = [currentScript, ...cliArgs];
+    }
     // Pass parent agent ID so subagents can access parent's context (e.g., search history)
     let parentAgentId: string | undefined;
     try {
@@ -817,10 +810,20 @@ async function executeSubagent(
       // Context not available
     }
 
+    // Resolve auth once in parent and forward to child to avoid per-subagent
+    // keychain lookups under high parallel fan-out.
+    const settings = await settingsManager.getSettingsWithSecureTokens();
+    const inheritedApiKey =
+      process.env.LETTA_API_KEY || settings.env?.LETTA_API_KEY;
+    const inheritedBaseUrl =
+      process.env.LETTA_BASE_URL || settings.env?.LETTA_BASE_URL;
+
     const proc = spawn(lettaCmd, cliArgs, {
       cwd: process.cwd(),
       env: {
         ...process.env,
+        ...(inheritedApiKey && { LETTA_API_KEY: inheritedApiKey }),
+        ...(inheritedBaseUrl && { LETTA_BASE_URL: inheritedBaseUrl }),
         // Tag Task-spawned agents for easy filtering.
         LETTA_CODE_AGENT_ROLE: "subagent",
         // Pass parent agent ID for subagents that need to access parent's context
@@ -940,12 +943,15 @@ async function executeSubagent(
         }
       }
 
+      const propagatedError = state.finalError?.trim();
+      const fallbackError = stderr || `Subagent exited with code ${exitCode}`;
+
       return {
         agentId: state.agentId || "",
         conversationId: state.conversationId || undefined,
         report: "",
         success: false,
-        error: stderr || `Subagent exited with code ${exitCode}`,
+        error: propagatedError || fallbackError,
       };
     }
 

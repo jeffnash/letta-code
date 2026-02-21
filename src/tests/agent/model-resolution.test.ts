@@ -192,9 +192,9 @@ describe("isDynamicModel", () => {
   test("should return false for static model", () => {
     expect(isDynamicModel("sonnet-4.5")).toBe(false);
     expect(isDynamicModel("anthropic/claude-sonnet-4-5-20250929")).toBe(false);
-    // zai-glm-4.7 is now in models.json, so it's static
-    expect(isDynamicModel("zai-glm-4.7")).toBe(false);
-    expect(isDynamicModel("cliproxy/zai-glm-4.7")).toBe(false);
+    // glm-4.7 is now in models.json, so it's static
+    expect(isDynamicModel("glm-4.7")).toBe(false);
+    expect(isDynamicModel("zai/glm-4.7")).toBe(false);
   });
 
   test("should return true for dynamic model", () => {

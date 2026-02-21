@@ -2,13 +2,27 @@
  * SubagentGroupDisplay - Live/interactive subagent status display
  *
  * Used in the ACTIVE render area for subagents that may still be running.
+ * Subscribes to external store and handles keyboard input - these hooks
+ * require the component to stay "alive" and re-rendering.
+ *
+ * Features:
+ * - Real-time updates via useSyncExternalStore
+ * - Single blinking dot in header while running
+ * - Expand/collapse tool calls (ctrl+o)
+ * - Shows "Running N subagents..." while active
+ *
+ * When agents complete, they get committed to Ink's <Static> area using
+ * SubagentGroupStatic instead (a pure props-based snapshot with no hooks).
  */
 
 import { Box, useInput } from "ink";
-import Link from "ink-link";
 import { memo, useSyncExternalStore } from "react";
 import { useAnimation } from "../contexts/AnimationContext.js";
-import { formatStats, getTreeChars } from "../helpers/subagentDisplay.js";
+import {
+  formatStats,
+  getSubagentModelDisplay,
+  getTreeChars,
+} from "../helpers/subagentDisplay.js";
 import {
   getSnapshot,
   type SubagentState,
@@ -19,8 +33,6 @@ import { useTerminalWidth } from "../hooks/useTerminalWidth.js";
 import { BlinkDot } from "./BlinkDot.js";
 import { colors } from "./colors.js";
 import { Text } from "./Text";
-
-const isTmux = Boolean(process.env.TMUX);
 
 function formatToolArgs(argsStr: string): string {
   try {
@@ -45,14 +57,9 @@ function formatToolArgs(argsStr: string): string {
   }
 }
 
-function formatAgentIds(agent: SubagentState): string {
-  const ids = [
-    agent.taskId,
-    agent.agentId,
-    agent.conversationId,
-  ].filter(Boolean) as string[];
-  return ids.join(" · ");
-}
+// ============================================================================
+// Subcomponents
+// ============================================================================
 
 interface AgentRowProps {
   agent: SubagentState;
@@ -65,26 +72,31 @@ const AgentRow = memo(
   ({ agent, isLast, expanded, condensed = false }: AgentRowProps) => {
     const { treeChar, continueChar } = getTreeChars(isLast);
     const columns = useTerminalWidth();
-    const gutterWidth = 8;
+    const gutterWidth = 8; // indent (3) + continueChar (2) + status indent (3)
     const contentWidth = Math.max(0, columns - gutterWidth);
 
     const isRunning = agent.status === "pending" || agent.status === "running";
     const shouldDim = isRunning && !agent.isBackground;
+    const showStats = !(agent.isBackground && isRunning);
+    const hideBackgroundStatusLine =
+      agent.isBackground && isRunning && !agent.agentURL;
     const stats = formatStats(
       agent.toolCalls.length,
       agent.totalTokens,
       isRunning,
     );
-    const ids = formatAgentIds(agent);
-    const modelLabel = agent.model ? `Model: ${agent.model}` : "";
-    const subagentLabel = `Subagent: ${agent.type.toLowerCase()}`;
+    const modelDisplay = getSubagentModelDisplay(agent.model);
     const lastTool = agent.toolCalls[agent.toolCalls.length - 1];
 
+    // Condensed mode: simplified view to reduce re-renders when overflowing
+    // Shows: "Description · type · model" + "Running..." or "Done"
+    // Full details are shown in SubagentGroupStatic when flushed to static area
     if (condensed) {
       const isComplete =
         agent.status === "completed" || agent.status === "error";
       return (
         <Box flexDirection="column">
+          {/* Main row: tree char + description + type + model (no stats) */}
           <Box flexDirection="row">
             <Text>
               <Text color={colors.subagent.treeChar}>
@@ -95,78 +107,54 @@ const AgentRow = memo(
                 {agent.description}
               </Text>
               <Text dimColor>
-                {agent.taskId ? ` · ${agent.taskId}` : ""}
+                {" · "}
+                {agent.type.toLowerCase()}
               </Text>
+              {modelDisplay && (
+                <>
+                  <Text dimColor>{` · ${modelDisplay.label}`}</Text>
+                  {modelDisplay.isByokProvider && (
+                    <Text
+                      color={
+                        modelDisplay.isOpenAICodexProvider
+                          ? "#74AA9C"
+                          : "yellow"
+                      }
+                    >
+                      {" ▲"}
+                    </Text>
+                  )}
+                </>
+              )}
             </Text>
           </Box>
-
-          <Box flexDirection="row">
-            <Text color={colors.subagent.treeChar}>
-              {"   "}
-              {continueChar} ⎿{" "}
-            </Text>
-            <Text dimColor>{subagentLabel}</Text>
-          </Box>
-
-          {modelLabel && (
+          {/* Simple status line */}
+          {!hideBackgroundStatusLine && (
             <Box flexDirection="row">
               <Text color={colors.subagent.treeChar}>
                 {"   "}
-                {continueChar} ⎿{" "}
+                {continueChar}
               </Text>
-              <Text dimColor>{modelLabel}</Text>
-            </Box>
-          )}
-
-          {agent.agentURL && (
-            <Box flexDirection="row">
-              <Text color={colors.subagent.treeChar}>
-                {"   "}
-                {continueChar} ⎿{" "}
-              </Text>
-              {!isTmux ? (
-                <Link url={agent.agentURL}>
-                  <Text dimColor>Agent ↗</Text>
-                </Link>
+              <Text dimColor>{"   "}</Text>
+              {agent.status === "error" ? (
+                <Text color={colors.subagent.error}>Error</Text>
+              ) : isComplete ? (
+                <Text dimColor>Done</Text>
+              ) : agent.isBackground ? (
+                <Text dimColor>Running in the background</Text>
               ) : (
-                <Text dimColor>{agent.agentURL}</Text>
+                <Text dimColor>Running...</Text>
               )}
             </Box>
           )}
-
-          {ids && (
-            <Box flexDirection="row">
-              <Text color={colors.subagent.treeChar}>
-                {"   "}
-                {continueChar} ⎿{" "}
-              </Text>
-              <Text dimColor>{"IDs: "}</Text>
-              <Text dimColor>{ids}</Text>
-            </Box>
-          )}
-
-          <Box flexDirection="row">
-            <Text color={colors.subagent.treeChar}>
-              {"   "}
-              {continueChar}
-            </Text>
-            <Text dimColor>{"   "}</Text>
-            {agent.status === "error" ? (
-              <Text color={colors.subagent.error}>Error</Text>
-            ) : isComplete ? (
-              <Text dimColor>Done</Text>
-            ) : agent.isBackground ? (
-              <Text dimColor>Running in the background</Text>
-            ) : (
-              <Text dimColor>Running...</Text>
-            )}
-          </Box>
         </Box>
       );
     }
 
+    // Full mode: all details including live tool calls
     return (
       <Box flexDirection="column">
+        {/* Main row: tree char + description + type + model + stats */}
         <Box flexDirection="row">
           <Text>
             <Text color={colors.subagent.treeChar}>
@@ -178,56 +166,44 @@ const AgentRow = memo(
             </Text>
             <Text dimColor>
               {" · "}
-              {stats}
+              {agent.type.toLowerCase()}
             </Text>
+            {modelDisplay && (
+              <>
+                <Text dimColor>{` · ${modelDisplay.label}`}</Text>
+                {modelDisplay.isByokProvider && (
+                  <Text
+                    color={
+                      modelDisplay.isOpenAICodexProvider ? "#74AA9C" : "yellow"
+                    }
+                  >
+                    {" ▲"}
+                  </Text>
+                )}
+              </>
+            )}
+            {showStats && (
+              <Text dimColor>
+                {" · "}
+                {stats}
+              </Text>
+            )}
           </Text>
         </Box>
 
-        <Box flexDirection="row">
-          <Text color={colors.subagent.treeChar}>
-            {"   "}
-            {continueChar} ⎿{" "}
-          </Text>
-          <Text dimColor>{subagentLabel}</Text>
-        </Box>
-
-        {modelLabel && (
-          <Box flexDirection="row">
-            <Text color={colors.subagent.treeChar}>
-              {"   "}
-              {continueChar} ⎿{" "}
-            </Text>
-            <Text dimColor>{modelLabel}</Text>
-          </Box>
-        )}
-
+        {/* Subagent URL */}
         {agent.agentURL && (
           <Box flexDirection="row">
             <Text color={colors.subagent.treeChar}>
               {"   "}
               {continueChar} ⎿{" "}
             </Text>
-            {!isTmux ? (
-              <Link url={agent.agentURL}>
-                <Text dimColor>Agent ↗</Text>
-              </Link>
-            ) : (
-              <Text dimColor>{agent.agentURL}</Text>
-            )}
+            <Text dimColor>{"Subagent: "}</Text>
+            <Text dimColor>{agent.agentURL}</Text>
           </Box>
         )}
 
-        {ids && (
-          <Box flexDirection="row">
-            <Text color={colors.subagent.treeChar}>
-              {"   "}
-              {continueChar} ⎿{" "}
-            </Text>
-            <Text dimColor>{"IDs: "}</Text>
-            <Text dimColor>{ids}</Text>
-          </Box>
-        )}
-
+        {/* Expanded: show all tool calls */}
         {expanded &&
           agent.toolCalls.map((tc) => {
             const formattedArgs = formatToolArgs(tc.args);
@@ -245,61 +221,64 @@ const AgentRow = memo(
             );
           })}
 
-        <Box flexDirection="row">
-          {agent.status === "completed" ? (
-            <>
-              <Text color={colors.subagent.treeChar}>
-                {"   "}
-                {continueChar}
-              </Text>
-              <Text dimColor>{"   Done"}</Text>
-            </>
-          ) : agent.status === "error" ? (
-            <>
-              <Box width={gutterWidth} flexShrink={0}>
-                <Text>
-                  <Text color={colors.subagent.treeChar}>
-                    {"   "}
-                    {continueChar}
+        {/* Status line */}
+        {!hideBackgroundStatusLine && (
+          <Box flexDirection="row">
+            {agent.status === "completed" ? (
+              <>
+                <Text color={colors.subagent.treeChar}>
+                  {"   "}
+                  {continueChar}
+                </Text>
+                <Text dimColor>{"   Done"}</Text>
+              </>
+            ) : agent.status === "error" ? (
+              <>
+                <Box width={gutterWidth} flexShrink={0}>
+                  <Text>
+                    <Text color={colors.subagent.treeChar}>
+                      {"   "}
+                      {continueChar}
+                    </Text>
+                    <Text dimColor>{"   "}</Text>
                   </Text>
-                  <Text dimColor>{"   "}</Text>
+                </Box>
+                <Box flexGrow={1} width={contentWidth}>
+                  <Text wrap="wrap" color={colors.subagent.error}>
+                    {agent.error}
+                  </Text>
+                </Box>
+              </>
+            ) : agent.isBackground ? (
+              <Text>
+                <Text color={colors.subagent.treeChar}>
+                  {"   "}
+                  {continueChar}
                 </Text>
-              </Box>
-              <Box flexGrow={1} width={contentWidth}>
-                <Text wrap="wrap" color={colors.subagent.error}>
-                  {agent.error}
+                <Text dimColor>{"   Running in the background"}</Text>
+              </Text>
+            ) : lastTool ? (
+              <>
+                <Text color={colors.subagent.treeChar}>
+                  {"   "}
+                  {continueChar}
                 </Text>
-              </Box>
-            </>
-          ) : agent.isBackground ? (
-            <>
-              <Text color={colors.subagent.treeChar}>
-                {"   "}
-                {continueChar}
-              </Text>
-              <Text dimColor>{"   Running in the background"}</Text>
-            </>
-          ) : lastTool ? (
-            <>
-              <Text color={colors.subagent.treeChar}>
-                {"   "}
-                {continueChar}
-              </Text>
-              <Text dimColor>
-                {"   "}
-                {lastTool.name}
-              </Text>
-            </>
-          ) : (
-            <>
-              <Text color={colors.subagent.treeChar}>
-                {"   "}
-                {continueChar}
-              </Text>
-              <Text dimColor>{"   Starting..."}</Text>
-            </>
-          )}
-        </Box>
+                <Text dimColor>
+                  {"   "}
+                  {lastTool.name}
+                </Text>
+              </>
+            ) : (
+              <>
+                <Text color={colors.subagent.treeChar}>
+                  {"   "}
+                  {continueChar}
+                </Text>
+                <Text dimColor>{"   Starting..."}</Text>
+              </>
+            )}
+          </Box>
+        )}
       </Box>
     );
   },
@@ -316,6 +295,7 @@ interface GroupHeaderProps {
 const GroupHeader = memo(
   ({ count, allCompleted, hasErrors, expanded }: GroupHeaderProps) => {
     const hint = expanded ? "(ctrl+o to collapse)" : "(ctrl+o to expand)";
+
     const dotColor = hasErrors
       ? colors.subagent.error
       : colors.subagent.completed;
@@ -330,6 +310,7 @@ const GroupHeader = memo(
         {allCompleted ? (
           <Text color={dotColor}>●</Text>
         ) : (
+          // BlinkDot now gets shouldAnimate from AnimationContext
           <BlinkDot color={runningDotColor} />
         )}
         <Text>
@@ -341,23 +322,33 @@ const GroupHeader = memo(
     );
   },
 );
+
 GroupHeader.displayName = "GroupHeader";
+
+// ============================================================================
+// Main Component
+// ============================================================================
 
 export const SubagentGroupDisplay = memo(() => {
   const { agents, expanded } = useSyncExternalStore(subscribe, getSnapshot);
   const { shouldAnimate } = useAnimation();
 
+  // Handle ctrl+o for expand/collapse
   useInput((input, key) => {
     if (key.ctrl && input === "o") {
       toggleExpanded();
     }
   });
 
+  // Don't render if no agents
   if (agents.length === 0) {
     return null;
   }
 
+  // Use condensed mode when animation is disabled (overflow detected by AnimationContext)
+  // This ensures consistent behavior - when we disable animation, we also simplify the view
   const condensed = !shouldAnimate;
+
   const allCompleted = agents.every(
     (a) => a.status === "completed" || a.status === "error",
   );

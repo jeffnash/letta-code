@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { Message } from "@letta-ai/letta-client/resources/agents/messages";
 import {
+  classifyPreStreamConflict,
+  extractConflictDetail,
+  getPreStreamErrorAction,
   isApprovalPendingError,
   isConversationBusyError,
   isInvalidToolCallIdsError,
+  rebuildInputWithFreshDenials,
 } from "../agent/approval-recovery";
 import { extractApprovals } from "../agent/check-approval";
 
@@ -63,13 +67,21 @@ describe("isApprovalPendingError", () => {
   });
 
   test("detects approval pending error case-insensitively", () => {
-    expect(isApprovalPendingError("CANNOT SEND A NEW MESSAGE")).toBe(true);
-    expect(isApprovalPendingError("cannot send a new message")).toBe(true);
+    expect(isApprovalPendingError("WAITING FOR APPROVAL")).toBe(true);
+    expect(isApprovalPendingError("waiting for approval")).toBe(true);
   });
 
   test("detects partial match in longer message", () => {
-    const detail = "Error occurred: Cannot send a new message while processing";
+    const detail =
+      "Error occurred: agent is waiting for approval while processing";
     expect(isApprovalPendingError(detail)).toBe(true);
+  });
+
+  test("does not misclassify conversation busy conflict as approval pending", () => {
+    const busyDetail =
+      "CONFLICT: Cannot send a new message: Another request is currently being processed for this conversation.";
+    expect(isConversationBusyError(busyDetail)).toBe(true);
+    expect(isApprovalPendingError(busyDetail)).toBe(false);
   });
 
   test("returns false for desync errors (opposite case)", () => {
@@ -135,6 +147,55 @@ describe("isConversationBusyError", () => {
     expect(isConversationBusyError(undefined)).toBe(false);
     expect(isConversationBusyError(123)).toBe(false);
     expect(isConversationBusyError({ detail: REAL_ERROR_DETAIL })).toBe(false);
+  });
+});
+
+describe("classifyPreStreamConflict", () => {
+  test("classifies approval-pending conflict distinctly from busy conflict", () => {
+    const approvalDetail =
+      "CONFLICT: Cannot send a new message: The agent is waiting for approval on a tool call.";
+    const busyDetail =
+      "CONFLICT: Cannot send a new message: Another request is currently being processed for this conversation.";
+
+    expect(classifyPreStreamConflict(approvalDetail)).toBe("approval_pending");
+    expect(classifyPreStreamConflict(busyDetail)).toBe("conversation_busy");
+  });
+
+  test("returns null for non-conflict errors", () => {
+    expect(classifyPreStreamConflict("Rate limit exceeded")).toBeNull();
+  });
+});
+
+describe("getPreStreamErrorAction", () => {
+  test("returns resolve_approval_pending for approval conflict details", () => {
+    const detail =
+      "CONFLICT: Cannot send a new message: The agent is waiting for approval on a tool call.";
+
+    expect(getPreStreamErrorAction(detail, 0, 1)).toBe(
+      "resolve_approval_pending",
+    );
+  });
+
+  test("returns retry_conversation_busy when busy and retries remain", () => {
+    const detail =
+      "CONFLICT: Cannot send a new message: Another request is currently being processed for this conversation.";
+
+    expect(getPreStreamErrorAction(detail, 0, 1)).toBe(
+      "retry_conversation_busy",
+    );
+  });
+
+  test("returns rethrow when conversation busy retries are exhausted", () => {
+    const detail =
+      "CONFLICT: Cannot send a new message: Another request is currently being processed for this conversation.";
+
+    expect(getPreStreamErrorAction(detail, 1, 1)).toBe("rethrow");
+  });
+
+  test("returns rethrow for unrelated errors", () => {
+    expect(getPreStreamErrorAction("Rate limit exceeded", 0, 1)).toBe(
+      "rethrow",
+    );
   });
 });
 
@@ -288,6 +349,208 @@ describe("extractApprovals", () => {
     expect(result.pendingApprovals[0]!.toolCallId).toBe("call-minimal");
     expect(result.pendingApprovals[0]!.toolName).toBe("");
     expect(result.pendingApprovals[0]!.toolArgs).toBe("");
+  });
+});
+
+/**
+ * Tests for extractConflictDetail - shared error-text extraction from APIError shapes.
+ * Replaces duplicated inline extraction in App.tsx and headless.ts.
+ */
+describe("extractConflictDetail", () => {
+  test("extracts detail from nested error shape (e.error.error.detail)", () => {
+    // This is the exact error shape from the interrupt→CONFLICT screenshot
+    const error = {
+      error: {
+        error: {
+          message_type: "error_message",
+          error_type: "internal_error",
+          message: "An unknown error occurred with the LLM streaming request.",
+          detail:
+            "CONFLICT: Cannot send a new message: The agent is waiting for approval on a tool call. Please approve or deny the pending request before continuing.",
+        },
+        run_id: "run-d056a979-dd6e-481c-86c1-9ca1da8f618c",
+      },
+    };
+    const detail = extractConflictDetail(error);
+    expect(detail).toBe(
+      "CONFLICT: Cannot send a new message: The agent is waiting for approval on a tool call. Please approve or deny the pending request before continuing.",
+    );
+    // Extracted detail should route correctly through the classifier
+    expect(isApprovalPendingError(detail)).toBe(true);
+  });
+
+  test("falls back to nested message when detail is missing", () => {
+    const error = {
+      error: {
+        error: {
+          message: "An unknown error with approval waiting for approval",
+        },
+      },
+    };
+    expect(extractConflictDetail(error)).toBe(
+      "An unknown error with approval waiting for approval",
+    );
+  });
+
+  test("extracts from flat shape (e.error.detail)", () => {
+    const error = {
+      error: {
+        detail:
+          "CONFLICT: Cannot send a new message: Another request is currently being processed for this conversation.",
+      },
+    };
+    const detail = extractConflictDetail(error);
+    expect(isConversationBusyError(detail)).toBe(true);
+  });
+
+  test("extracts from flat shape (e.error.message) when detail is missing", () => {
+    const error = {
+      error: { message: "Agent is waiting for approval on tool call" },
+    };
+    const detail = extractConflictDetail(error);
+    expect(detail).toBe("Agent is waiting for approval on tool call");
+  });
+
+  test("falls back to Error.message", () => {
+    const error = new Error("Connection refused");
+    expect(extractConflictDetail(error)).toBe("Connection refused");
+  });
+
+  test("returns empty string for non-error input", () => {
+    expect(extractConflictDetail(null)).toBe("");
+    expect(extractConflictDetail("string")).toBe("");
+    expect(extractConflictDetail(42)).toBe("");
+  });
+});
+
+/**
+ * Tests for rebuildInputWithFreshDenials - strips stale approval payloads
+ * from the currentInput array and optionally prepends fresh denial results.
+ */
+describe("rebuildInputWithFreshDenials", () => {
+  test("strips stale approval and prepends fresh denials", () => {
+    const input = [
+      {
+        type: "approval" as const,
+        approvals: [
+          {
+            type: "tool" as const,
+            tool_call_id: "stale-id",
+            tool_return: "Interrupted by user",
+            status: "error" as const,
+          },
+        ],
+      },
+      { type: "message" as const, role: "user" as const, content: "hello" },
+    ];
+    const serverApprovals = [
+      { toolCallId: "real-id", toolName: "Read", toolArgs: "{}" },
+    ];
+
+    const result = rebuildInputWithFreshDenials(
+      input,
+      serverApprovals,
+      "Auto-denied",
+    );
+
+    // Stale approval stripped, fresh denial prepended, message preserved
+    expect(result).toHaveLength(2);
+    expect(result[0]!.type).toBe("approval");
+    const approvalPayload = result[0] as {
+      type: "approval";
+      approvals: Array<{
+        tool_call_id: string;
+        approve: boolean;
+        reason: string;
+      }>;
+    };
+    expect(approvalPayload.approvals[0]!.tool_call_id).toBe("real-id");
+    expect(approvalPayload.approvals[0]!.approve).toBe(false);
+    expect(approvalPayload.approvals[0]!.reason).toBe("Auto-denied");
+    expect(result[1]!.type).toBe("message");
+  });
+
+  test("strips stale approval with no server approvals (clean retry)", () => {
+    const input = [
+      { type: "approval" as const, approvals: [] },
+      { type: "message" as const, role: "user" as const, content: "hello" },
+    ];
+
+    const result = rebuildInputWithFreshDenials(input, [], "");
+
+    // Only message remains
+    expect(result).toHaveLength(1);
+    expect(result[0]!.type).toBe("message");
+  });
+
+  test("prepends fresh denials when no stale approvals to strip", () => {
+    const input = [
+      { type: "message" as const, role: "user" as const, content: "hello" },
+    ];
+    const serverApprovals = [
+      { toolCallId: "real-id", toolName: "Read", toolArgs: "{}" },
+    ];
+
+    const result = rebuildInputWithFreshDenials(
+      input,
+      serverApprovals,
+      "Auto-denied",
+    );
+
+    // Fresh denial prepended, message preserved
+    expect(result).toHaveLength(2);
+    expect(result[0]!.type).toBe("approval");
+    expect(result[1]!.type).toBe("message");
+  });
+
+  test("handles multiple stale approvals and multiple server approvals", () => {
+    const input = [
+      {
+        type: "approval" as const,
+        approvals: [
+          {
+            type: "approval" as const,
+            tool_call_id: "old-1",
+            approve: false,
+            reason: "stale",
+          },
+        ],
+      },
+      {
+        type: "approval" as const,
+        approvals: [
+          {
+            type: "approval" as const,
+            tool_call_id: "old-2",
+            approve: false,
+            reason: "stale",
+          },
+        ],
+      },
+      { type: "message" as const, role: "user" as const, content: "hello" },
+    ];
+    const serverApprovals = [
+      { toolCallId: "new-1", toolName: "Bash", toolArgs: "{}" },
+      { toolCallId: "new-2", toolName: "Write", toolArgs: "{}" },
+    ];
+
+    const result = rebuildInputWithFreshDenials(
+      input,
+      serverApprovals,
+      "denied",
+    );
+
+    // Both stale approvals stripped, one fresh denial payload prepended, message kept
+    expect(result).toHaveLength(2);
+    expect(result[0]!.type).toBe("approval");
+    const approvalPayload = result[0] as {
+      type: "approval";
+      approvals: Array<{ tool_call_id: string }>;
+    };
+    expect(approvalPayload.approvals).toHaveLength(2);
+    expect(approvalPayload.approvals[0]!.tool_call_id).toBe("new-1");
+    expect(approvalPayload.approvals[1]!.tool_call_id).toBe("new-2");
+    expect(result[1]!.type).toBe("message");
   });
 });
 

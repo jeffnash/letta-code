@@ -2,7 +2,6 @@
  * Utilities for creating an agent on the Letta API backend
  **/
 
-import { join } from "node:path";
 import type {
   AgentState,
   AgentType,
@@ -20,9 +19,11 @@ import {
   resolveModelAsync,
 } from "./model";
 import { updateAgentLLMConfig } from "./modify";
-import { resolveSystemPrompt } from "./promptAssets";
+import {
+  resolveSystemPrompt,
+  SYSTEM_PROMPT_MEMORY_ADDON,
+} from "./promptAssets";
 import { SLEEPTIME_MEMORY_PERSONA } from "./prompts/sleeptime";
-import { discoverSkills, formatSkillsForMemory, SKILLS_DIR } from "./skills";
 
 /**
  * Describes where a memory block came from
@@ -74,6 +75,8 @@ export interface CreateAgentOptions {
   >;
   /** Override values for preset blocks (label → value) */
   blockValues?: Record<string, string>;
+  /** Tags to organize and categorize the agent */
+  tags?: string[];
 }
 
 /**
@@ -294,34 +297,6 @@ export async function createAgent(
     }
   }
 
-  // Resolve absolute path for skills directory
-  const resolvedSkillsDirectory =
-    options.skillsDirectory || join(process.cwd(), SKILLS_DIR);
-
-  // Discover skills from .skills directory and populate skills memory block
-  try {
-    const { skills, errors } = await discoverSkills(resolvedSkillsDirectory);
-
-    // Log any errors encountered during skill discovery
-    if (errors.length > 0) {
-      console.warn("Errors encountered during skill discovery:");
-      for (const error of errors) {
-        console.warn(`  ${error.path}: ${error.message}`);
-      }
-    }
-
-    // Find and update the skills memory block with discovered skills
-    const skillsBlock = filteredMemoryBlocks.find((b) => b.label === "skills");
-    if (skillsBlock) {
-      const formatted = formatSkillsForMemory(skills, resolvedSkillsDirectory);
-      skillsBlock.value = formatted;
-    }
-  } catch (error) {
-    console.warn(
-      `Failed to discover skills: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-
   // Track provenance: which blocks were created
   // Note: We no longer reuse shared blocks - each agent gets fresh blocks
   const blockProvenance: BlockProvenance[] = [];
@@ -354,6 +329,10 @@ export async function createAgent(
     systemPromptContent = await resolveSystemPrompt(effectiveSystemPromptPreset);
   }
 
+  // Append the non-memfs memory section by default.
+  // If memfs is enabled, updateAgentSystemPromptMemfs() will swap it for the memfs version.
+  systemPromptContent = `${systemPromptContent}\n${SYSTEM_PROMPT_MEMORY_ADDON}`;
+
   // Append additional instructions if provided
   if (options.systemPromptAppend) {
     systemPromptContent = `${systemPromptContent}\n\n${options.systemPromptAppend}`;
@@ -367,6 +346,9 @@ export async function createAgent(
   const tags = ["origin:letta-code"];
   if (isSubagent) {
     tags.push("role:subagent");
+  }
+  if (options.tags && Array.isArray(options.tags)) {
+    tags.push(...options.tags);
   }
 
   const agentDescription =

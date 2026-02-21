@@ -6,7 +6,7 @@
 interface AgentContext {
   agentId: string | null;
   skillsDirectory: string | null;
-  hasLoadedSkills: boolean;
+  noSkills: boolean;
   conversationId: string | null;
 }
 
@@ -24,7 +24,7 @@ function getContext(): AgentContext {
     global[CONTEXT_KEY] = {
       agentId: null,
       skillsDirectory: null,
-      hasLoadedSkills: false,
+      noSkills: false,
       conversationId: null,
     };
   }
@@ -37,13 +37,16 @@ const context = getContext();
  * Set the current agent context
  * @param agentId - The agent ID
  * @param skillsDirectory - Optional skills directory path
+ * @param noSkills - Whether to skip bundled skills
  */
 export function setAgentContext(
   agentId: string,
   skillsDirectory?: string,
+  noSkills?: boolean,
 ): void {
   context.agentId = agentId;
   context.skillsDirectory = skillsDirectory || null;
+  context.noSkills = noSkills ?? false;
 }
 
 /**
@@ -73,19 +76,10 @@ export function getSkillsDirectory(): string | null {
 }
 
 /**
- * Check if skills are currently loaded (cached state)
- * @returns true if skills are loaded, false otherwise
+ * Get whether bundled skills should be skipped
  */
-export function hasLoadedSkills(): boolean {
-  return context.hasLoadedSkills;
-}
-
-/**
- * Update the loaded skills state (called by Skill tool)
- * @param loaded - Whether skills are currently loaded
- */
-export function setHasLoadedSkills(loaded: boolean): void {
-  context.hasLoadedSkills = loaded;
+export function getNoSkills(): boolean {
+  return context.noSkills;
 }
 
 /**
@@ -102,66 +96,4 @@ export function setConversationId(conversationId: string | null): void {
  */
 export function getConversationId(): string | null {
   return context.conversationId;
-}
-
-/**
- * Initialize the loaded skills flag by checking the block
- * Should be called after setAgentContext to sync the cached state
- */
-export async function initializeLoadedSkillsFlag(options?: {
-  enabled?: boolean;
-}): Promise<void> {
-  if (!context.agentId) {
-    return;
-  }
-
-  if (options?.enabled === false) {
-    context.hasLoadedSkills = false;
-    return;
-  }
-
-  try {
-    const { getClient } = await import("./client");
-    const client = await getClient();
-    const loadedSkillsBlock = await client.agents.blocks.retrieve(
-      "loaded_skills",
-      { agent_id: context.agentId },
-    );
-    const value = loadedSkillsBlock?.value?.trim() || "";
-    // Check for actual skill content (skills are formatted with "# Skill:" headers)
-    context.hasLoadedSkills = value.includes("# Skill:");
-  } catch {
-    // Block doesn't exist, no skills loaded
-    context.hasLoadedSkills = false;
-  }
-}
-
-/** Type for agents with optional memory blocks */
-type AgentWithMemory = {
-  memory?: { blocks?: Array<{ label?: string | null } | null> | null };
-};
-
-/** Result of checking which skill-related memory blocks an agent supports */
-type MemoryBlockSupport = {
-  supportsSkills: boolean;
-  supportsLoadedSkills: boolean;
-};
-
-/**
- * Check which skill-related memory blocks an agent supports.
- * Used to determine if skill discovery/loading should be performed.
- */
-export function getMemoryBlockSupport(
-  agent: AgentWithMemory,
-): MemoryBlockSupport {
-  const blocks = agent.memory?.blocks;
-  if (!Array.isArray(blocks)) {
-    return { supportsSkills: false, supportsLoadedSkills: false };
-  }
-
-  const labels = new Set(blocks.map((block) => block?.label));
-  return {
-    supportsSkills: labels.has("skills"),
-    supportsLoadedSkills: labels.has("loaded_skills"),
-  };
 }

@@ -9,25 +9,17 @@ import type { ApprovalCreate } from "@letta-ai/letta-client/resources/agents/mes
 import type { StopReasonType } from "@letta-ai/letta-client/resources/runs/runs";
 import type { ApprovalResult } from "./agent/approval-execution";
 import {
-  buildApprovalRecoveryMessage,
+  extractConflictDetail,
   fetchRunErrorDetail,
+  getPreStreamErrorAction,
   isApprovalPendingError,
-  isConversationBusyError,
   isInvalidToolCallIdsError,
 } from "./agent/approval-recovery";
 import { getClient } from "./agent/client";
-import {
-  initializeLoadedSkillsFlag,
-  setAgentContext,
-  setConversationId,
-} from "./agent/context";
+import { setAgentContext, setConversationId } from "./agent/context";
 import { createAgent } from "./agent/create";
-import { ensureSkillsBlocks, ISOLATED_BLOCK_LABELS } from "./agent/memory";
-import {
-  ensureMemoryFilesystemBlock,
-  syncMemoryFilesystem,
-  updateMemoryFilesystemBlock,
-} from "./agent/memoryFilesystem";
+import { ISOLATED_BLOCK_LABELS } from "./agent/memory";
+
 import { sendMessageStream } from "./agent/message";
 import { getModelUpdateArgs } from "./agent/model";
 import { SessionStats } from "./agent/stats";
@@ -46,6 +38,15 @@ import {
 import { SYSTEM_REMINDER_CLOSE, SYSTEM_REMINDER_OPEN } from "./constants";
 import { settingsManager } from "./settings-manager";
 import { clearSkillBlockCache } from "./tools/impl/Skill";
+import {
+  isHeadlessAutoAllowTool,
+  isInteractiveApprovalTool,
+} from "./tools/interactivePolicy";
+import {
+  type ExternalToolDefinition,
+  registerExternalTools,
+  setExternalToolExecutor,
+} from "./tools/manager";
 import type {
   AutoApprovalMessage,
   CanUseToolControlRequest,
@@ -80,9 +81,8 @@ export async function handleHeadlessCommand(
   argv: string[],
   model?: string,
   skillsDirectory?: string,
+  noSkills?: boolean,
 ) {
-  const settings = settingsManager.getSettings();
-
   // Parse CLI args
   // Include all flags from index.ts to prevent them from being treated as positionals
   const { values, positionals } = parseArgs({
@@ -94,10 +94,10 @@ export async function handleHeadlessCommand(
       conversation: { type: "string" },
       default: { type: "boolean" }, // Alias for --conv default
       "new-agent": { type: "boolean" },
-      "create-only": { type: "boolean" }, // Create agent and exit (for SDK)
       new: { type: "boolean" }, // Deprecated - kept for helpful error message
       agent: { type: "string", short: "a" },
       model: { type: "string", short: "m" },
+      embedding: { type: "string" },
       system: { type: "string", short: "s" },
       "system-custom": { type: "string" },
       "system-append": { type: "string" },
@@ -119,13 +119,15 @@ export async function handleHeadlessCommand(
       "permission-mode": { type: "string" },
       yolo: { type: "boolean" },
       skills: { type: "string" },
-      sleeptime: { type: "boolean" },
+      "pre-load-skills": { type: "string" },
       "init-blocks": { type: "string" },
       "base-tools": { type: "string" },
       "from-af": { type: "string" },
-      "no-skills": { type: "boolean" },
+      tags: { type: "string" },
+
       memfs: { type: "boolean" },
       "no-memfs": { type: "boolean" },
+      "no-skills": { type: "boolean" },
       "max-turns": { type: "string" }, // Maximum number of agentic turns
       "no-subagent-max-turns": { type: "boolean" }, // Ignore max-turns limit for subagents
       "show-subagents": { type: "boolean" }, // Don't hide subagents
@@ -239,7 +241,6 @@ export async function handleHeadlessCommand(
 
   // Resolve agent (same logic as interactive mode)
   let agent: AgentState | null = null;
-  let isNewlyCreatedAgent = false;
   let specifiedAgentId = values.agent as string | undefined;
   let specifiedConversationId = values.conversation as string | undefined;
   const useDefaultConv = values.default as boolean | undefined;
@@ -259,15 +260,31 @@ export async function handleHeadlessCommand(
   const systemPromptPreset = values.system as string | undefined;
   const systemCustom = values["system-custom"] as string | undefined;
   const systemAppend = values["system-append"] as string | undefined;
+  const embeddingModel = values.embedding as string | undefined;
   const memoryBlocksJson = values["memory-blocks"] as string | undefined;
   const blockValueArgs = values["block-value"] as string[] | undefined;
   const initBlocksRaw = values["init-blocks"] as string | undefined;
   const baseToolsRaw = values["base-tools"] as string | undefined;
-  const sleeptimeFlag = (values.sleeptime as boolean | undefined) ?? undefined;
   const memfsFlag = values.memfs as boolean | undefined;
   const noMemfsFlag = values["no-memfs"] as boolean | undefined;
   const fromAfFile = values["from-af"] as string | undefined;
+  const preLoadSkillsRaw = values["pre-load-skills"] as string | undefined;
   const maxTurnsRaw = values["max-turns"] as string | undefined;
+  const tagsRaw = values["tags"] as string | undefined;
+
+  // Parse and validate base tools
+  let tags: string[] | undefined;
+  if (tagsRaw !== undefined) {
+    const trimmed = tagsRaw.trim();
+    if (!trimmed || trimmed.toLowerCase() === "none") {
+      tags = [];
+    } else {
+      tags = trimmed
+        .split(",")
+        .map((name) => name.trim())
+        .filter((name) => name.length > 0);
+    }
+  }
 
   // Parse and validate max-turns if provided (skip if LETTA_NO_MAX_TURNS is set)
   let maxTurns: number | undefined;
@@ -356,6 +373,8 @@ export async function handleHeadlessCommand(
   }
 
   // Validate --from-af flag
+  // Detect if it's a registry handle (e.g., @author/name) or a local file path
+  let isRegistryImport = false;
   if (fromAfFile) {
     if (specifiedAgentId) {
       console.error("Error: --from-af cannot be used with --agent");
@@ -368,6 +387,21 @@ export async function handleHeadlessCommand(
     if (forceNew) {
       console.error("Error: --from-af cannot be used with --new-agent");
       process.exit(1);
+    }
+
+    // Check if this looks like a registry handle (@author/name)
+    if (fromAfFile.startsWith("@")) {
+      // Definitely a registry handle
+      isRegistryImport = true;
+      // Validate handle format
+      const normalized = fromAfFile.slice(1);
+      const parts = normalized.split("/");
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        console.error(
+          `Error: Invalid registry handle "${fromAfFile}". Use format: @author/agentname`,
+        );
+        process.exit(1);
+      }
     }
   }
 
@@ -502,16 +536,40 @@ export async function handleHeadlessCommand(
     }
   }
 
-  // Priority 1: Import from AgentFile template
+  // Priority 1: Import from AgentFile template (local file or registry)
   if (!agent && fromAfFile) {
-    const { importAgentFromFile } = await import("./agent/import");
-    const result = await importAgentFromFile({
-      filePath: fromAfFile,
-      modelOverride: model,
-      stripMessages: true,
-    });
+    let result: { agent: AgentState; skills?: string[] };
+
+    if (isRegistryImport) {
+      // Import from letta-ai/agent-file registry
+      const { importAgentFromRegistry } = await import("./agent/import");
+      result = await importAgentFromRegistry({
+        handle: fromAfFile,
+        modelOverride: model,
+        stripMessages: true,
+        stripSkills: false,
+      });
+    } else {
+      // Import from local file
+      const { importAgentFromFile } = await import("./agent/import");
+      result = await importAgentFromFile({
+        filePath: fromAfFile,
+        modelOverride: model,
+        stripMessages: true,
+        stripSkills: false,
+      });
+    }
+
     agent = result.agent;
-    isNewlyCreatedAgent = true;
+
+    // Display extracted skills summary
+    if (result.skills && result.skills.length > 0) {
+      const { getAgentSkillsDir } = await import("./agent/skills");
+      const skillsDir = getAgentSkillsDir(agent.id);
+      console.log(
+        `📦 Extracted ${result.skills.length} skill${result.skills.length === 1 ? "" : "s"} to ${skillsDir}: ${result.skills.join(", ")}`,
+      );
+    }
   }
 
   // Priority 2: Try to use --agent specified ID
@@ -529,10 +587,10 @@ export async function handleHeadlessCommand(
     const updateArgs = getModelUpdateArgs(model);
     const createOptions = {
       model,
+      embeddingModel,
       updateArgs,
       skillsDirectory,
       parallelToolCalls: true,
-      enableSleeptime: sleeptimeFlag ?? settings.enableSleeptime,
       systemPromptPreset,
       systemPromptCustom: systemCustom,
       systemPromptAppend: systemAppend,
@@ -540,51 +598,61 @@ export async function handleHeadlessCommand(
       baseTools,
       memoryBlocks,
       blockValues,
+      tags,
     };
     const result = await createAgent(createOptions);
     agent = result.agent;
-    isNewlyCreatedAgent = true;
+
+    // Enable memfs by default on Letta Cloud for new agents
+    const { enableMemfsIfCloud } = await import("./agent/memoryFilesystem");
+    await enableMemfsIfCloud(agent.id);
   }
 
   // Priority 4: Try to resume from project settings (.letta/settings.local.json)
+  // Store local conversation ID for use in conversation resolution below
+  let resolvedLocalConvId: string | null = null;
   if (!agent) {
     await settingsManager.loadLocalProjectSettings();
-    const localProjectSettings = settingsManager.getLocalProjectSettings();
-    if (localProjectSettings?.lastAgent) {
+    const localAgentId = settingsManager.getLocalLastAgentId(process.cwd());
+    if (localAgentId) {
       try {
-        agent = await client.agents.retrieve(localProjectSettings.lastAgent);
+        agent = await client.agents.retrieve(localAgentId);
+        // Store local conversation for downstream resolution
+        const localSession = settingsManager.getLocalLastSession(process.cwd());
+        resolvedLocalConvId = localSession?.conversationId ?? null;
       } catch (_error) {
         // Local LRU agent doesn't exist - log and continue
-        console.error(
-          `Unable to locate agent ${localProjectSettings.lastAgent} in .letta/`,
-        );
+        console.error(`Unable to locate agent ${localAgentId} in .letta/`);
       }
     }
   }
 
-  // Priority 5: Try to reuse global lastAgent if --continue flag is passed
-  if (!agent && shouldContinue) {
-    if (settings.lastAgent) {
+  // Priority 5: Try to reuse global LRU (covers directory-switching case)
+  // Do NOT restore global conversation — use default (project-scoped conversations)
+  if (!agent) {
+    const globalAgentId = settingsManager.getGlobalLastAgentId();
+    if (globalAgentId) {
       try {
-        agent = await client.agents.retrieve(settings.lastAgent);
+        agent = await client.agents.retrieve(globalAgentId);
       } catch (_error) {
         // Global LRU agent doesn't exist
       }
     }
-    // --continue requires an LRU agent to exist
-    if (!agent) {
-      console.error("No recent session found in .letta/ or ~/.letta.");
-      console.error("Run 'letta' to get started.");
-      process.exit(1);
-    }
   }
 
-  // Priority 6: Fresh user with no LRU - create Memo (same as interactive mode)
+  // Priority 6: --continue with no agent found → error
+  if (!agent && shouldContinue) {
+    console.error("No recent session found in .letta/ or ~/.letta.");
+    console.error("Run 'letta' to get started.");
+    process.exit(1);
+  }
+
+  // Priority 7: Fresh user with no LRU - create default agent
   if (!agent) {
     const { ensureDefaultAgents } = await import("./agent/defaults");
-    const memoAgent = await ensureDefaultAgents(client);
-    if (memoAgent) {
-      agent = memoAgent;
+    const defaultAgent = await ensureDefaultAgents(client);
+    if (defaultAgent) {
+      agent = defaultAgent;
     }
   }
 
@@ -644,65 +712,37 @@ export async function handleHeadlessCommand(
   // Determine which conversation to use
   let conversationId: string;
 
-  // Check flags early
-  const noSkillsFlag = values["no-skills"] as boolean | undefined;
   const isSubagent = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
 
-  // Ensure skills blocks exist BEFORE conversation creation (for non-subagent, non-no-skills)
-  // This prevents "block not found" errors when creating conversations with isolated_block_labels
-  // Note: ensureSkillsBlocks already calls blocks.list internally, so no extra API call
-  if (!noSkillsFlag && !isSubagent) {
-    await ensureSkillsBlocks(agent.id);
-  }
-
-  // Apply memfs flag if specified, or enable by default for new agents
-  // In headless mode, also enable for --agent since users expect full functionality
-  if (memfsFlag) {
-    settingsManager.setMemfsEnabled(agent.id, true);
-  } else if (noMemfsFlag) {
-    settingsManager.setMemfsEnabled(agent.id, false);
-  } else if (isNewlyCreatedAgent && !isSubagent) {
-    // Enable memfs by default for newly created agents (but not subagents)
-    settingsManager.setMemfsEnabled(agent.id, true);
-  } else if (specifiedAgentId && !isSubagent) {
-    // Enable memfs by default when using --agent in headless mode
-    settingsManager.setMemfsEnabled(agent.id, true);
-  }
-
-  // Sync filesystem-backed memory before creating conversations (only if memfs is enabled)
-  if (settingsManager.isMemfsEnabled(agent.id)) {
-    try {
-      await ensureMemoryFilesystemBlock(agent.id);
-      const syncResult = await syncMemoryFilesystem(agent.id);
-      if (syncResult.conflicts.length > 0) {
-        console.error(
-          `Memory filesystem sync conflicts detected (${syncResult.conflicts.length}). Run in interactive mode to resolve.`,
-        );
-        process.exit(1);
-      }
-      await updateMemoryFilesystemBlock(agent.id);
-      // Note: Sync summary intentionally not logged in headless mode to keep output clean
-    } catch (error) {
+  // Apply memfs flag if explicitly specified (memfs is opt-in via /memfs enable or --memfs)
+  try {
+    const { applyMemfsFlags } = await import("./agent/memoryFilesystem");
+    const memfsResult = await applyMemfsFlags(
+      agent.id,
+      memfsFlag,
+      noMemfsFlag,
+      { pullOnExistingRepo: true },
+    );
+    if (memfsResult.pullSummary?.includes("CONFLICT")) {
       console.error(
-        `Memory filesystem sync failed: ${error instanceof Error ? error.message : String(error)}`,
+        "Memory has merge conflicts. Run in interactive mode to resolve.",
       );
       process.exit(1);
     }
+  } catch (error) {
+    console.error(
+      `Memory git sync failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    process.exit(1);
   }
 
   // Determine which blocks to isolate for the conversation
-  let isolatedBlockLabels: string[] = [];
-  if (!noSkillsFlag) {
-    // After ensureSkillsBlocks, we know all standard blocks exist
-    // Use the full list, optionally filtered by initBlocks
-    isolatedBlockLabels =
-      initBlocks === undefined
-        ? [...ISOLATED_BLOCK_LABELS]
-        : ISOLATED_BLOCK_LABELS.filter((label) =>
-            initBlocks.includes(label as string),
-          );
-  }
-  // If --no-skills is set, isolatedBlockLabels stays empty (no isolation)
+  const isolatedBlockLabels: string[] =
+    initBlocks === undefined
+      ? [...ISOLATED_BLOCK_LABELS]
+      : ISOLATED_BLOCK_LABELS.filter((label) =>
+          initBlocks.includes(label as string),
+        );
 
   if (specifiedConversationId) {
     if (specifiedConversationId === "default") {
@@ -763,8 +803,21 @@ export async function handleHeadlessCommand(
       isolated_block_labels: isolatedBlockLabels,
     });
     conversationId = conversation.id;
+  } else if (resolvedLocalConvId) {
+    // Resumed from local LRU — restore the local conversation
+    if (resolvedLocalConvId === "default") {
+      conversationId = "default";
+    } else {
+      try {
+        await client.conversations.retrieve(resolvedLocalConvId);
+        conversationId = resolvedLocalConvId;
+      } catch {
+        // Local conversation no longer exists — fall back to default
+        conversationId = "default";
+      }
+    }
   } else {
-    // Default (including --new-agent, --agent): use the agent's "default" conversation
+    // Default (including --new-agent, --agent, global LRU fallback): use "default" conversation
     conversationId = "default";
   }
   markMilestone("HEADLESS_CONVERSATION_READY");
@@ -787,40 +840,25 @@ export async function handleHeadlessCommand(
     });
   }
 
-  // Set agent context for tools that need it (e.g., Skill tool, Task tool)
-  setAgentContext(agent.id, skillsDirectory);
-
-  // Skills-related fire-and-forget operations (skip for subagents/--no-skills)
-  if (!noSkillsFlag && !isSubagent) {
-    // Fire-and-forget: Initialize loaded skills flag (LET-7101)
-    // Don't await - this is just for the skill unload reminder
-    initializeLoadedSkillsFlag().catch(() => {
-      // Ignore errors - not critical
-    });
-
-    // Fire-and-forget: Sync skills in background (LET-7101)
-    // This ensures new skills added after agent creation are available
-    // Don't await - proceed to message sending immediately
-    (async () => {
-      try {
-        const { syncSkillsToAgent, SKILLS_DIR } = await import(
-          "./agent/skills"
-        );
-        const { join } = await import("node:path");
-
-        const resolvedSkillsDirectory =
-          skillsDirectory || join(process.cwd(), SKILLS_DIR);
-
-        await syncSkillsToAgent(client, agent.id, resolvedSkillsDirectory, {
-          skipIfUnchanged: true,
+  // Migration (LET-7353): Remove legacy skills/loaded_skills blocks
+  for (const label of ["skills", "loaded_skills"]) {
+    try {
+      const block = await client.agents.blocks.retrieve(label, {
+        agent_id: agent.id,
+      });
+      if (block) {
+        await client.agents.blocks.detach(block.id, {
+          agent_id: agent.id,
         });
-      } catch (error) {
-        console.warn(
-          `[skills] Background sync failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        await client.blocks.delete(block.id);
       }
-    })();
+    } catch {
+      // Block doesn't exist or already removed, skip
+    }
   }
+
+  // Set agent context for tools that need it (e.g., Skill tool, Task tool)
+  setAgentContext(agent.id, skillsDirectory, noSkills);
 
   // Validate output format
   const outputFormat =
@@ -839,6 +877,13 @@ export async function handleHeadlessCommand(
     process.exit(1);
   }
 
+  const { getClientToolsFromRegistry } = await import("./tools/manager");
+  const loadedToolNames = getClientToolsFromRegistry().map((t) => t.name);
+  const availableTools =
+    loadedToolNames.length > 0
+      ? loadedToolNames
+      : agent.tools?.map((t) => t.name).filter((n): n is string => !!n) || [];
+
   // If input-format is stream-json, use bidirectional mode
   if (isBidirectionalMode) {
     await runBidirectionalMode(
@@ -847,6 +892,7 @@ export async function handleHeadlessCommand(
       client,
       outputFormat,
       includePartialMessages,
+      availableTools,
     );
     return;
   }
@@ -869,20 +915,15 @@ export async function handleHeadlessCommand(
       agent_id: agent.id,
       conversation_id: conversationId,
       model: agent.llm_config?.model ?? "",
-      tools:
-        agent.tools?.map((t) => t.name).filter((n): n is string => !!n) || [],
+      tools: availableTools,
       cwd: process.cwd(),
       mcp_servers: [],
       permission_mode: "",
       slash_commands: [],
+      memfs_enabled: settingsManager.isMemfsEnabled(agent.id),
       uuid: `init-${agent.id}`,
     };
     console.log(JSON.stringify(initEvent));
-
-    // --create-only: exit after outputting init (for SDK createAgent)
-    if (values["create-only"]) {
-      process.exit(0);
-    }
   }
 
   // Helper to resolve any pending approvals before sending user input
@@ -935,6 +976,7 @@ export async function handleHeadlessCommand(
       const { autoAllowed, autoDenied } = await classifyApprovals(
         pendingApprovals,
         {
+          alwaysRequiresUserInput: isInteractiveApprovalTool,
           treatAskAsDeny: true,
           denyReasonForAsk: "Tool requires approval (headless mode)",
           requireArgsForAutoApprove: true,
@@ -1001,10 +1043,31 @@ export async function handleHeadlessCommand(
         approvals: executedResults as ApprovalResult[],
       };
 
+      // Inject queued skill content as user message parts (LET-7353)
+      const approvalMessages: Array<
+        | import("@letta-ai/letta-client/resources/agents/agents").MessageCreate
+        | import("@letta-ai/letta-client/resources/agents/messages").ApprovalCreate
+      > = [approvalInput];
+      {
+        const { consumeQueuedSkillContent } = await import(
+          "./tools/impl/skillContentRegistry"
+        );
+        const skillContents = consumeQueuedSkillContent();
+        if (skillContents.length > 0) {
+          approvalMessages.push({
+            role: "user" as const,
+            content: skillContents.map((sc) => ({
+              type: "text" as const,
+              text: sc.content,
+            })),
+          });
+        }
+      }
+
       // Send the approval to clear the pending state; drain the stream without output
       const approvalStream = await sendMessageStream(
         conversationId,
-        [approvalInput],
+        approvalMessages,
         { agentId: agent.id },
       );
       if (outputFormat === "stream-json") {
@@ -1028,9 +1091,8 @@ export async function handleHeadlessCommand(
     await resolveAllPendingApprovals();
   }
 
-  // Build message content with reminders (plan mode first, then skill unload)
+  // Build message content with reminders
   const { permissionMode } = await import("./permissions/mode");
-  const { hasLoadedSkills } = await import("./agent/context");
   const contentParts: MessageCreate["content"] = [];
   const pushPart = (text: string) => {
     if (!text) return;
@@ -1050,16 +1112,59 @@ ${SYSTEM_REMINDER_CLOSE}
     pushPart(systemReminder);
   }
 
+  // Inject available skills as system-reminder (LET-7353)
+  {
+    const {
+      discoverSkills,
+      SKILLS_DIR: defaultDir,
+      formatSkillsAsSystemReminder,
+    } = await import("./agent/skills");
+    const { getSkillsDirectory } = await import("./agent/context");
+    const { join } = await import("node:path");
+    try {
+      const skillsDir = getSkillsDirectory() || join(process.cwd(), defaultDir);
+      const { skills } = await discoverSkills(skillsDir, agent.id, {
+        skipBundled: noSkills,
+      });
+      const skillsReminder = formatSkillsAsSystemReminder(skills);
+      if (skillsReminder) {
+        pushPart(skillsReminder);
+      }
+
+      // Pre-load specific skills' full content (used by subagents with skills: field)
+      if (preLoadSkillsRaw) {
+        const { readFile: readFileAsync } = await import("node:fs/promises");
+        const skillIds = preLoadSkillsRaw
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const loadedContents: string[] = [];
+        for (const skillId of skillIds) {
+          const skill = skills.find((s) => s.id === skillId);
+          if (skill?.path) {
+            try {
+              const content = await readFileAsync(skill.path, "utf-8");
+              loadedContents.push(`<${skillId}>\n${content}\n</${skillId}>`);
+            } catch {
+              // Skill file not readable, skip
+            }
+          }
+        }
+        if (loadedContents.length > 0) {
+          pushPart(
+            `<loaded_skills>\n${loadedContents.join("\n\n")}\n</loaded_skills>`,
+          );
+        }
+      }
+    } catch {
+      // Skills discovery failed, skip
+    }
+  }
+
   // Add plan mode reminder if in plan mode (highest priority)
   if (permissionMode.getMode() === "plan") {
     const { PLAN_MODE_REMINDER } = await import("./agent/promptAssets");
     pushPart(PLAN_MODE_REMINDER);
-  }
-
-  // Add skill unload reminder if skills are loaded (using cached flag)
-  if (hasLoadedSkills()) {
-    const { SKILL_UNLOAD_REMINDER } = await import("./agent/promptAssets");
-    pushPart(SKILL_UNLOAD_REMINDER);
   }
 
   // Add user prompt
@@ -1106,6 +1211,26 @@ ${SYSTEM_REMINDER_CLOSE}
       // Check max turns limit before starting a new turn (uses server-side step count)
       checkMaxTurns();
 
+      // Inject queued skill content as user message parts (LET-7353)
+      {
+        const { consumeQueuedSkillContent } = await import(
+          "./tools/impl/skillContentRegistry"
+        );
+        const skillContents = consumeQueuedSkillContent();
+        if (skillContents.length > 0) {
+          currentInput = [
+            ...currentInput,
+            {
+              role: "user" as const,
+              content: skillContents.map((sc) => ({
+                type: "text" as const,
+                text: sc.content,
+              })),
+            },
+          ];
+        }
+      }
+
       // Wrap sendMessageStream in try-catch to handle pre-stream errors (e.g., 409)
       let stream: Awaited<ReturnType<typeof sendMessageStream>>;
       try {
@@ -1113,36 +1238,41 @@ ${SYSTEM_REMINDER_CLOSE}
           agentId: agent.id,
         });
       } catch (preStreamError) {
-        // Extract error detail from APIError
-        let errorDetail = "";
-        if (
-          preStreamError instanceof APIError &&
-          preStreamError.error &&
-          typeof preStreamError.error === "object"
-        ) {
-          const errObj = preStreamError.error as Record<string, unknown>;
-          if (
-            errObj.error &&
-            typeof errObj.error === "object" &&
-            "detail" in errObj.error
-          ) {
-            const nested = errObj.error as Record<string, unknown>;
-            errorDetail =
-              typeof nested.detail === "string" ? nested.detail : "";
+        // Extract error detail using shared helper (handles nested/direct/message shapes)
+        const errorDetail = extractConflictDetail(preStreamError);
+
+        const preStreamAction = getPreStreamErrorAction(
+          errorDetail,
+          conversationBusyRetries,
+          CONVERSATION_BUSY_MAX_RETRIES,
+        );
+
+        // Check for pending approval blocking new messages - resolve and retry.
+        // This is distinct from "conversation busy" and needs approval resolution,
+        // not just a timed delay.
+        if (preStreamAction === "resolve_approval_pending") {
+          if (outputFormat === "stream-json") {
+            const recoveryMsg: RecoveryMessage = {
+              type: "recovery",
+              recovery_type: "approval_pending",
+              message:
+                "Detected pending approval conflict on send; resolving before retry",
+              session_id: sessionId,
+              uuid: `recovery-pre-stream-${crypto.randomUUID()}`,
+            };
+            console.log(JSON.stringify(recoveryMsg));
+          } else {
+            console.error(
+              "Pending approval detected, resolving before retry...",
+            );
           }
-          if (!errorDetail && typeof errObj.detail === "string") {
-            errorDetail = errObj.detail;
-          }
-        }
-        if (!errorDetail && preStreamError instanceof Error) {
-          errorDetail = preStreamError.message;
+
+          await resolveAllPendingApprovals();
+          continue;
         }
 
         // Check for 409 "conversation busy" error - retry once with delay
-        if (
-          isConversationBusyError(errorDetail) &&
-          conversationBusyRetries < CONVERSATION_BUSY_MAX_RETRIES
-        ) {
+        if (preStreamAction === "retry_conversation_busy") {
           conversationBusyRetries += 1;
 
           // Emit retry message for stream-json mode
@@ -1250,6 +1380,7 @@ ${SYSTEM_REMINDER_CLOSE}
             !autoApprovalEmitted.has(updatedApproval.toolCallId)
           ) {
             const { autoAllowed } = await classifyApprovals([updatedApproval], {
+              alwaysRequiresUserInput: isInteractiveApprovalTool,
               requireArgsForAutoApprove: true,
               missingNameReason: "Tool call incomplete - missing name",
             });
@@ -1377,25 +1508,7 @@ ${SYSTEM_REMINDER_CLOSE}
           }
 
           if (approvals.length === 0) {
-            // Still no approvals - check if we're in bypassPermissions mode
-            const { permissionMode } = await import("./permissions/mode");
-
-            if (permissionMode.getMode() === "bypassPermissions") {
-              console.warn(
-                "[headless] No pending approvals found, but in bypassPermissions mode. " +
-                  "Sending recovery message to continue...",
-              );
-              // Send a recovery message to let the agent continue
-              currentInput = [buildApprovalRecoveryMessage()];
-              continue;
-            }
-
-            // Not in bypass mode - exit with helpful error
-            console.error(
-              "Error: Subagent stopped with requires_approval, but no approval requests were captured. " +
-                "This can happen when the stream is missing tool_call_id. " +
-                "Run with --yolo (bypassPermissions mode) to auto-approve subagent tools.",
-            );
+            console.error("Unexpected empty approvals array");
             process.exit(1);
           }
         }
@@ -1420,18 +1533,34 @@ ${SYSTEM_REMINDER_CLOSE}
               reason: string;
             };
 
-        const { autoAllowed, autoDenied } = await classifyApprovals(approvals, {
-          treatAskAsDeny: true,
-          denyReasonForAsk: "Tool requires approval (headless mode)",
-          requireArgsForAutoApprove: true,
-          missingNameReason: "Tool call incomplete - missing name",
-        });
+        const { autoAllowed, autoDenied, needsUserInput } =
+          await classifyApprovals(approvals, {
+            alwaysRequiresUserInput: isInteractiveApprovalTool,
+            requireArgsForAutoApprove: true,
+            missingNameReason: "Tool call incomplete - missing name",
+          });
 
         const decisions: Decision[] = [
           ...autoAllowed.map((ac) => ({
             type: "approve" as const,
             approval: ac.approval,
           })),
+          ...needsUserInput.map((ac) => {
+            // One-shot headless mode has no control channel for interactive
+            // approvals. Match Claude behavior by auto-allowing EnterPlanMode
+            // while denying tools that need runtime user responses.
+            if (isHeadlessAutoAllowTool(ac.approval.toolName)) {
+              return {
+                type: "approve" as const,
+                approval: ac.approval,
+              };
+            }
+            return {
+              type: "deny" as const,
+              approval: ac.approval,
+              reason: "Tool requires approval (headless mode)",
+            };
+          }),
           ...autoDenied.map((ac) => {
             const fallback =
               "matchedRule" in ac.permission && ac.permission.matchedRule
@@ -1776,9 +1905,22 @@ ${SYSTEM_REMINDER_CLOSE}
     lastToolResult?.resultText ||
     "No assistant response found";
 
+  const stats = sessionStats.getSnapshot();
+  const usage = {
+    prompt_tokens: stats.usage.promptTokens,
+    completion_tokens: stats.usage.completionTokens,
+    total_tokens: stats.usage.totalTokens,
+    step_count: stats.usage.stepCount,
+    cached_input_tokens: stats.usage.cachedInputTokens,
+    cache_write_tokens: stats.usage.cacheWriteTokens,
+    reasoning_tokens: stats.usage.reasoningTokens,
+    ...(stats.usage.contextTokens !== undefined && {
+      context_tokens: stats.usage.contextTokens,
+    }),
+  };
+
   // Output based on format
   if (outputFormat === "json") {
-    const stats = sessionStats.getSnapshot();
     const output = {
       type: "result",
       subtype: "success",
@@ -1789,17 +1931,11 @@ ${SYSTEM_REMINDER_CLOSE}
       result: resultText,
       agent_id: agent.id,
       conversation_id: conversationId,
-      usage: {
-        prompt_tokens: stats.usage.promptTokens,
-        completion_tokens: stats.usage.completionTokens,
-        total_tokens: stats.usage.totalTokens,
-      },
+      usage,
     };
     console.log(JSON.stringify(output, null, 2));
   } else if (outputFormat === "stream-json") {
     // Output final result event
-    const stats = sessionStats.getSnapshot();
-
     // Collect all run_ids from buffers
     const allRunIds = new Set<string>();
     for (const line of toLines(buffers)) {
@@ -1826,11 +1962,7 @@ ${SYSTEM_REMINDER_CLOSE}
       agent_id: agent.id,
       conversation_id: conversationId,
       run_ids: Array.from(allRunIds),
-      usage: {
-        prompt_tokens: stats.usage.promptTokens,
-        completion_tokens: stats.usage.completionTokens,
-        total_tokens: stats.usage.totalTokens,
-      },
+      usage,
       uuid: resultUuid,
     };
     console.log(JSON.stringify(resultEvent));
@@ -1856,9 +1988,10 @@ ${SYSTEM_REMINDER_CLOSE}
 async function runBidirectionalMode(
   agent: AgentState,
   conversationId: string,
-  _client: Letta,
+  client: Letta,
   _outputFormat: string,
   includePartialMessages: boolean,
+  availableTools: string[],
 ): Promise<void> {
   const sessionId = agent.id;
   const readline = await import("node:readline");
@@ -1871,14 +2004,139 @@ async function runBidirectionalMode(
     agent_id: agent.id,
     conversation_id: conversationId,
     model: agent.llm_config?.model,
-    tools: agent.tools?.map((t) => t.name) || [],
+    tools: availableTools,
     cwd: process.cwd(),
+    memfs_enabled: settingsManager.isMemfsEnabled(agent.id),
     uuid: `init-${agent.id}`,
   };
   console.log(JSON.stringify(initEvent));
 
   // Track current operation for interrupt support
   let currentAbortController: AbortController | null = null;
+
+  // Resolve pending approvals for this conversation before retrying user input.
+  const resolveAllPendingApprovals = async () => {
+    const { getResumeData } = await import("./agent/check-approval");
+    while (true) {
+      // Re-fetch agent to get latest in-context messages (source of truth for backend)
+      const freshAgent = await client.agents.retrieve(agent.id);
+
+      let resume: Awaited<ReturnType<typeof getResumeData>>;
+      try {
+        resume = await getResumeData(client, freshAgent, conversationId);
+      } catch (error) {
+        // Treat 404/422 as "no approvals" - stale message/conversation state
+        if (
+          error instanceof APIError &&
+          (error.status === 404 || error.status === 422)
+        ) {
+          break;
+        }
+        throw error;
+      }
+
+      const pendingApprovals = resume.pendingApprovals || [];
+      if (pendingApprovals.length === 0) break;
+
+      type Decision =
+        | {
+            type: "approve";
+            approval: {
+              toolCallId: string;
+              toolName: string;
+              toolArgs: string;
+            };
+            reason: string;
+            matchedRule: string;
+          }
+        | {
+            type: "deny";
+            approval: {
+              toolCallId: string;
+              toolName: string;
+              toolArgs: string;
+            };
+            reason: string;
+          };
+
+      const { autoAllowed, autoDenied } = await classifyApprovals(
+        pendingApprovals,
+        {
+          treatAskAsDeny: true,
+          denyReasonForAsk: "Tool requires approval (headless mode)",
+          requireArgsForAutoApprove: true,
+          missingNameReason: "Tool call incomplete - missing name",
+        },
+      );
+
+      const decisions: Decision[] = [
+        ...autoAllowed.map((ac) => ({
+          type: "approve" as const,
+          approval: ac.approval,
+          reason: ac.permission.reason || "Allowed by permission rule",
+          matchedRule:
+            "matchedRule" in ac.permission && ac.permission.matchedRule
+              ? ac.permission.matchedRule
+              : "auto-approved",
+        })),
+        ...autoDenied.map((ac) => {
+          const fallback =
+            "matchedRule" in ac.permission && ac.permission.matchedRule
+              ? `Permission denied: ${ac.permission.matchedRule}`
+              : ac.permission.reason
+                ? `Permission denied: ${ac.permission.reason}`
+                : "Permission denied: Unknown reason";
+          return {
+            type: "deny" as const,
+            approval: ac.approval,
+            reason: ac.denyReason ?? fallback,
+          };
+        }),
+      ];
+
+      const { executeApprovalBatch } = await import(
+        "./agent/approval-execution"
+      );
+      const executedResults = await executeApprovalBatch(decisions);
+
+      const approvalInput: ApprovalCreate = {
+        type: "approval",
+        approvals: executedResults as ApprovalResult[],
+      };
+
+      const approvalMessages: Array<
+        | import("@letta-ai/letta-client/resources/agents/agents").MessageCreate
+        | import("@letta-ai/letta-client/resources/agents/messages").ApprovalCreate
+      > = [approvalInput];
+
+      {
+        const { consumeQueuedSkillContent } = await import(
+          "./tools/impl/skillContentRegistry"
+        );
+        const skillContents = consumeQueuedSkillContent();
+        if (skillContents.length > 0) {
+          approvalMessages.push({
+            role: "user" as const,
+            content: skillContents.map((sc) => ({
+              type: "text" as const,
+              text: sc.content,
+            })),
+          });
+        }
+      }
+
+      const approvalStream = await sendMessageStream(
+        conversationId,
+        approvalMessages,
+        { agentId: agent.id },
+      );
+      await drainStreamWithResume(
+        approvalStream,
+        createBuffers(agent.id),
+        () => {},
+      );
+    }
+  };
 
   // Create readline interface for stdin
   const rl = readline.createInterface({
@@ -1950,11 +2208,20 @@ async function runBidirectionalMode(
 
     console.log(JSON.stringify(controlRequest));
 
+    const deferredLines: string[] = [];
+
     // Wait for control_response
-    while (true) {
+    let result: {
+      decision: "allow" | "deny";
+      reason?: string;
+      updatedInput?: Record<string, unknown> | null;
+    } | null = null;
+
+    while (result === null) {
       const line = await getNextLine();
       if (line === null) {
-        return { decision: "deny", reason: "stdin closed" };
+        result = { decision: "deny", reason: "stdin closed" };
+        break;
       }
       if (!line.trim()) continue;
 
@@ -1969,28 +2236,38 @@ async function runBidirectionalMode(
             | CanUseToolResponse
             | undefined;
           if (!response) {
-            return { decision: "deny", reason: "Invalid response format" };
+            result = { decision: "deny", reason: "Invalid response format" };
+            break;
           }
 
           if (response.behavior === "allow") {
-            return { decision: "allow", updatedInput: response.updatedInput };
+            result = {
+              decision: "allow",
+              updatedInput: response.updatedInput,
+            };
           } else {
-            return {
+            result = {
               decision: "deny",
               reason: response.message,
               // TODO: handle interrupt flag
             };
           }
+          break;
         }
-        // Put other messages back in queue for main loop
-        lineQueue.unshift(line);
-        // But since we're waiting for permission, we need to wait more
-        // Actually this causes issues - let's just ignore other messages
-        // during permission wait (they'll be lost)
+
+        // Defer other messages for the main loop without re-reading them.
+        deferredLines.push(line);
       } catch {
-        // Ignore parse errors
+        // Defer parse errors so the main loop can surface them.
+        deferredLines.push(line);
       }
     }
+
+    if (deferredLines.length > 0) {
+      lineQueue.unshift(...deferredLines);
+    }
+
+    return result;
   }
 
   // Main processing loop
@@ -2036,7 +2313,7 @@ async function runBidirectionalMode(
             response: {
               agent_id: agent.id,
               model: agent.llm_config?.model,
-              tools: agent.tools?.map((t) => t.name) || [],
+              tools: availableTools,
             },
           },
           session_id: sessionId,
@@ -2059,6 +2336,70 @@ async function runBidirectionalMode(
           uuid: crypto.randomUUID(),
         };
         console.log(JSON.stringify(interruptResponse));
+      } else if (subtype === "register_external_tools") {
+        // Register external tools from SDK
+        const toolsRequest = message.request as {
+          tools?: ExternalToolDefinition[];
+        };
+        const tools = toolsRequest.tools ?? [];
+
+        registerExternalTools(tools);
+
+        // Set up the external tool executor to send requests back to SDK
+        setExternalToolExecutor(async (toolCallId, toolName, input) => {
+          // Send execute_external_tool request to SDK
+          const execRequest: ControlRequest = {
+            type: "control_request",
+            request_id: `ext-${toolCallId}`,
+            request: {
+              subtype: "execute_external_tool",
+              tool_call_id: toolCallId,
+              tool_name: toolName,
+              input,
+            } as unknown as CanUseToolControlRequest, // Type cast for compatibility
+          };
+          console.log(JSON.stringify(execRequest));
+
+          // Wait for external_tool_result response
+          while (true) {
+            const line = await getNextLine();
+            if (line === null) {
+              return {
+                content: [{ type: "text", text: "stdin closed" }],
+                isError: true,
+              };
+            }
+            if (!line.trim()) continue;
+
+            try {
+              const msg = JSON.parse(line);
+              if (
+                msg.type === "control_response" &&
+                msg.response?.subtype === "external_tool_result" &&
+                msg.response?.tool_call_id === toolCallId
+              ) {
+                return {
+                  content: msg.response.content ?? [{ type: "text", text: "" }],
+                  isError: msg.response.is_error ?? false,
+                };
+              }
+            } catch {
+              // Ignore parse errors, keep waiting
+            }
+          }
+        });
+
+        const registerResponse: ControlResponse = {
+          type: "control_response",
+          response: {
+            subtype: "success",
+            request_id: requestId ?? "",
+            response: { registered: tools.length },
+          },
+          session_id: sessionId,
+          uuid: crypto.randomUUID(),
+        };
+        console.log(JSON.stringify(registerResponse));
       } else {
         const errorResponse: ControlResponse = {
           type: "control_response",
@@ -2089,9 +2430,32 @@ async function runBidirectionalMode(
         let lastStopReason: StopReasonType | null = null; // Track for result subtype
         let sawStreamError = false; // Track if we emitted an error during streaming
 
+        // Inject available skills as system-reminder for bidirectional mode (LET-7353)
+        let enrichedContent = userContent;
+        if (typeof enrichedContent === "string") {
+          try {
+            const {
+              discoverSkills: discover,
+              SKILLS_DIR: defaultDir,
+              formatSkillsAsSystemReminder,
+            } = await import("./agent/skills");
+            const { getSkillsDirectory } = await import("./agent/context");
+            const { join } = await import("node:path");
+            const skillsDir =
+              getSkillsDirectory() || join(process.cwd(), defaultDir);
+            const { skills } = await discover(skillsDir, agent.id);
+            const skillsReminder = formatSkillsAsSystemReminder(skills);
+            if (skillsReminder) {
+              enrichedContent = `${skillsReminder}\n\n${enrichedContent}`;
+            }
+          } catch {
+            // Skills discovery failed, skip
+          }
+        }
+
         // Initial input is the user message
         let currentInput: MessageCreate[] = [
-          { role: "user", content: userContent },
+          { role: "user", content: enrichedContent },
         ];
 
         // Approval handling loop - continue until end_turn or error
@@ -2103,10 +2467,57 @@ async function runBidirectionalMode(
             break;
           }
 
-          // Send message to agent
-          const stream = await sendMessageStream(conversationId, currentInput, {
-            agentId: agent.id,
-          });
+          // Inject queued skill content as user message parts (LET-7353)
+          {
+            const { consumeQueuedSkillContent } = await import(
+              "./tools/impl/skillContentRegistry"
+            );
+            const skillContents = consumeQueuedSkillContent();
+            if (skillContents.length > 0) {
+              currentInput = [
+                ...currentInput,
+                {
+                  role: "user" as const,
+                  content: skillContents.map((sc) => ({
+                    type: "text" as const,
+                    text: sc.content,
+                  })),
+                },
+              ];
+            }
+          }
+
+          // Send message to agent.
+          // Wrap in try-catch to handle pre-stream 409 approval-pending errors.
+          let stream: Awaited<ReturnType<typeof sendMessageStream>>;
+          try {
+            stream = await sendMessageStream(conversationId, currentInput, {
+              agentId: agent.id,
+            });
+          } catch (preStreamError) {
+            // Extract error detail using shared helper (handles nested/direct/message shapes)
+            const errorDetail = extractConflictDetail(preStreamError);
+
+            // Route through shared pre-stream conflict classifier (parity with main loop + TUI)
+            // Bidir mode has no conversation-busy retry budget, so pass 0/0 to disable busy-retry.
+            const preStreamAction = getPreStreamErrorAction(errorDetail, 0, 0);
+
+            if (preStreamAction === "resolve_approval_pending") {
+              const recoveryMsg: RecoveryMessage = {
+                type: "recovery",
+                recovery_type: "approval_pending",
+                message:
+                  "Detected pending approval conflict on send; resolving before retry",
+                session_id: sessionId,
+                uuid: `recovery-bidir-${crypto.randomUUID()}`,
+              };
+              console.log(JSON.stringify(recoveryMsg));
+              await resolveAllPendingApprovals();
+              continue;
+            }
+
+            throw preStreamError;
+          }
           const streamJsonHook: DrainStreamHook = ({
             chunk,
             shouldOutput,
@@ -2225,6 +2636,7 @@ async function runBidirectionalMode(
 
             const { autoAllowed, autoDenied, needsUserInput } =
               await classifyApprovals(approvals, {
+                alwaysRequiresUserInput: isInteractiveApprovalTool,
                 requireArgsForAutoApprove: true,
                 missingNameReason: "Tool call incomplete - missing name",
               });

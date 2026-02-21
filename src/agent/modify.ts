@@ -139,8 +139,12 @@ function buildModelSettings(
     settings = {};
   }
 
-  // Apply max_output_tokens for all providers if specified
-  if (typeof updateArgs?.max_output_tokens === "number") {
+  // Apply max_output_tokens only when provider_type is present.
+  // Without provider_type the discriminated union rejects the payload (e.g. MiniMax).
+  if (
+    typeof updateArgs?.max_output_tokens === "number" &&
+    "provider_type" in settings
+  ) {
     (settings as Record<string, unknown>).max_output_tokens =
       updateArgs.max_output_tokens;
   }
@@ -177,6 +181,9 @@ export async function updateAgentLLMConfig(
     model: modelHandle,
     ...(hasModelSettings && { model_settings: modelSettings }),
     ...(contextWindow && { context_window_limit: contextWindow }),
+    ...(typeof updateArgs?.max_output_tokens === "number" && {
+      max_tokens: updateArgs.max_output_tokens,
+    }),
   });
 
   const finalAgent = await client.agents.retrieve(agentId);
@@ -240,8 +247,13 @@ export async function updateAgentSystemPrompt(
   systemPromptId: string,
 ): Promise<UpdateSystemPromptResult> {
   try {
-    const { resolveSystemPrompt } = await import("./promptAssets");
-    const systemPromptContent = await resolveSystemPrompt(systemPromptId);
+    const { resolveSystemPrompt, SYSTEM_PROMPT_MEMORY_ADDON } = await import(
+      "./promptAssets"
+    );
+    const baseContent = await resolveSystemPrompt(systemPromptId);
+    // Append the non-memfs memory section by default.
+    // If memfs is enabled, the caller should follow up with updateAgentSystemPromptMemfs().
+    const systemPromptContent = `${baseContent}\n${SYSTEM_PROMPT_MEMORY_ADDON}`;
 
     const updateResult = await updateAgentSystemPromptRaw(
       agentId,
@@ -441,7 +453,10 @@ export async function unlinkToolsFromAgent(
 }
 
 /**
- * Updates an agent's system prompt to include or exclude the memfs addon section.
+ * Updates an agent's system prompt to swap between the memfs and non-memfs memory sections.
+ *
+ * When enabling memfs: strips any existing # Memory section, appends the memfs memory addon.
+ * When disabling memfs: strips any existing # Memory section, appends the non-memfs memory addon.
  *
  * @param agentId - The agent ID to update
  * @param enableMemfs - Whether to enable (add) or disable (remove) the memfs addon
@@ -456,17 +471,21 @@ export async function updateAgentSystemPromptMemfs(
     const agent = await client.agents.retrieve(agentId);
     let currentSystemPrompt = agent.system || "";
 
-    const { SYSTEM_PROMPT_MEMFS_ADDON } = await import("./promptAssets");
+    const { SYSTEM_PROMPT_MEMFS_ADDON, SYSTEM_PROMPT_MEMORY_ADDON } =
+      await import("./promptAssets");
 
-    // Remove any existing memfs addon section (to avoid duplicates)
-    // Look for the "## Memory Filesystem" header
-    const memfsHeaderRegex = /\n## Memory Filesystem[\s\S]*?(?=\n# |$)/;
-    currentSystemPrompt = currentSystemPrompt.replace(memfsHeaderRegex, "");
+    // Strip any existing memory section (covers both old inline "# Memory" / "## Memory"
+    // sections and the new addon format including "## Memory Filesystem" subsections).
+    // Matches from "# Memory" or "## Memory" to the next top-level heading or end of string.
+    const memoryHeaderRegex =
+      /\n#{1,2} Memory\b[\s\S]*?(?=\n#{1,2} (?!Memory|Filesystem|Structure|How It Works|Syncing|History)[^\n]|$)/;
+    currentSystemPrompt = currentSystemPrompt.replace(memoryHeaderRegex, "");
 
-    // If enabling, append the memfs addon
-    if (enableMemfs) {
-      currentSystemPrompt = `${currentSystemPrompt}${SYSTEM_PROMPT_MEMFS_ADDON}`;
-    }
+    // Append the appropriate memory section
+    const addon = enableMemfs
+      ? SYSTEM_PROMPT_MEMFS_ADDON
+      : SYSTEM_PROMPT_MEMORY_ADDON;
+    currentSystemPrompt = `${currentSystemPrompt}\n${addon}`;
 
     await client.agents.update(agentId, {
       system: currentSystemPrompt,
@@ -476,7 +495,7 @@ export async function updateAgentSystemPromptMemfs(
       success: true,
       message: enableMemfs
         ? "System prompt updated to include Memory Filesystem section"
-        : "System prompt updated to remove Memory Filesystem section",
+        : "System prompt updated to include standard Memory section",
     };
   } catch (error) {
     return {

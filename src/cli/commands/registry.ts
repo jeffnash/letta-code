@@ -44,9 +44,17 @@ export const commands: Record<string, Command> = {
       return "Processing memory request...";
     },
   },
-  "/skill": {
-    desc: "Enter skill creation mode (/skill [description])",
-    order: 28, // Advanced feature, moved below visible commands
+  "/skills": {
+    desc: "Browse available skills",
+    order: 28,
+    handler: () => {
+      // Handled specially in App.tsx to open skills browser overlay
+      return "Opening skills browser...";
+    },
+  },
+  "/skill-creator": {
+    desc: "Enter skill creation mode (/skill-creator [description])",
+    order: 28.5,
     handler: () => {
       // Handled specially in App.tsx to trigger skill-creation workflow
       return "Starting skill creation...";
@@ -58,6 +66,14 @@ export const commands: Record<string, Command> = {
     handler: () => {
       // Handled specially in App.tsx to open memory viewer
       return "Opening memory viewer...";
+    },
+  },
+  "/sleeptime": {
+    desc: "Configure reflection reminder trigger settings",
+    order: 15.5,
+    handler: () => {
+      // Handled specially in App.tsx to open sleeptime settings
+      return "Opening sleeptime settings...";
     },
   },
   "/memfs": {
@@ -135,12 +151,12 @@ export const commands: Record<string, Command> = {
       return "Updating description...";
     },
   },
-  "/download": {
-    desc: "Download AgentFile (.af)",
+  "/export": {
+    desc: "Export AgentFile (.af)",
     order: 26,
     handler: () => {
       // Handled specially in App.tsx to access agent ID and client
-      return "Downloading agent file...";
+      return "Exporting agent file...";
     },
   },
   "/toolset": {
@@ -224,6 +240,15 @@ export const commands: Record<string, Command> = {
     handler: () => {
       // Handled specially in App.tsx to open hooks manager
       return "Opening hooks manager...";
+    },
+  },
+  "/statusline": {
+    desc: "Configure status line (help|show|set|clear|test|enable|disable)",
+    args: "[subcommand]",
+    order: 36.5,
+    handler: () => {
+      // Handled specially in App.tsx
+      return "Managing status line...";
     },
   },
   "/terminal": {
@@ -358,7 +383,8 @@ export const commands: Record<string, Command> = {
     },
   },
   "/compact": {
-    desc: "Summarize conversation history (compaction)",
+    desc: "Summarize conversation history (compaction) with optional mode",
+    args: "[all|sliding_window]",
     handler: () => {
       // Handled specially in App.tsx to access client and agent ID
       return "Compacting conversation...";
@@ -401,6 +427,13 @@ export const commands: Record<string, Command> = {
     hidden: true, // Alias for /agents (opens to Pinned tab)
     handler: () => {
       return "Opening agent browser...";
+    },
+  },
+  "/download": {
+    desc: "Export AgentFile (.af)",
+    hidden: true, // Legacy alias for /export
+    handler: () => {
+      return "Exporting agent file...";
     },
   },
 };

@@ -233,6 +233,30 @@ test("Bash pattern: special characters in command", () => {
   );
 });
 
+test("Bash pattern: skill-scoped prefix matches same skill scripts", () => {
+  expect(
+    matchesBashPattern(
+      "Bash(npx tsx /tmp/letta/src/skills/builtin/creating-skills/scripts/init-skill.ts foo)",
+      "Bash(npx tsx /tmp/letta/src/skills/builtin/creating-skills:*)",
+    ),
+  ).toBe(true);
+  expect(
+    matchesBashPattern(
+      "Bash(npx tsx /tmp/letta/src/skills/builtin/creating-skills/scripts/package-skill.ts bar)",
+      "Bash(npx tsx /tmp/letta/src/skills/builtin/creating-skills:*)",
+    ),
+  ).toBe(true);
+});
+
+test("Bash pattern: skill-scoped prefix does not match other skills", () => {
+  expect(
+    matchesBashPattern(
+      "Bash(npx tsx /tmp/letta/src/skills/builtin/messaging-agents/scripts/send.ts)",
+      "Bash(npx tsx /tmp/letta/src/skills/builtin/creating-skills:*)",
+    ),
+  ).toBe(false);
+});
+
 // ============================================================================
 // Tool Pattern Matching Tests
 // ============================================================================
@@ -322,6 +346,76 @@ test("File pattern: Windows absolute path in working directory", () => {
       "Edit(src/file.ts)",
       "Edit(src/**)",
       "D:\\Coding\\Project",
+    ),
+  ).toBe(true);
+});
+
+test("File pattern: Windows absolute variants are equivalent", () => {
+  const query =
+    "Edit(C:\\Users\\Aaron\\.letta\\agents\\agent-1\\memory\\system\\project\\tech_stack.md)";
+  const workingDir = "C:\\Users\\Aaron\\repo";
+
+  expect(
+    matchesFilePattern(
+      query,
+      "Edit(/C:/Users/Aaron/.letta/agents/agent-1/memory/system/project/**)",
+      workingDir,
+    ),
+  ).toBe(true);
+
+  expect(
+    matchesFilePattern(
+      query,
+      "Edit(//C:/Users/Aaron/.letta/agents/agent-1/memory/system/project/**)",
+      workingDir,
+    ),
+  ).toBe(true);
+
+  expect(
+    matchesFilePattern(
+      query,
+      "Edit(C:/Users/Aaron/.letta/agents/agent-1/memory/system/project/**)",
+      workingDir,
+    ),
+  ).toBe(true);
+});
+
+test("File pattern: Windows drive-letter matching is case-insensitive", () => {
+  const query = "Edit(c:\\users\\aaron\\repo\\src\\file.ts)";
+  const workingDir = "C:\\Users\\Aaron\\repo";
+
+  expect(
+    matchesFilePattern(query, "Edit(C:/Users/Aaron/repo/src/**)", workingDir),
+  ).toBe(true);
+});
+
+test("File pattern: UNC absolute path matches normalized UNC pattern", () => {
+  const query = "Edit(\\\\server\\share\\folder\\file.md)";
+  const workingDir = "C:\\Users\\Aaron\\repo";
+
+  expect(
+    matchesFilePattern(query, "Edit(//server/share/folder/**)", workingDir),
+  ).toBe(true);
+});
+
+test("File pattern: extended Windows drive path matches canonical drive pattern", () => {
+  const query = String.raw`Edit(\\?\C:\Users\Aaron\folder\file.md)`;
+  const workingDir = String.raw`C:\Users\Aaron\repo`;
+
+  expect(
+    matchesFilePattern(query, "Edit(C:/Users/Aaron/folder/**)", workingDir),
+  ).toBe(true);
+});
+
+test("File pattern: extended UNC pattern matches UNC query path", () => {
+  const query = String.raw`Edit(\\server\share\folder\file.md)`;
+  const workingDir = String.raw`C:\Users\Aaron\repo`;
+
+  expect(
+    matchesFilePattern(
+      query,
+      "Edit(//?/UNC/server/share/folder/**)",
+      workingDir,
     ),
   ).toBe(true);
 });

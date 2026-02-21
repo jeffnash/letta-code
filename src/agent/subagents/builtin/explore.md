@@ -1,13 +1,13 @@
 ---
 name: explore
 description: Fast agent for codebase exploration - finding files, searching code, understanding structure
-tools: Glob, Grep, Read, LS, BashOutput
+tools: Glob, Grep, Read, LS, TaskOutput
 model:
   - group:fast
   - group:strong
   - inherit
   - any
-memoryBlocks: human, persona, skills, loaded_skills
+memoryBlocks: human, persona
 mode: stateless
 ---
 

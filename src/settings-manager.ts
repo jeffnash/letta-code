@@ -25,6 +25,20 @@ export interface SessionRef {
 }
 
 /**
+ * Configuration for a user-defined status line command.
+ */
+export interface StatusLineConfig {
+  type?: "command";
+  command: string; // Shell command (receives JSON stdin, outputs text)
+  padding?: number; // Left padding for status line output
+  timeout?: number; // Execution timeout ms (default 5000, max 30000)
+  debounceMs?: number; // Debounce for event-driven refreshes (default 300)
+  refreshIntervalMs?: number; // Optional polling interval ms (opt-in)
+  disabled?: boolean; // Disable at this level
+  prompt?: string; // Custom input prompt character (default ">")
+}
+
+/**
  * Per-agent settings stored in a flat array.
  * baseUrl is omitted/undefined for Letta API (api.letta.com).
  */
@@ -39,9 +53,14 @@ export interface Settings {
   lastAgent: string | null; // DEPRECATED: kept for migration to lastSession
   lastSession?: SessionRef; // DEPRECATED: kept for backwards compat, use sessionsByServer
   tokenStreaming: boolean;
+  showCompactions?: boolean;
   enableSleeptime: boolean;
   sessionContextEnabled: boolean; // Send device/agent context on first message of each session
-  memoryReminderInterval: number | null; // null = disabled, number = prompt memory check every N turns
+  memoryReminderInterval: number | null | "compaction" | "auto-compaction"; // DEPRECATED: use reflection* fields
+  reflectionTrigger: "off" | "step-count" | "compaction-event";
+  reflectionBehavior: "reminder" | "auto-launch";
+  reflectionStepCount: number;
+  conversationSwitchAlertEnabled: boolean; // Send system-reminder when switching conversations/agents
   defaultModel: string | null; // Default model ID for new agents (null = use server default)
   showNonCliProxyModels?: boolean; // If false, hide non-cliproxy models in selection UIs
   globalSharedBlockIds: Record<string, string>; // DEPRECATED: kept for backwards compat
@@ -50,6 +69,7 @@ export interface Settings {
   createDefaultAgents?: boolean; // Create Memo/Incognito default agents on startup (default: true)
   permissions?: PermissionRules;
   hooks?: HooksConfig; // Hook commands that run at various lifecycle points (includes disabled flag)
+  statusLine?: StatusLineConfig; // Configurable status line command
   env?: Record<string, string>;
   // Server-indexed settings (agent IDs are server-specific)
   sessionsByServer?: Record<string, SessionRef>; // key = normalized base URL (e.g., "api.letta.com", "localhost:8283")
@@ -77,6 +97,7 @@ export interface Settings {
 export interface ProjectSettings {
   localSharedBlockIds: Record<string, string>;
   hooks?: HooksConfig; // Project-specific hook commands (checked in)
+  statusLine?: StatusLineConfig; // Project-specific status line command
 }
 
 export interface LocalProjectSettings {
@@ -84,9 +105,13 @@ export interface LocalProjectSettings {
   lastSession?: SessionRef; // DEPRECATED: kept for backwards compat, use sessionsByServer
   permissions?: PermissionRules;
   hooks?: HooksConfig; // Project-specific hook commands
+  statusLine?: StatusLineConfig; // Local project-specific status line command
   profiles?: Record<string, string>; // DEPRECATED: old format, kept for migration
   pinnedAgents?: string[]; // DEPRECATED: kept for backwards compat, use pinnedAgentsByServer
-  memoryReminderInterval?: number | null; // null = disabled, number = overrides global
+  memoryReminderInterval?: number | null | "compaction" | "auto-compaction"; // DEPRECATED: use reflection* fields
+  reflectionTrigger?: "off" | "step-count" | "compaction-event";
+  reflectionBehavior?: "reminder" | "auto-launch";
+  reflectionStepCount?: number;
   // Server-indexed settings (agent IDs are server-specific)
   sessionsByServer?: Record<string, SessionRef>; // key = normalized base URL
   pinnedAgentsByServer?: Record<string, string[]>; // key = normalized base URL
@@ -95,9 +120,14 @@ export interface LocalProjectSettings {
 const DEFAULT_SETTINGS: Settings = {
   lastAgent: null,
   tokenStreaming: false,
+  showCompactions: false,
   enableSleeptime: false,
+  conversationSwitchAlertEnabled: false,
   sessionContextEnabled: true,
-  memoryReminderInterval: 5, // number = prompt memory check every N turns
+  memoryReminderInterval: 25, // DEPRECATED: use reflection* fields
+  reflectionTrigger: "step-count",
+  reflectionBehavior: "reminder",
+  reflectionStepCount: 25,
   defaultModel: null,
   showNonCliProxyModels: false,
   globalSharedBlockIds: {},
@@ -112,6 +142,10 @@ const DEFAULT_LOCAL_PROJECT_SETTINGS: LocalProjectSettings = {
 };
 
 const DEFAULT_LETTA_API_URL = "https://api.letta.com";
+
+function isSubagentProcess(): boolean {
+  return process.env.LETTA_CODE_AGENT_ROLE === "subagent";
+}
 
 /**
  * Normalize a base URL for use as a settings key.
@@ -177,8 +211,10 @@ class SettingsManager {
       // Check secrets availability and warn if not available
       await this.checkSecretsSupport();
 
-      // Migrate tokens to secrets if they exist in settings
-      await this.migrateTokensToSecrets();
+      // Migrate tokens to secrets if they exist in settings (parent process only)
+      if (!isSubagentProcess()) {
+        await this.migrateTokensToSecrets();
+      }
 
       // Migrate pinnedAgents/pinnedAgentsByServer to agents array
       this.migrateToAgentsArray();
@@ -189,7 +225,9 @@ class SettingsManager {
 
       // Still check secrets support and try to migrate in case of partial failure
       await this.checkSecretsSupport();
-      await this.migrateTokensToSecrets();
+      if (!isSubagentProcess()) {
+        await this.migrateTokensToSecrets();
+      }
       this.migrateToAgentsArray();
     }
   }
@@ -534,6 +572,7 @@ class SettingsManager {
         localSharedBlockIds:
           (rawSettings.localSharedBlockIds as Record<string, string>) ?? {},
         hooks: rawSettings.hooks as HooksConfig | undefined,
+        statusLine: rawSettings.statusLine as StatusLineConfig | undefined,
       };
 
       this.projectSettings.set(workingDirectory, projectSettings);
@@ -1387,10 +1426,17 @@ class SettingsManager {
    * Check if secrets are available
    */
   async isKeychainAvailable(): Promise<boolean> {
-    if (this.secretsAvailable === null) {
-      this.secretsAvailable = await isKeychainAvailable();
+    if (this.secretsAvailable === true) {
+      return true;
     }
-    return this.secretsAvailable;
+
+    const available = await isKeychainAvailable();
+    // Cache only positive availability to avoid pinning transient failures
+    // for the entire process lifetime.
+    if (available) {
+      this.secretsAvailable = true;
+    }
+    return available;
   }
 
   /**

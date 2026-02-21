@@ -444,7 +444,7 @@ test("plan mode - allows read-only Bash commands", () => {
   // cd && git should be allowed (common CLI pattern)
   const cdGitResult = checkPermission(
     "Bash",
-    { command: "cd /some/path && git status" },
+    { command: "cd src && git status" },
     permissions,
     "/Users/test/project",
   );
@@ -453,7 +453,7 @@ test("plan mode - allows read-only Bash commands", () => {
   // cd && git show should be allowed
   const cdGitShowResult = checkPermission(
     "Bash",
-    { command: "cd /some/path && git show abc123" },
+    { command: "cd src && git show abc123" },
     permissions,
     "/Users/test/project",
   );
@@ -471,7 +471,7 @@ test("plan mode - allows read-only Bash commands", () => {
   // cd && dangerous command should still be denied
   const cdDangerousResult = checkPermission(
     "Bash",
-    { command: "cd /some/path && npm install" },
+    { command: "cd src && npm install" },
     permissions,
     "/Users/test/project",
   );
@@ -549,4 +549,21 @@ test("Permission mode takes precedence over CLI allowedTools", () => {
 
   // Clean up
   cliPermissions.clear();
+});
+
+test("plan mode - remembers and restores previous mode", () => {
+  permissionMode.setMode("bypassPermissions");
+  expect(permissionMode.getMode()).toBe("bypassPermissions");
+
+  // Enter plan mode - should remember prior mode.
+  permissionMode.setMode("plan");
+  expect(permissionMode.getMode()).toBe("plan");
+  expect(permissionMode.getModeBeforePlan()).toBe("bypassPermissions");
+
+  // Exit plan mode by restoring previous mode.
+  permissionMode.setMode(permissionMode.getModeBeforePlan() ?? "default");
+  expect(permissionMode.getMode()).toBe("bypassPermissions");
+
+  // Once we leave plan mode, the remembered mode is consumed.
+  expect(permissionMode.getModeBeforePlan()).toBe(null);
 });

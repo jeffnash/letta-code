@@ -4,15 +4,19 @@ import { EventEmitter } from "node:events";
 import { stdin } from "node:process";
 import chalk from "chalk";
 import { Box, useInput } from "ink";
+import Link from "ink-link";
 import SpinnerLib from "ink-spinner";
 import {
   type ComponentType,
   memo,
+  type ReactNode,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
+import stringWidth from "string-width";
 import { LETTA_CLOUD_API_URL } from "../../auth/oauth";
 import {
   ELAPSED_DISPLAY_THRESHOLD_MS,
@@ -25,7 +29,6 @@ import { ralphMode } from "../../ralph/mode";
 import { settingsManager } from "../../settings-manager";
 import { charsToTokens, formatCompact } from "../helpers/format";
 import type { QueuedMessage } from "../helpers/messageQueueBridge";
-import { useTerminalWidth } from "../hooks/useTerminalWidth";
 import { colors } from "./colors";
 import { InputAssist } from "./InputAssist";
 import { PasteAwareTextInput } from "./PasteAwareTextInput";
@@ -38,6 +41,14 @@ const Spinner = SpinnerLib as ComponentType<{ type?: string }>;
 
 // Window for double-escape to clear input
 const ESC_CLEAR_WINDOW_MS = 2500;
+const FOOTER_WIDTH_STREAMING_DELTA = 2;
+
+function truncateEnd(value: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (value.length <= maxChars) return value;
+  if (maxChars <= 3) return value.slice(0, maxChars);
+  return `${value.slice(0, maxChars - 3)}...`;
+}
 
 /**
  * Represents a visual line segment in the text.
@@ -100,6 +111,85 @@ function findCursorLine(
   };
 }
 
+// Matches OSC 8 hyperlink sequences: \x1b]8;;URL\x1b\DISPLAY\x1b]8;;\x1b\
+// biome-ignore lint/suspicious/noControlCharactersInRegex: OSC 8 escape sequences require \x1b
+const OSC8_REGEX = /\x1b\]8;;([^\x1b]*)\x1b\\([^\x1b]*)\x1b\]8;;\x1b\\/g;
+
+function parseOsc8Line(line: string, keyPrefix: string): ReactNode[] {
+  const parts: ReactNode[] = [];
+  let lastIndex = 0;
+  const regex = new RegExp(OSC8_REGEX.source, "g");
+
+  for (let match = regex.exec(line); match !== null; match = regex.exec(line)) {
+    if (match.index > lastIndex) {
+      parts.push(
+        <Text key={`${keyPrefix}-${lastIndex}`}>
+          {line.slice(lastIndex, match.index)}
+        </Text>,
+      );
+    }
+    const url = match[1] ?? "";
+    const display = match[2] ?? "";
+    parts.push(
+      <Link key={`${keyPrefix}-${match.index}`} url={url}>
+        <Text>{display}</Text>
+      </Link>,
+    );
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < line.length) {
+    parts.push(
+      <Text key={`${keyPrefix}-${lastIndex}`}>{line.slice(lastIndex)}</Text>,
+    );
+  }
+  if (parts.length === 0) {
+    parts.push(<Text key={keyPrefix}>{line}</Text>);
+  }
+  return parts;
+}
+
+function StatusLineContent({
+  text,
+  padding,
+  modeName,
+  modeColor,
+  showExitHint,
+}: {
+  text: string;
+  padding: number;
+  modeName: string | null;
+  modeColor: string | null;
+  showExitHint: boolean;
+}) {
+  const lines = text.split("\n");
+  const paddingStr = padding > 0 ? " ".repeat(padding) : "";
+  const parts: ReactNode[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) {
+      parts.push("\n");
+    }
+    if (paddingStr) {
+      parts.push(paddingStr);
+    }
+    parts.push(...parseOsc8Line(lines[i] ?? "", `l${i}`));
+  }
+  return (
+    <Text wrap="wrap">
+      <Text>{parts}</Text>
+      {modeName && modeColor && (
+        <>
+          {"\n"}
+          <Text color={modeColor}>⏵⏵ {modeName}</Text>
+          <Text color={modeColor} dimColor>
+            {" "}
+            (shift+tab to {showExitHint ? "exit" : "cycle"})
+          </Text>
+        </>
+      )}
+    </Text>
+  );
+}
+
 /**
  * Memoized footer component to prevent re-renders during high-frequency
  * shimmer/timer updates. Only updates when its specific props change.
@@ -107,7 +197,6 @@ function findCursorLine(
 const InputFooter = memo(function InputFooter({
   ctrlCPressed,
   escapePressed,
-  pendingApprovalsCount,
   isBashMode,
   modeName,
   modeColor,
@@ -116,12 +205,14 @@ const InputFooter = memo(function InputFooter({
   currentModel,
   isOpenAICodexProvider,
   isByokProvider,
-  isAutocompleteActive,
   hideFooter,
+  rightColumnWidth,
+  statusLineText,
+  statusLineRight,
+  statusLinePadding,
 }: {
   ctrlCPressed: boolean;
   escapePressed: boolean;
-  pendingApprovalsCount: number;
   isBashMode: boolean;
   modeName: string | null;
   modeColor: string | null;
@@ -130,63 +221,274 @@ const InputFooter = memo(function InputFooter({
   currentModel: string | null | undefined;
   isOpenAICodexProvider: boolean;
   isByokProvider: boolean;
-  isAutocompleteActive: boolean;
   hideFooter: boolean;
+  rightColumnWidth: number;
+  statusLineText?: string;
+  statusLineRight?: string;
+  statusLinePadding?: number;
 }) {
-  // Hide footer when autocomplete is showing
-  if (hideFooter || isAutocompleteActive) {
+  const hideFooterContent = hideFooter;
+  const maxAgentChars = Math.max(10, Math.floor(rightColumnWidth * 0.45));
+  const displayAgentName = truncateEnd(agentName || "Unnamed", maxAgentChars);
+  const byokExtraChars = isByokProvider ? 2 : 0; // " ▲"
+  const reservedChars = displayAgentName.length + byokExtraChars + 4;
+  const maxModelChars = Math.max(8, rightColumnWidth - reservedChars);
+  const displayModel = truncateEnd(currentModel ?? "unknown", maxModelChars);
+  const rightTextLength =
+    displayAgentName.length + displayModel.length + byokExtraChars + 3;
+  const rightPrefixSpaces = Math.max(0, rightColumnWidth - rightTextLength);
+  const rightLabel = useMemo(() => {
+    const parts: string[] = [];
+    parts.push(" ".repeat(rightPrefixSpaces));
+    parts.push(chalk.hex(colors.footer.agentName)(displayAgentName));
+    parts.push(chalk.dim(" ["));
+    parts.push(chalk.dim(displayModel));
+    if (isByokProvider) {
+      parts.push(chalk.dim(" "));
+      parts.push(
+        isOpenAICodexProvider ? chalk.hex("#74AA9C")("▲") : chalk.yellow("▲"),
+      );
+    }
+    parts.push(chalk.dim("]"));
+    return parts.join("");
+  }, [
+    rightPrefixSpaces,
+    displayAgentName,
+    displayModel,
+    isByokProvider,
+    isOpenAICodexProvider,
+  ]);
+
+  return (
+    <Box flexDirection="row" marginBottom={1}>
+      <Box flexGrow={1} paddingRight={1}>
+        {hideFooterContent ? (
+          <Text> </Text>
+        ) : ctrlCPressed ? (
+          <Text dimColor>Press CTRL-C again to exit</Text>
+        ) : escapePressed ? (
+          <Text dimColor>Press Esc again to clear</Text>
+        ) : isBashMode ? (
+          <Text>
+            <Text color={colors.bash.prompt}>⏵⏵ bash mode</Text>
+            <Text color={colors.bash.prompt} dimColor>
+              {" "}
+              (backspace to exit)
+            </Text>
+          </Text>
+        ) : statusLineText ? (
+          <StatusLineContent
+            text={statusLineText}
+            padding={statusLinePadding ?? 0}
+            modeName={modeName}
+            modeColor={modeColor}
+            showExitHint={showExitHint}
+          />
+        ) : modeName && modeColor ? (
+          <Text>
+            <Text color={modeColor}>⏵⏵ {modeName}</Text>
+            <Text color={modeColor} dimColor>
+              {" "}
+              (shift+tab to {showExitHint ? "exit" : "cycle"})
+            </Text>
+          </Text>
+        ) : (
+          <Text dimColor>Press / for commands</Text>
+        )}
+      </Box>
+      <Box
+        flexDirection={
+          statusLineRight && !hideFooterContent ? "column" : undefined
+        }
+        alignItems={
+          statusLineRight && !hideFooterContent ? "flex-end" : undefined
+        }
+        width={
+          statusLineRight && !hideFooterContent ? undefined : rightColumnWidth
+        }
+        flexShrink={0}
+      >
+        {hideFooterContent ? (
+          <Text>{" ".repeat(rightColumnWidth)}</Text>
+        ) : statusLineRight ? (
+          statusLineRight.split("\n").map((line, i) => (
+            <Text key={`${i}-${line}`} wrap="truncate-end">
+              {parseOsc8Line(line, `r${i}`)}
+            </Text>
+          ))
+        ) : (
+          <Text>{rightLabel}</Text>
+        )}
+      </Box>
+    </Box>
+  );
+});
+
+const StreamingStatus = memo(function StreamingStatus({
+  streaming,
+  visible,
+  tokenCount,
+  elapsedBaseMs,
+  thinkingMessage,
+  agentName,
+  interruptRequested,
+  networkPhase,
+  terminalWidth,
+  shouldAnimate,
+}: {
+  streaming: boolean;
+  visible: boolean;
+  tokenCount: number;
+  elapsedBaseMs: number;
+  thinkingMessage: string;
+  agentName: string | null | undefined;
+  interruptRequested: boolean;
+  networkPhase: "upload" | "download" | "error" | null;
+  terminalWidth: number;
+  shouldAnimate: boolean;
+}) {
+  const [shimmerOffset, setShimmerOffset] = useState(-3);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const streamStartRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!streaming || !visible || !shouldAnimate) return;
+
+    const id = setInterval(() => {
+      setShimmerOffset((prev) => {
+        // Include agent name length (+1 for space) in shimmer cycle
+        const prefixLen = agentName ? agentName.length + 1 : 0;
+        const len = prefixLen + thinkingMessage.length;
+        const next = prev + 1;
+        return next > len + 3 ? -3 : next;
+      });
+    }, 120); // Speed of shimmer animation
+
+    return () => clearInterval(id);
+  }, [streaming, thinkingMessage, visible, agentName, shouldAnimate]);
+
+  useEffect(() => {
+    if (!shouldAnimate) {
+      setShimmerOffset(-3);
+    }
+  }, [shouldAnimate]);
+
+  // Elapsed time tracking
+  useEffect(() => {
+    if (streaming && visible) {
+      // Start tracking when streaming begins
+      if (streamStartRef.current === null) {
+        streamStartRef.current = performance.now();
+      }
+      const id = setInterval(() => {
+        if (streamStartRef.current !== null) {
+          setElapsedMs(performance.now() - streamStartRef.current);
+        }
+      }, 1000);
+      return () => clearInterval(id);
+    }
+    // Reset when streaming stops
+    streamStartRef.current = null;
+    setElapsedMs(0);
+  }, [streaming, visible]);
+
+  const estimatedTokens = charsToTokens(tokenCount);
+  const totalElapsedMs = elapsedBaseMs + elapsedMs;
+  const shouldShowTokenCount =
+    streaming && estimatedTokens > TOKEN_DISPLAY_THRESHOLD;
+  const shouldShowElapsed =
+    streaming && totalElapsedMs > ELAPSED_DISPLAY_THRESHOLD_MS;
+  const elapsedLabel = formatElapsedLabel(totalElapsedMs);
+
+  const networkArrow = useMemo(() => {
+    if (!networkPhase) return "";
+    if (networkPhase === "upload") return "↑";
+    if (networkPhase === "download") return "↑"; // Use ↑ for both to avoid distracting flip (change to ↓ to restore)
+    return "↑\u0338";
+  }, [networkPhase]);
+  const showErrorArrow = networkArrow === "↑\u0338";
+  const statusContentWidth = Math.max(0, terminalWidth - 2);
+  const minMessageWidth = 12;
+  const statusHintParts = useMemo(() => {
+    const parts: string[] = [];
+    if (shouldShowElapsed) {
+      parts.push(elapsedLabel);
+    }
+    if (shouldShowTokenCount) {
+      parts.push(
+        `${formatCompact(estimatedTokens)}${networkArrow ? ` ${networkArrow}` : ""}`,
+      );
+    } else if (showErrorArrow) {
+      parts.push(networkArrow);
+    }
+    return parts;
+  }, [
+    shouldShowElapsed,
+    elapsedLabel,
+    shouldShowTokenCount,
+    estimatedTokens,
+    networkArrow,
+    showErrorArrow,
+  ]);
+  const statusHintSuffix = statusHintParts.length
+    ? ` · ${statusHintParts.join(" · ")}`
+    : "";
+  const statusHintPlain = interruptRequested
+    ? ` (interrupting${statusHintSuffix})`
+    : ` (esc to interrupt${statusHintSuffix})`;
+  const statusHintWidth = Array.from(statusHintPlain).length;
+  const maxHintWidth = Math.max(0, statusContentWidth - minMessageWidth);
+  const hintColumnWidth = Math.max(0, Math.min(statusHintWidth, maxHintWidth));
+  const maxMessageWidth = Math.max(0, statusContentWidth - hintColumnWidth);
+  const statusLabel = `${agentName ? `${agentName} ` : ""}${thinkingMessage}…`;
+  const statusLabelWidth = Array.from(statusLabel).length;
+  const messageColumnWidth = Math.max(
+    0,
+    Math.min(maxMessageWidth, Math.max(minMessageWidth, statusLabelWidth)),
+  );
+
+  // Build the status hint text (esc to interrupt · 2m · 1.2k ↑)
+  // Uses chalk.dim to match reasoning text styling
+  // Memoized to prevent unnecessary re-renders during shimmer updates
+  const statusHintText = useMemo(() => {
+    const hintColor = chalk.hex(colors.subagent.hint);
+    const hintBold = hintColor.bold;
+    const suffix = `${statusHintSuffix})`;
+    if (interruptRequested) {
+      return hintColor(` (interrupting${suffix}`);
+    }
+    return (
+      hintColor(" (") + hintBold("esc") + hintColor(` to interrupt${suffix}`)
+    );
+  }, [interruptRequested, statusHintSuffix]);
+
+  if (!streaming || !visible) {
     return null;
   }
 
-	  if (pendingApprovalsCount && pendingApprovalsCount > 0) {
-	    return (
-	      <Box justifyContent="space-between" marginBottom={1}>
-	        <Text color="yellow">
-	          ⧗ {pendingApprovalsCount} tool(s) awaiting approval - cannot send messages
-	        </Text>
-	        <Text>
-	          <Text color={colors.footer.agentName}>{agentName || "Unnamed"}</Text>
-	          <Text dimColor>{` [${currentModel ?? "unknown"}]`}</Text>
-	        </Text>
-	      </Box>
-	    );
-	  }
-
   return (
-    <Box justifyContent="space-between" marginBottom={1}>
-      {ctrlCPressed ? (
-        <Text dimColor>Press CTRL-C again to exit</Text>
-      ) : escapePressed ? (
-        <Text dimColor>Press Esc again to clear</Text>
-      ) : isBashMode ? (
-        <Text>
-          <Text color={colors.bash.prompt}>⏵⏵ bash mode</Text>
-          <Text color={colors.bash.prompt} dimColor>
-            {" "}
-            (backspace to exit)
-          </Text>
+    <Box flexDirection="row" marginBottom={1}>
+      <Box width={2} flexShrink={0}>
+        <Text color={colors.status.processing}>
+          {shouldAnimate ? <Spinner type="layer" /> : "●"}
         </Text>
-      ) : modeName && modeColor ? (
-        <Text>
-          <Text color={modeColor}>⏵⏵ {modeName}</Text>
-          <Text color={modeColor} dimColor>
-            {" "}
-            (shift+tab to {showExitHint ? "exit" : "cycle"})
-          </Text>
-        </Text>
-      ) : (
-        <Text dimColor>Press / for commands</Text>
-      )}
-      <Text>
-        <Text color={colors.footer.agentName}>{agentName || "Unnamed"}</Text>
-        <Text dimColor>
-          {` [${currentModel ?? "unknown"}`}
-          {isByokProvider && (
-            <Text color={isOpenAICodexProvider ? "#74AA9C" : "yellow"}> ▲</Text>
-          )}
-          {"]"}
-        </Text>
-      </Text>
+      </Box>
+      <Box width={statusContentWidth} flexShrink={0} flexDirection="row">
+        <Box width={messageColumnWidth} flexShrink={0}>
+          <ShimmerText
+            boldPrefix={agentName || undefined}
+            message={thinkingMessage}
+            shimmerOffset={shouldAnimate ? shimmerOffset : -3}
+            wrap="truncate-end"
+          />
+        </Box>
+        {hintColumnWidth > 0 && (
+          <Box width={hintColumnWidth} flexShrink={0}>
+            <Text wrap="truncate-end">{statusHintText}</Text>
+          </Box>
+        )}
+        <Box flexGrow={1} />
+      </Box>
     </Box>
   );
 });
@@ -216,7 +518,6 @@ export function Input({
   onExit,
   onInterrupt,
   interruptRequested = false,
-  pendingApprovalsCount = 0,
   agentId,
   agentName,
   currentModel,
@@ -233,6 +534,12 @@ export function Input({
   restoredInput,
   onRestoredInputConsumed,
   networkPhase = null,
+  terminalWidth,
+  shouldAnimate = true,
+  statusLineText,
+  statusLineRight,
+  statusLinePadding = 0,
+  statusLinePrompt,
 }: {
   visible?: boolean;
   streaming: boolean;
@@ -250,7 +557,6 @@ export function Input({
   onExit?: () => void;
   onInterrupt?: () => void;
   interruptRequested?: boolean;
-  pendingApprovalsCount?: number;
   agentId?: string;
   agentName?: string | null;
   currentModel?: string | null;
@@ -267,6 +573,12 @@ export function Input({
   restoredInput?: string | null;
   onRestoredInputConsumed?: () => void;
   networkPhase?: "upload" | "download" | "error" | null;
+  terminalWidth: number;
+  shouldAnimate?: boolean;
+  statusLineText?: string;
+  statusLineRight?: string;
+  statusLinePadding?: number;
+  statusLinePrompt?: string;
 }) {
   const [value, setValue] = useState("");
   const [escapePressed, setEscapePressed] = useState(false);
@@ -281,9 +593,15 @@ export function Input({
   const [cursorPos, setCursorPos] = useState<number | undefined>(undefined);
   const [currentCursorPosition, setCurrentCursorPosition] = useState(0);
 
-  // Terminal width (reactive to window resizing)
-  const columns = useTerminalWidth();
-  const contentWidth = Math.max(0, columns - 2);
+  // Terminal width is sourced from App.tsx to avoid duplicate resize subscriptions.
+  const columns = terminalWidth;
+
+  // Bash mode state (declared early so prompt width can feed into contentWidth)
+  const [isBashMode, setIsBashMode] = useState(false);
+
+  const promptChar = isBashMode ? "!" : statusLinePrompt || ">";
+  const promptVisualWidth = stringWidth(promptChar) + 1; // +1 for trailing space
+  const contentWidth = Math.max(0, columns - promptVisualWidth);
 
   const interactionEnabled = visible && inputEnabled;
   const reserveInputSpace = !collapseInputWhenDisabled;
@@ -292,6 +610,60 @@ export function Input({
     return Math.max(1, getVisualLines(value, contentWidth).length);
   }, [value, contentWidth]);
   const inputChromeHeight = inputRowLines + 3; // top divider + input rows + bottom divider + footer
+  const computedFooterRightColumnWidth = useMemo(
+    () => Math.max(28, Math.min(72, Math.floor(columns * 0.45))),
+    [columns],
+  );
+  const [footerRightColumnWidth, setFooterRightColumnWidth] = useState(
+    computedFooterRightColumnWidth,
+  );
+  const debugFlicker = process.env.LETTA_DEBUG_FLICKER === "1";
+
+  useEffect(() => {
+    if (!streaming) {
+      setFooterRightColumnWidth(computedFooterRightColumnWidth);
+      return;
+    }
+
+    // While streaming, keep the right column width stable to avoid occasional
+    // right-edge jitter. Allow significant shrink (terminal got smaller),
+    // defer growth until streaming ends.
+    if (computedFooterRightColumnWidth >= footerRightColumnWidth) {
+      const growthDelta =
+        computedFooterRightColumnWidth - footerRightColumnWidth;
+      if (debugFlicker && growthDelta >= FOOTER_WIDTH_STREAMING_DELTA) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[debug:flicker:footer-width] defer growth ${footerRightColumnWidth} -> ${computedFooterRightColumnWidth} (delta=${growthDelta})`,
+        );
+      }
+      return;
+    }
+
+    const shrinkDelta = footerRightColumnWidth - computedFooterRightColumnWidth;
+    if (shrinkDelta < FOOTER_WIDTH_STREAMING_DELTA) {
+      if (debugFlicker && shrinkDelta > 0) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[debug:flicker:footer-width] ignore minor shrink ${footerRightColumnWidth} -> ${computedFooterRightColumnWidth} (delta=${shrinkDelta})`,
+        );
+      }
+      return;
+    }
+
+    if (debugFlicker) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[debug:flicker:footer-width] shrink ${footerRightColumnWidth} -> ${computedFooterRightColumnWidth} (delta=${shrinkDelta})`,
+      );
+    }
+    setFooterRightColumnWidth(computedFooterRightColumnWidth);
+  }, [
+    streaming,
+    computedFooterRightColumnWidth,
+    footerRightColumnWidth,
+    debugFlicker,
+  ]);
 
   // Command history
   const [history, setHistory] = useState<string[]>([]);
@@ -305,9 +677,6 @@ export function Input({
   // Track preferred column for vertical navigation (sticky column behavior)
   const [preferredColumn, setPreferredColumn] = useState<number | null>(null);
 
-  // Bash mode state
-  const [isBashMode, setIsBashMode] = useState(false);
-
   // Restore input from error (only if current value is empty)
   useEffect(() => {
     if (restoredInput && value === "") {
@@ -319,17 +688,17 @@ export function Input({
     }
   }, [restoredInput, value, onRestoredInputConsumed]);
 
-  const handleBangAtEmpty = () => {
+  const handleBangAtEmpty = useCallback(() => {
     if (isBashMode) return false;
     setIsBashMode(true);
     return true;
-  };
+  }, [isBashMode]);
 
-  const handleBackspaceAtEmpty = () => {
+  const handleBackspaceAtEmpty = useCallback(() => {
     if (!isBashMode) return false;
     setIsBashMode(false);
     return true;
-  };
+  }, [isBashMode]);
 
   // Reset cursor position after it's been applied
   useEffect(() => {
@@ -357,11 +726,6 @@ export function Input({
       setCurrentMode(externalMode);
     }
   }, [externalMode]);
-
-  // Shimmer animation state
-  const [shimmerOffset, setShimmerOffset] = useState(-3);
-  const [elapsedMs, setElapsedMs] = useState(0);
-  const streamStartRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!interactionEnabled) {
@@ -510,8 +874,6 @@ export function Input({
   });
 
   // Handle up/down arrow keys for wrapped text navigation and command history
-  // Command history navigation: cursor is placed at END of recalled commands
-  // (matches bash/zsh behavior). Users can press Home to move to start if needed.
   useInput((_input, key) => {
     if (!interactionEnabled) return;
     // Don't interfere with autocomplete navigation, BUT allow history navigation
@@ -597,13 +959,13 @@ export function Input({
           setHistoryIndex(history.length - 1);
           const historyEntry = history[history.length - 1] ?? "";
           setValue(historyEntry);
-          setCursorPos(historyEntry.length); // Cursor at end (bash/zsh behavior, allows appending args)
+          setCursorPos(historyEntry.length); // Cursor at end (traditional terminal behavior)
         } else if (historyIndex > 0) {
           // Go to older command
           setHistoryIndex(historyIndex - 1);
           const olderEntry = history[historyIndex - 1] ?? "";
           setValue(olderEntry);
-          setCursorPos(olderEntry.length); // Cursor at end (bash/zsh behavior, allows appending args)
+          setCursorPos(olderEntry.length); // Cursor at end (traditional terminal behavior)
         }
       } else if (key.downArrow) {
         const targetLine = visualLines[lineIndex + 1];
@@ -689,43 +1051,7 @@ export function Input({
     };
   }, []);
 
-  // Shimmer animation effect
-  useEffect(() => {
-    if (!streaming || !visible) return;
-
-    const id = setInterval(() => {
-      setShimmerOffset((prev) => {
-        // Include agent name length (+1 for space) in shimmer cycle
-        const prefixLen = agentName ? agentName.length + 1 : 0;
-        const len = prefixLen + thinkingMessage.length;
-        const next = prev + 1;
-        return next > len + 3 ? -3 : next;
-      });
-    }, 120); // Speed of shimmer animation
-
-    return () => clearInterval(id);
-  }, [streaming, thinkingMessage, visible, agentName]);
-
-  // Elapsed time tracking
-  useEffect(() => {
-    if (streaming && visible) {
-      // Start tracking when streaming begins
-      if (streamStartRef.current === null) {
-        streamStartRef.current = performance.now();
-      }
-      const id = setInterval(() => {
-        if (streamStartRef.current !== null) {
-          setElapsedMs(performance.now() - streamStartRef.current);
-        }
-      }, 1000);
-      return () => clearInterval(id);
-    }
-    // Reset when streaming stops
-    streamStartRef.current = null;
-    setElapsedMs(0);
-  }, [streaming, visible]);
-
-  const handleSubmit = async () => {
+  const handleSubmit = useCallback(async () => {
     // Don't submit if autocomplete is active with matches
     if (isAutocompleteActive) {
       return;
@@ -741,9 +1067,10 @@ export function Input({
       if (bashRunning) return;
 
       // Add to history if not empty and not a duplicate of the last entry
-      if (previousValue.trim() !== history[history.length - 1]) {
-        setHistory([...history, previousValue]);
-      }
+      setHistory((prev) => {
+        if (previousValue.trim() === prev[prev.length - 1]) return prev;
+        return [...prev, previousValue];
+      });
 
       // Reset history navigation
       setHistoryIndex(-1);
@@ -758,8 +1085,11 @@ export function Input({
     }
 
     // Add to history if not empty and not a duplicate of the last entry
-    if (previousValue.trim() && previousValue !== history[history.length - 1]) {
-      setHistory([...history, previousValue]);
+    if (previousValue.trim()) {
+      setHistory((prev) => {
+        if (previousValue === prev[prev.length - 1]) return prev;
+        return [...prev, previousValue];
+      });
     }
 
     // Reset history navigation
@@ -772,63 +1102,79 @@ export function Input({
     if (!result.submitted) {
       setValue(previousValue);
     }
-  };
+  }, [
+    isAutocompleteActive,
+    value,
+    isBashMode,
+    bashRunning,
+    onBashSubmit,
+    onSubmit,
+  ]);
 
   // Handle file selection from autocomplete
-  const handleFileSelect = (selectedPath: string) => {
-    // Find the last "@" and replace everything after it with the selected path
-    const atIndex = value.lastIndexOf("@");
-    if (atIndex === -1) return;
+  const handleFileSelect = useCallback(
+    (selectedPath: string) => {
+      // Find the last "@" and replace everything after it with the selected path
+      const atIndex = value.lastIndexOf("@");
+      if (atIndex === -1) return;
 
-    const beforeAt = value.slice(0, atIndex);
-    const afterAt = value.slice(atIndex + 1);
-    const spaceIndex = afterAt.indexOf(" ");
+      const beforeAt = value.slice(0, atIndex);
+      const afterAt = value.slice(atIndex + 1);
+      const spaceIndex = afterAt.indexOf(" ");
 
-    let newValue: string;
-    let newCursorPos: number;
+      let newValue: string;
+      let newCursorPos: number;
 
-    // Replace the query part with the selected path
-    if (spaceIndex === -1) {
-      // No space after @query, replace to end
-      newValue = `${beforeAt}@${selectedPath} `;
-      newCursorPos = newValue.length;
-    } else {
-      // Space exists, replace only the query part
-      const afterQuery = afterAt.slice(spaceIndex);
-      newValue = `${beforeAt}@${selectedPath}${afterQuery}`;
-      newCursorPos = beforeAt.length + selectedPath.length + 1; // After the path
-    }
+      // Replace the query part with the selected path
+      if (spaceIndex === -1) {
+        // No space after @query, replace to end
+        newValue = `${beforeAt}@${selectedPath} `;
+        newCursorPos = newValue.length;
+      } else {
+        // Space exists, replace only the query part
+        const afterQuery = afterAt.slice(spaceIndex);
+        newValue = `${beforeAt}@${selectedPath}${afterQuery}`;
+        newCursorPos = beforeAt.length + selectedPath.length + 1; // After the path
+      }
 
-    setValue(newValue);
-    setCursorPos(newCursorPos);
-  };
+      setValue(newValue);
+      setCursorPos(newCursorPos);
+    },
+    [value],
+  );
 
   // Handle slash command selection from autocomplete (Enter key - execute)
-  const handleCommandSelect = async (selectedCommand: string) => {
-    // For slash commands, submit immediately when selected via Enter
-    // This provides a better UX - pressing Enter on /model should open the model selector
-    const commandToSubmit = selectedCommand.trim();
+  const handleCommandSelect = useCallback(
+    async (selectedCommand: string) => {
+      // For slash commands, submit immediately when selected via Enter
+      // This provides a better UX - pressing Enter on /model should open the model selector
+      const commandToSubmit = selectedCommand.trim();
 
-    // Add to history if not a duplicate of the last entry
-    if (commandToSubmit && commandToSubmit !== history[history.length - 1]) {
-      setHistory([...history, commandToSubmit]);
-    }
+      // Add to history if not a duplicate of the last entry
+      if (commandToSubmit) {
+        setHistory((prev) => {
+          if (commandToSubmit === prev[prev.length - 1]) return prev;
+          return [...prev, commandToSubmit];
+        });
+      }
 
-    // Reset history navigation
-    setHistoryIndex(-1);
-    setTemporaryInput("");
+      // Reset history navigation
+      setHistoryIndex(-1);
+      setTemporaryInput("");
 
-    setValue(""); // Clear immediately for responsiveness
-    await onSubmit(commandToSubmit);
-  };
+      setValue(""); // Clear immediately for responsiveness
+      await onSubmit(commandToSubmit);
+    },
+    [onSubmit],
+  );
 
   // Handle slash command autocomplete (Tab key - fill text only)
-  const handleCommandAutocomplete = (selectedCommand: string) => {
+  const handleCommandAutocomplete = useCallback((selectedCommand: string) => {
     // Just fill in the command text without executing
     // User can then press Enter to execute or continue typing arguments
     setValue(selectedCommand);
     setCursorPos(selectedCommand.length);
-  };
+  }, []);
 
   // Get display name and color for permission mode (ralph modes take precedence)
   // Memoized to prevent unnecessary footer re-renders
@@ -883,59 +1229,142 @@ export function Input({
     }
   }, [ralphPending, ralphPendingYolo, ralphActive, currentMode]);
 
-  const estimatedTokens = charsToTokens(tokenCount);
-  const totalElapsedMs = elapsedBaseMs + elapsedMs;
-  const shouldShowTokenCount =
-    streaming && estimatedTokens > TOKEN_DISPLAY_THRESHOLD;
-  const shouldShowElapsed =
-    streaming && totalElapsedMs > ELAPSED_DISPLAY_THRESHOLD_MS;
-  const elapsedLabel = formatElapsedLabel(totalElapsedMs);
-
-  const networkArrow = useMemo(() => {
-    if (!networkPhase) return "";
-    if (networkPhase === "upload") return "↑";
-    if (networkPhase === "download") return "↑"; // Use ↑ for both to avoid distracting flip (change to ↓ to restore)
-    return "↑\u0338";
-  }, [networkPhase]);
-  const showErrorArrow = networkArrow === "↑\u0338";
-
-  // Build the status hint text (esc to interrupt · 2m · 1.2k ↑)
-  // Uses chalk.dim to match reasoning text styling
-  // Memoized to prevent unnecessary re-renders during shimmer updates
-  const statusHintText = useMemo(() => {
-    const hintColor = chalk.hex(colors.subagent.hint);
-    const hintBold = hintColor.bold;
-    const parts: string[] = [];
-    if (shouldShowElapsed) {
-      parts.push(elapsedLabel);
-    }
-    if (shouldShowTokenCount) {
-      parts.push(
-        `${formatCompact(estimatedTokens)}${networkArrow ? ` ${networkArrow}` : ""}`,
-      );
-    } else if (showErrorArrow) {
-      parts.push(networkArrow);
-    }
-    const suffix = `${parts.length > 0 ? ` · ${parts.join(" · ")}` : ""})`;
-    if (interruptRequested) {
-      return hintColor(` (interrupting${suffix}`);
-    }
-    return (
-      hintColor(" (") + hintBold("esc") + hintColor(` to interrupt${suffix}`)
-    );
-  }, [
-    shouldShowElapsed,
-    elapsedLabel,
-    shouldShowTokenCount,
-    estimatedTokens,
-    interruptRequested,
-    networkArrow,
-    showErrorArrow,
-  ]);
-
   // Create a horizontal line using box-drawing characters
   // Memoized since it only changes when terminal width changes
   const horizontalLine = useMemo(() => "─".repeat(columns), [columns]);
+
+  const lowerPane = useMemo(() => {
+    return (
+      <>
+        {/* Queue display - show whenever there are queued messages */}
+        {messageQueue && messageQueue.length > 0 && (
+          <QueuedMessages messages={messageQueue} />
+        )}
+
+        {interactionEnabled ? (
+          <Box flexDirection="column">
+            {/* Top horizontal divider */}
+            <Text
+              dimColor={!isBashMode}
+              color={isBashMode ? colors.bash.border : undefined}
+            >
+              {horizontalLine}
+            </Text>
+
+            {/* Two-column layout for input, matching message components */}
+            <Box flexDirection="row">
+              <Box width={promptVisualWidth} flexShrink={0}>
+                <Text
+                  color={isBashMode ? colors.bash.prompt : colors.input.prompt}
+                >
+                  {promptChar}
+                </Text>
+                <Text> </Text>
+              </Box>
+              <Box flexGrow={1} width={contentWidth}>
+                <PasteAwareTextInput
+                  value={value}
+                  onChange={setValue}
+                  onSubmit={handleSubmit}
+                  cursorPosition={cursorPos}
+                  onCursorMove={setCurrentCursorPosition}
+                  focus={interactionEnabled && !onEscapeCancel}
+                  onBangAtEmpty={handleBangAtEmpty}
+                  onBackspaceAtEmpty={handleBackspaceAtEmpty}
+                  onPasteError={onPasteError}
+                />
+              </Box>
+            </Box>
+
+            {/* Bottom horizontal divider */}
+            <Text
+              dimColor={!isBashMode}
+              color={isBashMode ? colors.bash.border : undefined}
+            >
+              {horizontalLine}
+            </Text>
+
+            <InputAssist
+              currentInput={value}
+              cursorPosition={currentCursorPosition}
+              onFileSelect={handleFileSelect}
+              onCommandSelect={handleCommandSelect}
+              onCommandAutocomplete={handleCommandAutocomplete}
+              onAutocompleteActiveChange={setIsAutocompleteActive}
+              agentId={agentId}
+              agentName={agentName}
+              serverUrl={serverUrl}
+              workingDirectory={process.cwd()}
+              conversationId={conversationId}
+            />
+
+            <InputFooter
+              ctrlCPressed={ctrlCPressed}
+              escapePressed={escapePressed}
+              isBashMode={isBashMode}
+              modeName={modeInfo?.name ?? null}
+              modeColor={modeInfo?.color ?? null}
+              showExitHint={ralphActive || ralphPending}
+              agentName={agentName}
+              currentModel={currentModel}
+              isOpenAICodexProvider={
+                currentModelProvider === OPENAI_CODEX_PROVIDER_NAME
+              }
+              isByokProvider={
+                currentModelProvider?.startsWith("lc-") ||
+                currentModelProvider === OPENAI_CODEX_PROVIDER_NAME
+              }
+              hideFooter={hideFooter}
+              rightColumnWidth={footerRightColumnWidth}
+              statusLineText={statusLineText}
+              statusLineRight={statusLineRight}
+              statusLinePadding={statusLinePadding}
+            />
+          </Box>
+        ) : reserveInputSpace ? (
+          <Box height={inputChromeHeight} />
+        ) : null}
+      </>
+    );
+  }, [
+    messageQueue,
+    interactionEnabled,
+    isBashMode,
+    horizontalLine,
+    contentWidth,
+    value,
+    handleSubmit,
+    cursorPos,
+    onEscapeCancel,
+    handleBangAtEmpty,
+    handleBackspaceAtEmpty,
+    onPasteError,
+    currentCursorPosition,
+    handleFileSelect,
+    handleCommandSelect,
+    handleCommandAutocomplete,
+    agentId,
+    agentName,
+    serverUrl,
+    conversationId,
+    ctrlCPressed,
+    escapePressed,
+    modeInfo?.name,
+    modeInfo?.color,
+    ralphActive,
+    ralphPending,
+    currentModel,
+    currentModelProvider,
+    hideFooter,
+    footerRightColumnWidth,
+    reserveInputSpace,
+    inputChromeHeight,
+    statusLineText,
+    statusLineRight,
+    statusLinePadding,
+    promptChar,
+    promptVisualWidth,
+  ]);
 
   // If not visible, render nothing but keep component mounted to preserve state
   if (!visible) {
@@ -944,111 +1373,19 @@ export function Input({
 
   return (
     <Box flexDirection="column">
-      {/* Live status / token counter - only show when streaming */}
-      {streaming && (
-        <Box flexDirection="row" marginBottom={1}>
-          <Box width={2} flexShrink={0}>
-            <Text color={colors.status.processing}>
-              <Spinner type="layer" />
-            </Text>
-          </Box>
-          <Box flexGrow={1} flexDirection="row">
-            <ShimmerText
-              boldPrefix={agentName || undefined}
-              message={thinkingMessage}
-              shimmerOffset={shimmerOffset}
-            />
-            <Text>{statusHintText}</Text>
-          </Box>
-        </Box>
-      )}
-
-      {/* Queue display - show whenever there are queued messages */}
-      {messageQueue && messageQueue.length > 0 && (
-        <QueuedMessages messages={messageQueue} />
-      )}
-
-      {interactionEnabled ? (
-        <Box flexDirection="column">
-          {/* Top horizontal divider */}
-          <Text
-            dimColor={!isBashMode}
-            color={isBashMode ? colors.bash.border : undefined}
-          >
-            {horizontalLine}
-          </Text>
-
-          {/* Two-column layout for input, matching message components */}
-          <Box flexDirection="row">
-            <Box width={2} flexShrink={0}>
-              <Text
-                color={isBashMode ? colors.bash.prompt : colors.input.prompt}
-              >
-                {isBashMode ? "!" : ">"}
-              </Text>
-              <Text> </Text>
-            </Box>
-            <Box flexGrow={1} width={contentWidth}>
-              <PasteAwareTextInput
-                value={value}
-                onChange={setValue}
-                onSubmit={handleSubmit}
-                cursorPosition={cursorPos}
-                onCursorMove={setCurrentCursorPosition}
-                focus={interactionEnabled && !onEscapeCancel}
-                onBangAtEmpty={handleBangAtEmpty}
-                onBackspaceAtEmpty={handleBackspaceAtEmpty}
-                onPasteError={onPasteError}
-              />
-            </Box>
-          </Box>
-
-          {/* Bottom horizontal divider */}
-          <Text
-            dimColor={!isBashMode}
-            color={isBashMode ? colors.bash.border : undefined}
-          >
-            {horizontalLine}
-          </Text>
-
-          <InputAssist
-            currentInput={value}
-            cursorPosition={currentCursorPosition}
-            onFileSelect={handleFileSelect}
-            onCommandSelect={handleCommandSelect}
-            onCommandAutocomplete={handleCommandAutocomplete}
-            onAutocompleteActiveChange={setIsAutocompleteActive}
-            agentId={agentId}
-            agentName={agentName}
-            serverUrl={serverUrl}
-            workingDirectory={process.cwd()}
-            conversationId={conversationId}
-          />
-
-          <InputFooter
-            ctrlCPressed={ctrlCPressed}
-            escapePressed={escapePressed}
-            pendingApprovalsCount={pendingApprovalsCount}
-            isBashMode={isBashMode}
-            modeName={modeInfo?.name ?? null}
-            modeColor={modeInfo?.color ?? null}
-            showExitHint={ralphActive || ralphPending}
-            agentName={agentName}
-            currentModel={currentModel}
-            isOpenAICodexProvider={
-              currentModelProvider === OPENAI_CODEX_PROVIDER_NAME
-            }
-            isByokProvider={
-              currentModelProvider?.startsWith("lc-") ||
-              currentModelProvider === OPENAI_CODEX_PROVIDER_NAME
-            }
-            isAutocompleteActive={isAutocompleteActive}
-            hideFooter={hideFooter}
-          />
-        </Box>
-      ) : reserveInputSpace ? (
-        <Box height={inputChromeHeight} />
-      ) : null}
+      <StreamingStatus
+        streaming={streaming}
+        visible={visible}
+        tokenCount={tokenCount}
+        elapsedBaseMs={elapsedBaseMs}
+        thinkingMessage={thinkingMessage}
+        agentName={agentName}
+        interruptRequested={interruptRequested}
+        networkPhase={networkPhase}
+        terminalWidth={columns}
+        shouldAnimate={shouldAnimate}
+      />
+      {lowerPane}
     </Box>
   );
 }

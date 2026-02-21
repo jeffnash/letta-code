@@ -6,11 +6,45 @@
 
 import type { LettaStreamingResponse } from "@letta-ai/letta-client/resources/agents/messages";
 import { INTERRUPTED_BY_USER } from "../../constants";
-import { runPostToolUseHooks, runPreToolUseHooks } from "../../hooks";
+import {
+  runPostToolUseHooks,
+  runPreCompactHooks,
+  runPreToolUseHooks,
+} from "../../hooks";
 import { debugLog } from "../../utils/debug";
 import { extractCompactionSummary } from "./backfill";
+import type { ContextTracker } from "./contextTracker";
+import { MAX_CONTEXT_HISTORY } from "./contextTracker";
 import { findLastSafeSplitPoint } from "./markdownSplit";
 import { isShellTool } from "./toolNameMapping";
+
+type CompactionSummaryMessageChunk = {
+  message_type: "summary_message";
+  id?: string;
+  otid?: string;
+  summary?: string;
+  compaction_stats?: {
+    trigger?: string;
+    context_tokens_before?: number;
+    context_tokens_after?: number;
+    context_window?: number;
+    messages_count_before?: number;
+    messages_count_after?: number;
+  };
+};
+
+type CompactionEventMessageChunk = {
+  message_type: "event_message";
+  id?: string;
+  otid?: string;
+  event_type?: string;
+  event_data?: Record<string, unknown>;
+};
+
+type StreamingChunk =
+  | LettaStreamingResponse
+  | CompactionSummaryMessageChunk
+  | CompactionEventMessageChunk;
 
 // Constants for streaming output
 const MAX_TAIL_LINES = 5;
@@ -156,9 +190,10 @@ export type Line =
       id: string;
       input: string;
       output: string;
-      phase?: "running" | "finished";
+      phase?: "running" | "waiting" | "finished";
       success?: boolean;
       dimOutput?: boolean;
+      preformatted?: boolean;
     }
   | {
       kind: "bash_command";
@@ -203,6 +238,12 @@ export type Buffers = {
   pendingToolByRun: Map<string, string>; // temporary id per run until real id
   toolCallIdToLineId: Map<string, string>;
   lastOtid: string | null; // Track the last otid to detect transitions
+  // Alias maps to keep assistant deltas on one line when streams mix id/otid.
+  assistantCanonicalByMessageId: Map<string, string>;
+  assistantCanonicalByOtid: Map<string, string>;
+  // Alias maps to keep reasoning deltas on one line when streams mix id/otid.
+  reasoningCanonicalByMessageId: Map<string, string>;
+  reasoningCanonicalByOtid: Map<string, string>;
   pendingRefresh?: boolean; // Track throttled refresh state
   interrupted?: boolean; // Track if stream was interrupted by user (skip stale refreshes)
   commitGeneration?: number; // Incremented when resuming from error to invalidate pending refreshes
@@ -213,12 +254,12 @@ export type Buffers = {
     promptTokens: number;
     completionTokens: number;
     totalTokens: number;
-    cachedTokens: number;
+    cachedInputTokens: number;
+    cacheWriteTokens: number;
     reasoningTokens: number;
+    contextTokens?: number;
     stepCount: number;
   };
-  // Most recent context_tokens from usage_statistics (estimate of tokens in context window)
-  lastContextTokens: number;
   // Aggressive static promotion: split streaming content at paragraph boundaries
   tokenStreamingEnabled?: boolean;
   splitCounters: Map<string, number>; // tracks split count per original otid
@@ -238,17 +279,21 @@ export function createBuffers(agentId?: string): Buffers {
     pendingToolByRun: new Map(),
     toolCallIdToLineId: new Map(),
     lastOtid: null,
+    assistantCanonicalByMessageId: new Map(),
+    assistantCanonicalByOtid: new Map(),
+    reasoningCanonicalByMessageId: new Map(),
+    reasoningCanonicalByOtid: new Map(),
     commitGeneration: 0,
     abortGeneration: 0,
     usage: {
       promptTokens: 0,
       completionTokens: 0,
       totalTokens: 0,
-      cachedTokens: 0,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
       reasoningTokens: 0,
       stepCount: 0,
     },
-    lastContextTokens: 0,
     tokenStreamingEnabled: false,
     splitCounters: new Map(),
     serverToolCalls: new Map(),
@@ -406,6 +451,172 @@ function extractTextPart(v: unknown): string {
   return "";
 }
 
+function resolveLineIdForKind(
+  b: Buffers,
+  canonicalId: string,
+  kind: "assistant" | "reasoning",
+): string {
+  const existing = b.byId.get(canonicalId);
+  if (!existing || existing.kind === kind) return canonicalId;
+
+  // Avoid cross-kind collisions when providers reuse the same id/otid.
+  return `${kind}:${canonicalId}`;
+}
+
+function resolveAssistantLineId(
+  b: Buffers,
+  chunk: LettaStreamingResponse & { id?: string; otid?: string },
+): string | undefined {
+  const messageId = typeof chunk.id === "string" ? chunk.id : undefined;
+  const otid = typeof chunk.otid === "string" ? chunk.otid : undefined;
+
+  const canonicalFromMessageId = messageId
+    ? b.assistantCanonicalByMessageId.get(messageId)
+    : undefined;
+  const canonicalFromOtid = otid
+    ? b.assistantCanonicalByOtid.get(otid)
+    : undefined;
+
+  let canonical =
+    canonicalFromMessageId || canonicalFromOtid || messageId || otid;
+  if (!canonical) return undefined;
+
+  // When a new otid arrives whose messageId maps to an already-finished line,
+  // start a fresh canonical so the new content block gets its own line.
+  // This handles Anthropic responses like [text, thinking, text] where both
+  // text blocks share the same message id but need separate rendering lifecycles
+  // (the first gets committed to static before the second starts streaming).
+  if (otid && !canonicalFromOtid && canonicalFromMessageId) {
+    const existingLineId = resolveLineIdForKind(
+      b,
+      canonicalFromMessageId,
+      "assistant",
+    );
+    const existingLine = b.byId.get(existingLineId);
+    if (
+      existingLine &&
+      existingLine.kind === "assistant" &&
+      "phase" in existingLine &&
+      existingLine.phase === "finished"
+    ) {
+      canonical = otid;
+    }
+  }
+
+  // If both aliases exist but disagree, prefer the one that already has a line.
+  if (
+    canonicalFromMessageId &&
+    canonicalFromOtid &&
+    canonicalFromMessageId !== canonicalFromOtid
+  ) {
+    const messageLineExists = b.byId.has(canonicalFromMessageId);
+    const otidLineExists = b.byId.has(canonicalFromOtid);
+
+    if (messageLineExists && !otidLineExists) {
+      canonical = canonicalFromMessageId;
+    } else if (otidLineExists && !messageLineExists) {
+      canonical = canonicalFromOtid;
+    } else {
+      canonical = canonicalFromMessageId;
+    }
+
+    debugLog(
+      "accumulator",
+      `Assistant id/otid alias conflict resolved to ${canonical}`,
+    );
+  }
+
+  if (messageId) {
+    b.assistantCanonicalByMessageId.set(messageId, canonical);
+  }
+  if (otid) {
+    b.assistantCanonicalByOtid.set(otid, canonical);
+  }
+
+  const lineId = resolveLineIdForKind(b, canonical, "assistant");
+  if (lineId !== canonical) {
+    if (messageId) b.assistantCanonicalByMessageId.set(messageId, lineId);
+    if (otid) b.assistantCanonicalByOtid.set(otid, lineId);
+  }
+
+  return lineId;
+}
+
+function resolveReasoningLineId(
+  b: Buffers,
+  chunk: LettaStreamingResponse & { id?: string; otid?: string },
+): string | undefined {
+  const messageId = typeof chunk.id === "string" ? chunk.id : undefined;
+  const otid = typeof chunk.otid === "string" ? chunk.otid : undefined;
+
+  const canonicalFromMessageId = messageId
+    ? b.reasoningCanonicalByMessageId.get(messageId)
+    : undefined;
+  const canonicalFromOtid = otid
+    ? b.reasoningCanonicalByOtid.get(otid)
+    : undefined;
+
+  let canonical =
+    canonicalFromMessageId || canonicalFromOtid || messageId || otid;
+  if (!canonical) return undefined;
+
+  // Same fix as resolveAssistantLineId: when a new otid maps to a
+  // finished reasoning line via messageId, start a fresh canonical.
+  if (otid && !canonicalFromOtid && canonicalFromMessageId) {
+    const existingLineId = resolveLineIdForKind(
+      b,
+      canonicalFromMessageId,
+      "reasoning",
+    );
+    const existingLine = b.byId.get(existingLineId);
+    if (
+      existingLine &&
+      existingLine.kind === "reasoning" &&
+      "phase" in existingLine &&
+      existingLine.phase === "finished"
+    ) {
+      canonical = otid;
+    }
+  }
+
+  if (
+    canonicalFromMessageId &&
+    canonicalFromOtid &&
+    canonicalFromMessageId !== canonicalFromOtid
+  ) {
+    const messageLineExists = b.byId.has(canonicalFromMessageId);
+    const otidLineExists = b.byId.has(canonicalFromOtid);
+
+    if (messageLineExists && !otidLineExists) {
+      canonical = canonicalFromMessageId;
+    } else if (otidLineExists && !messageLineExists) {
+      canonical = canonicalFromOtid;
+    } else {
+      canonical = canonicalFromMessageId;
+    }
+
+    debugLog(
+      "accumulator",
+      `Reasoning id/otid alias conflict resolved to ${canonical}`,
+    );
+  }
+
+  if (messageId) {
+    b.reasoningCanonicalByMessageId.set(messageId, canonical);
+  }
+  if (otid) {
+    b.reasoningCanonicalByOtid.set(otid, canonical);
+  }
+
+  const lineId = resolveLineIdForKind(b, canonical, "reasoning");
+  if (lineId !== canonical) {
+    if (messageId) b.reasoningCanonicalByMessageId.set(messageId, lineId);
+    if (otid) b.reasoningCanonicalByOtid.set(otid, lineId);
+  }
+
+  return lineId;
+}
+
 /**
  * Attempts to split content at a paragraph boundary for aggressive static promotion.
  * If split found, creates a committed line for "before" and updates original with "after".
@@ -464,7 +675,11 @@ function trySplitContent(
 }
 
 // Feed one SDK chunk; mutate buffers in place.
-export function onChunk(b: Buffers, chunk: LettaStreamingResponse) {
+export function onChunk(
+  b: Buffers,
+  chunk: StreamingChunk,
+  ctx?: ContextTracker,
+) {
   // Skip processing if stream was interrupted mid-turn. handleInterrupt already
   // rendered the cancellation state, so we should ignore any buffered chunks
   // that arrive before drainStream exits.
@@ -479,7 +694,11 @@ export function onChunk(b: Buffers, chunk: LettaStreamingResponse) {
 
   switch (chunk.message_type) {
     case "reasoning_message": {
-      const id = chunk.otid;
+      const chunkWithIds = chunk as LettaStreamingResponse & {
+        id?: string;
+        otid?: string;
+      };
+      const id = resolveReasoningLineId(b, chunkWithIds);
       // console.log(`[REASONING] Received chunk with otid=${id}, delta="${chunk.reasoning?.substring(0, 50)}..."`);
       if (!id) {
         // console.log(`[REASONING] No otid, breaking`);
@@ -511,7 +730,13 @@ export function onChunk(b: Buffers, chunk: LettaStreamingResponse) {
     }
 
     case "assistant_message": {
-      const id = chunk.otid;
+      const chunkWithIds = chunk as LettaStreamingResponse & {
+        id?: string;
+        otid?: string;
+      };
+      // Resolve to a stable line id across mixed streams where some chunks
+      // have only id, only otid, or both.
+      const id = resolveAssistantLineId(b, chunkWithIds);
       if (!id) break;
 
       // Handle otid transition (mark previous line as finished)
@@ -805,10 +1030,57 @@ export function onChunk(b: Buffers, chunk: LettaStreamingResponse) {
       if (chunk.total_tokens !== undefined) {
         b.usage.totalTokens += chunk.total_tokens;
       }
+      if (
+        chunk.cached_input_tokens !== undefined &&
+        chunk.cached_input_tokens !== null
+      ) {
+        b.usage.cachedInputTokens += chunk.cached_input_tokens;
+      }
+      if (
+        chunk.cache_write_tokens !== undefined &&
+        chunk.cache_write_tokens !== null
+      ) {
+        b.usage.cacheWriteTokens += chunk.cache_write_tokens;
+      }
+      if (
+        chunk.reasoning_tokens !== undefined &&
+        chunk.reasoning_tokens !== null
+      ) {
+        b.usage.reasoningTokens += chunk.reasoning_tokens;
+      }
+      const usageChunk = chunk as typeof chunk & {
+        context_tokens?: number | null;
+      };
+      if (
+        usageChunk.context_tokens !== undefined &&
+        usageChunk.context_tokens !== null
+      ) {
+        // context_tokens is a snapshot metric, not additive.
+        b.usage.contextTokens = usageChunk.context_tokens;
+      }
       // Use context_tokens from SDK (estimate of tokens in context window)
-      const usageChunk = chunk as typeof chunk & { context_tokens?: number };
-      if (usageChunk.context_tokens !== undefined) {
-        b.lastContextTokens = usageChunk.context_tokens;
+      if (ctx) {
+        if (
+          usageChunk.context_tokens !== undefined &&
+          usageChunk.context_tokens !== null
+        ) {
+          ctx.lastContextTokens = usageChunk.context_tokens;
+          // Track history for time-series display
+          const compacted = ctx.pendingCompaction;
+          if (compacted) ctx.pendingCompaction = false;
+          ctx.contextTokensHistory.push({
+            timestamp: Date.now(),
+            tokens: usageChunk.context_tokens,
+            turnId: ctx.currentTurnId,
+            ...(compacted ? { compacted: true } : {}),
+          });
+          // Cap history length to avoid unbounded growth
+          if (ctx.contextTokensHistory.length > MAX_CONTEXT_HISTORY) {
+            ctx.contextTokensHistory = ctx.contextTokensHistory.slice(
+              -MAX_CONTEXT_HISTORY,
+            );
+          }
+        }
       }
       if (chunk.step_count !== undefined) {
         b.usage.stepCount += chunk.step_count;
@@ -860,6 +1132,16 @@ export function onChunk(b: Buffers, chunk: LettaStreamingResponse) {
             break;
           }
         }
+
+        // Flag so the next usage_statistics entry is marked as post-compaction.
+        // Set here (not in event_message) because summary_message arrives after
+        // compaction completes, guaranteeing the next usage_statistics has the
+        // reduced token count.
+        if (ctx) {
+          ctx.pendingCompaction = true;
+          ctx.pendingSkillsReinject = true;
+          ctx.pendingReflectionTrigger = true;
+        }
         break;
       }
 
@@ -877,13 +1159,30 @@ export function onChunk(b: Buffers, chunk: LettaStreamingResponse) {
         // Handle otid transition (mark previous line as finished)
         handleOtidTransition(b, id);
 
+        const eventType = eventChunk.event_type || "unknown";
         ensure(b, id, () => ({
           kind: "event",
           id,
-          eventType: eventChunk.event_type || "unknown",
+          eventType,
           eventData: eventChunk.event_data || {},
           phase: "running",
         }));
+
+        // Fire PreCompact hooks when server-side auto-compaction starts
+        if (eventType === "compaction") {
+          runPreCompactHooks(
+            ctx?.lastContextTokens,
+            undefined, // max_context_length not available here
+            b.agentId,
+            undefined, // conversationId not available here
+          ).catch((error) => {
+            debugLog("hooks", "PreCompact hook error (accumulator)", error);
+          });
+        }
+
+        // Note: pendingCompaction is set in summary_message (not here) because
+        // usage_statistics for the step that triggered compaction can arrive after
+        // this event_message, and we want to mark the first POST-compaction entry.
         break;
       }
 

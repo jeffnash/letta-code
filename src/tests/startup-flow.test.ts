@@ -104,13 +104,13 @@ describe("Startup Flow - Flag Conflicts", () => {
     );
   });
 
-  test("--conversation conflicts with --from-af", async () => {
+  test("--conversation conflicts with --import", async () => {
     const result = await runCli(
-      ["--conversation", "conv-123", "--from-af", "test.af"],
+      ["--conversation", "conv-123", "--import", "test.af"],
       { expectExit: 1 },
     );
     expect(result.stderr).toContain(
-      "--conversation cannot be used with --from-af",
+      "--conversation cannot be used with --import",
     );
   });
 
@@ -122,5 +122,22 @@ describe("Startup Flow - Flag Conflicts", () => {
     expect(result.stderr).toContain(
       "--conversation cannot be used with --name",
     );
+  });
+});
+
+describe("Startup Flow - Smoke", () => {
+  test("--name conflicts with --new-agent", async () => {
+    const result = await runCli(["--name", "MyAgent", "--new-agent"], {
+      expectExit: 1,
+    });
+    expect(result.stderr).toContain("--name cannot be used with --new");
+  });
+
+  test("--new-agent headless parses and reaches credential check", async () => {
+    const result = await runCli(["--new-agent", "-p", "Say OK"], {
+      expectExit: 1,
+    });
+    expect(result.stderr).toContain("Missing LETTA_API_KEY");
+    expect(result.stderr).not.toContain("No recent session found");
   });
 });
